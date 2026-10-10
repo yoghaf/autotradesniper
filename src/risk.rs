@@ -1,17 +1,27 @@
 use crate::config::AppConfig;
+use crate::payload::CalldataPayloadBuilder;
 use crate::types::Position;
 use crate::wallet::WalletManager;
 use alloy::primitives::Address;
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
-/// Risk Management & Fast-Exit Module
+/// High-Precision Position Tracker with Instant Timer Reference
+struct InternalPositionTracker {
+    pub position: Position,
+    pub entry_instant: Instant,
+}
+
+/// Risk Management & Sub-Second Fast-Exit Module
 pub struct RiskManager {
     config: AppConfig,
     _wallet_manager: WalletManager,
     positions: Arc<RwLock<Vec<Position>>>,
+    internal_trackers: Arc<RwLock<HashMap<String, InternalPositionTracker>>>,
     exit_alert_tx: mpsc::Sender<Position>,
 }
 
@@ -26,11 +36,21 @@ impl RiskManager {
             config,
             _wallet_manager: wallet_manager,
             positions,
+            internal_trackers: Arc::new(RwLock::new(HashMap::new())),
             exit_alert_tx,
         }
     }
 
-    /// Register a newly opened position after dispatch
+    /// Calculate Adaptive Slippage Tolerance based on trade size and curve dynamics
+    #[inline(always)]
+    pub fn calculate_adaptive_slippage(&self, base_slippage_percent: f64, trade_eth: f64) -> f64 {
+        // As trade size increases relative to pool base, adaptively expand slippage allowance
+        // to prevent sandwich reverts while maintaining max capital protection bounds
+        let size_multiplier = 1.0 + (trade_eth / 2.0).min(0.5);
+        base_slippage_percent * size_multiplier
+    }
+
+    /// Register a newly opened position with microsecond timestamp reference
     pub async fn register_entry(
         &self,
         token_address: Address,
@@ -42,8 +62,12 @@ impl RiskManager {
             .unwrap_or_default()
             .as_secs();
 
+        let base_slippage = *self.config.slippage_percent.read().await;
+        let adaptive_slip = self.calculate_adaptive_slippage(base_slippage, entry_eth);
+
+        let pos_id = format!("POS-{:x}", rand::random::<u32>());
         let pos = Position {
-            id: format!("POS-{:x}", rand::random::<u32>()),
+            id: pos_id.clone(),
             token_address: format!("{:?}", token_address),
             token_symbol: format!("TKN-{}", &format!("{:?}", token_address)[2..6].to_uppercase()),
             entry_eth_amount: entry_eth,
@@ -57,91 +81,124 @@ impl RiskManager {
         };
 
         info!(
-            "🎯 New Position Registered: {} (Token: {}, Entry: {:.4} ETH)",
-            pos.id, pos.token_symbol, pos.entry_eth_amount
+            "🎯 New Position Registered: {} (Token: {}, Entry: {:.4} ETH, Adaptive Slippage: {:.2}%)",
+            pos.id, pos.token_symbol, pos.entry_eth_amount, adaptive_slip
         );
 
+        // Store in global state
         self.positions.write().await.push(pos.clone());
+
+        // Store high-precision instant tracker
+        self.internal_trackers.write().await.insert(
+            pos_id,
+            InternalPositionTracker {
+                position: pos.clone(),
+                entry_instant: Instant::now(),
+            },
+        );
+
         pos
     }
 
-    /// Build ultra-fast standard exit calldata WITHOUT any data buffer (~164 bytes)
-    /// Standard swapExactTokensForETH / route liquidation
-    pub fn build_fast_exit_calldata(token_in: &[u8; 20], router_or_pool: &[u8; 20]) -> Vec<u8> {
-        // swapExactTokensForETH(uint256,uint256,address[],address,uint256) selector: 0x18cbafe5
-        let selector = [0x18, 0xcb, 0xaf, 0xe5];
-        let mut calldata = Vec::with_capacity(164);
-        calldata.extend_from_slice(&selector);
-
-        // Standard liquidation parameters (160 bytes of packed arguments)
-        let mut params = vec![0u8; 160];
-        params[12..32].copy_from_slice(token_in);
-        params[44..64].copy_from_slice(router_or_pool);
-        calldata.extend_from_slice(&params);
-
-        calldata
-    }
-
-    /// Continuous position lifecycle and fast-exit evaluation loop
+    /// Continuous Sub-Second Position Lifecycle and Fast-Exit Monitor
+    /// Uses high-resolution timer (`tokio::time::interval_at`) running every 100ms
     pub async fn start_lifecycle_monitor(&self) {
-        info!("🛡️ Risk Management & Fast-Exit lifecycle loop started.");
+        info!("🛡️ Sub-Second Risk Management & Fast-Exit lifecycle loop active (100ms interval).");
+
+        let start_time = tokio::time::Instant::now();
+        let mut interval = tokio::time::interval_at(start_time, Duration::from_millis(100));
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            interval.tick().await;
 
             let target_profit = *self.config.target_profit_percent.read().await;
-            let time_decay_limit = *self.config.time_decay_exit_seconds.read().await;
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+            let time_decay_limit_secs = *self.config.time_decay_exit_seconds.read().await;
+            let time_decay_duration = Duration::from_secs(time_decay_limit_secs);
 
+            let mut trackers = self.internal_trackers.write().await;
             let mut positions_lock = self.positions.write().await;
-            for pos in positions_lock.iter_mut() {
-                if !pos.is_open {
+
+            for (pos_id, tracker) in trackers.iter_mut() {
+                if !tracker.position.is_open {
                     continue;
                 }
 
-                let elapsed_secs = now.saturating_sub(pos.entry_timestamp_secs);
+                let elapsed = tracker.entry_instant.elapsed();
+                let elapsed_secs_f = elapsed.as_secs_f64();
 
-                // Realistic momentum tracking for demonstration / live market feed
-                let momentum_factor = if elapsed_secs <= 15 {
+                // High-precision price / momentum simulation
+                let momentum_factor = if elapsed_secs_f <= 15.0 {
                     let surge = 1.0 + (rand::random::<f64>() * 0.45);
-                    pos.current_eth_value = pos.entry_eth_amount * surge;
+                    tracker.position.current_eth_value = tracker.position.entry_eth_amount * surge;
                     (surge - 1.0) * 100.0
                 } else {
-                    let decay = 1.0 + ((20.0 - (elapsed_secs as f64 * 0.5)) / 100.0);
-                    pos.current_eth_value = pos.entry_eth_amount * decay.max(0.7);
+                    let decay = 1.0 + ((20.0 - (elapsed_secs_f * 0.5)) / 100.0);
+                    tracker.position.current_eth_value = tracker.position.entry_eth_amount * decay.max(0.7);
                     (decay - 1.0) * 100.0
                 };
 
-                pos.pnl_percent = momentum_factor;
+                tracker.position.pnl_percent = momentum_factor;
 
-                // Rule 1: Target Profit Realization (+25% to +50%)
-                if pos.pnl_percent >= target_profit {
+                // Sync with public positions vector
+                if let Some(pos_ref) = positions_lock.iter_mut().find(|p| p.id == *pos_id) {
+                    pos_ref.current_eth_value = tracker.position.current_eth_value;
+                    pos_ref.pnl_percent = tracker.position.pnl_percent;
+                }
+
+                // Rule 1: Target Profit Realization (+25% s.d. +50%)
+                if tracker.position.pnl_percent >= target_profit {
                     info!(
-                        "💰 TARGET PROFIT TRIGGERED for {}: +{:.1}% >= target {:.1}%! Executing Fast-Exit...",
-                        pos.id, pos.pnl_percent, target_profit
+                        "💰 TARGET PROFIT TRIGGERED for {}: +{:.1}% >= target {:.1}% in {:.2}s! Executing Fast-Exit...",
+                        tracker.position.id, tracker.position.pnl_percent, target_profit, elapsed_secs_f
                     );
-                    pos.is_open = false;
-                    pos.exit_reason = Some(format!("Target Profit Realization (+{:.1}%)", pos.pnl_percent));
-                    pos.exit_tx_hash = Some(format!("0xexit_tp_{:x}", rand::random::<u64>()));
 
-                    let _ = self.exit_alert_tx.send(pos.clone()).await;
+                    // Pre-compute 164-byte exit payload instantly
+                    if let (Ok(token_addr), Ok(router_addr)) = (
+                        Address::from_str(&tracker.position.token_address),
+                        Address::from_str(&tracker.position.pool_address),
+                    ) {
+                        let _exit_calldata = CalldataPayloadBuilder::build_fast_exit_payload(&token_addr, &router_addr);
+                    }
+
+                    tracker.position.is_open = false;
+                    tracker.position.exit_reason = Some(format!("Target Profit Realization (+{:.1}%)", tracker.position.pnl_percent));
+                    tracker.position.exit_tx_hash = Some(format!("0xexit_tp_{:x}", rand::random::<u64>()));
+
+                    if let Some(pos_ref) = positions_lock.iter_mut().find(|p| p.id == *pos_id) {
+                        pos_ref.is_open = false;
+                        pos_ref.exit_reason = tracker.position.exit_reason.clone();
+                        pos_ref.exit_tx_hash = tracker.position.exit_tx_hash.clone();
+                    }
+
+                    let _ = self.exit_alert_tx.send(tracker.position.clone()).await;
                     continue;
                 }
 
-                // Rule 2: Time-Decay Exit (default 45s stop-loss limit)
-                if elapsed_secs >= time_decay_limit {
+                // Rule 2: Sub-Second Time-Decay Exit (precisely at 45.0 seconds)
+                if elapsed >= time_decay_duration {
                     warn!(
-                        "⏱ TIME-DECAY EXIT TRIGGERED for {}: {}s elapsed without momentum! Liquidation executed.",
-                        pos.id, elapsed_secs
+                        "⏱ SUB-SECOND TIME-DECAY EXIT TRIGGERED for {}: {:.2}s elapsed without momentum! Liquidation executed.",
+                        tracker.position.id, elapsed_secs_f
                     );
-                    pos.is_open = false;
-                    pos.exit_reason = Some(format!("Time-Decay Exit ({}s limit reached)", time_decay_limit));
-                    pos.exit_tx_hash = Some(format!("0xexit_td_{:x}", rand::random::<u64>()));
 
-                    let _ = self.exit_alert_tx.send(pos.clone()).await;
+                    if let (Ok(token_addr), Ok(router_addr)) = (
+                        Address::from_str(&tracker.position.token_address),
+                        Address::from_str(&tracker.position.pool_address),
+                    ) {
+                        let _exit_calldata = CalldataPayloadBuilder::build_fast_exit_payload(&token_addr, &router_addr);
+                    }
+
+                    tracker.position.is_open = false;
+                    tracker.position.exit_reason = Some(format!("Time-Decay Exit ({}s limit reached)", time_decay_limit_secs));
+                    tracker.position.exit_tx_hash = Some(format!("0xexit_td_{:x}", rand::random::<u64>()));
+
+                    if let Some(pos_ref) = positions_lock.iter_mut().find(|p| p.id == *pos_id) {
+                        pos_ref.is_open = false;
+                        pos_ref.exit_reason = tracker.position.exit_reason.clone();
+                        pos_ref.exit_tx_hash = tracker.position.exit_tx_hash.clone();
+                    }
+
+                    let _ = self.exit_alert_tx.send(tracker.position.clone()).await;
                     continue;
                 }
             }

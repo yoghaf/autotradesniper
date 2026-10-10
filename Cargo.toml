@@ -3,6 +3,18 @@ name = "autotradesniper"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "autotradesniper"
+path = "src/lib.rs"
+
+[[bin]]
+name = "autotradesniper"
+path = "src/main.rs"
+
+[[bench]]
+name = "latency_benchmark"
+harness = false
+
 [dependencies]
 alloy = { version = "2.5.0", features = [
     "full",
@@ -28,3 +40,6 @@ thiserror = "2.0"
 hex = "0.4"
 futures-util = "0.3"
 rand = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }

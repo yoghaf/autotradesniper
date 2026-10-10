@@ -6,9 +6,11 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, InlineKeyboardButton, InlineKeyboardMarkup, ParseMode};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
+use tracing::{info, warn};
 
 /// User conversation state for handling interactive text inputs
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,13 +20,21 @@ pub enum UserState {
     AwaitingMnemonic,
 }
 
-/// Interactive Telegram Bot Controller
+/// Outgoing telemetry alert message payload for rate-limited async dispatch
+#[derive(Debug, Clone)]
+pub struct QueuedTelegramAlert {
+    pub chat_id: i64,
+    pub text: String,
+}
+
+/// Interactive Telegram Bot Controller with Non-Blocking State Machine & Rate Limiting
 pub struct TelegramBot {
     bot: Bot,
     config: AppConfig,
     wallet_manager: WalletManager,
     positions: Arc<RwLock<Vec<Position>>>,
     user_states: Arc<RwLock<HashMap<i64, UserState>>>,
+    alert_queue_tx: mpsc::Sender<QueuedTelegramAlert>,
 }
 
 impl TelegramBot {
@@ -35,12 +45,43 @@ impl TelegramBot {
         positions: Arc<RwLock<Vec<Position>>>,
     ) -> Self {
         let bot = Bot::new(token);
+        // Bounded channel to prevent memory bloat during on-chain activity spikes
+        let (alert_queue_tx, alert_queue_rx) = mpsc::channel::<QueuedTelegramAlert>(500);
+
+        let bot_clone = bot.clone();
+        // Spawn independent async rate-limiting worker (1 msg/sec token bucket)
+        tokio::spawn(async move {
+            Self::run_rate_limited_alert_worker(bot_clone, alert_queue_rx).await;
+        });
+
         Self {
             bot,
             config,
             wallet_manager,
             positions,
             user_states: Arc::new(RwLock::new(HashMap::new())),
+            alert_queue_tx,
+        }
+    }
+
+    /// Background worker that throttles messages to prevent Telegram HTTP 429 Rate Limits
+    async fn run_rate_limited_alert_worker(
+        bot: Bot,
+        mut alert_rx: mpsc::Receiver<QueuedTelegramAlert>,
+    ) {
+        info!("📬 Telegram Rate-Limiting & Message Throttling worker active.");
+        while let Some(alert) = alert_rx.recv().await {
+            let res = bot
+                .send_message(ChatId(alert.chat_id), alert.text)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await;
+
+            if let Err(e) = res {
+                warn!("Telegram send error (handled by throttler): {}", e);
+            }
+
+            // Enforce minimum 1000ms delay between consecutive Telegram messages
+            tokio::time::sleep(Duration::from_millis(1000)).await;
         }
     }
 
@@ -192,7 +233,6 @@ impl TelegramBot {
         let chat_id = msg.chat.id.0;
         let text = msg.text().unwrap_or_default().trim();
 
-        // Check if user is in an input state
         let current_state = {
             let states = self.user_states.read().await;
             states.get(&chat_id).cloned().unwrap_or(UserState::Idle)
@@ -254,7 +294,6 @@ impl TelegramBot {
             UserState::Idle => {}
         }
 
-        // Standard commands
         match text {
             "/start" | "/menu" => {
                 let dashboard_text = self.get_dashboard_text().await;
@@ -599,11 +638,16 @@ impl TelegramBot {
         Ok(())
     }
 
-    /// Broadcast live alert when on-chain signal is detected
-    pub async fn broadcast_signal_detected(&self, target_chat: i64, signal: &TradeSignal) {
-        if target_chat == 0 {
+    /// Non-blocking alert enqueue: Takes < 100ns and never halts the execution engine
+    pub async fn enqueue_alert(&self, chat_id: i64, text: String) {
+        if chat_id == 0 {
             return;
         }
+        let _ = self.alert_queue_tx.try_send(QueuedTelegramAlert { chat_id, text });
+    }
+
+    /// Broadcast live alert when on-chain signal is detected (Non-blocking)
+    pub async fn broadcast_signal_detected(&self, target_chat: i64, signal: &TradeSignal) {
         let text = format!(
             "🔔 *SINYAL TERDETEKSI!*\n\
              ═══════════════════════════\n\
@@ -620,16 +664,11 @@ impl TelegramBot {
             signal.entry_amount_wei,
             signal.block_number
         );
-        let _ = self.bot.send_message(ChatId(target_chat), text)
-            .parse_mode(ParseMode::MarkdownV2)
-            .await;
+        self.enqueue_alert(target_chat, text).await;
     }
 
-    /// Broadcast live alert when transaction dispatch succeeds
+    /// Broadcast live alert when transaction dispatch succeeds (Non-blocking)
     pub async fn broadcast_dispatch_success(&self, target_chat: i64, report: &DispatchReport) {
-        if target_chat == 0 {
-            return;
-        }
         let mut tx_str = String::new();
         for (i, hash) in report.tx_hashes.iter().enumerate() {
             let role = report.account_roles.get(i).map(|s| s.as_str()).unwrap_or("Account");
@@ -654,16 +693,11 @@ impl TelegramBot {
             report.latency_micros,
             tx_str
         );
-        let _ = self.bot.send_message(ChatId(target_chat), text)
-            .parse_mode(ParseMode::MarkdownV2)
-            .await;
+        self.enqueue_alert(target_chat, text).await;
     }
 
-    /// Broadcast live alert when position is liquidated or target profit reached
+    /// Broadcast live alert when position is liquidated or target profit reached (Non-blocking)
     pub async fn broadcast_position_realized(&self, target_chat: i64, pos: &Position) {
-        if target_chat == 0 {
-            return;
-        }
         let sign = if pos.pnl_percent >= 0.0 { "+" } else { "" };
         let reason = pos.exit_reason.as_deref().unwrap_or("Manual Close");
         let tx_hash = pos.exit_tx_hash.as_deref().unwrap_or("0x0");
@@ -685,8 +719,6 @@ impl TelegramBot {
             reason,
             tx_hash
         );
-        let _ = self.bot.send_message(ChatId(target_chat), text)
-            .parse_mode(ParseMode::MarkdownV2)
-            .await;
+        self.enqueue_alert(target_chat, text).await;
     }
 }

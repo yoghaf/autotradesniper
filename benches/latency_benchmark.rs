@@ -1,0 +1,114 @@
+use autotradesniper::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
+use autotradesniper::stream::{fast_selectors, ZeroCopyTxParser};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use alloy::primitives::Address;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn bench_zero_copy_parsing(c: &mut Criterion) {
+    let raw_sample_json = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{"hash":"0x88df0147ff268f886da7171e1b669d145d910f138800b0b868b6a030f8d9cdf6","from":"0x742d35cc6634c0532925a3b844bc454e4438f44e","to":"0x1b44f3514812d835eb1bdb0acb32253ddb043d42","input":"0x7ff36ab50000000000000000000000000000000000000000000000000de0b6b3a7640000","value":"0x112210f47de98115"}}}"#;
+
+    c.bench_function("zero_copy_from_address_extraction", |b| {
+        b.iter(|| {
+            let slice = ZeroCopyTxParser::find_field_hex_slice(black_box(raw_sample_json), b"\"from\"");
+            if let Some(s) = slice {
+                let addr = ZeroCopyTxParser::parse_address_from_hex(s);
+                black_box(addr);
+            }
+        });
+    });
+
+    c.bench_function("zero_copy_to_address_extraction", |b| {
+        b.iter(|| {
+            let slice = ZeroCopyTxParser::find_field_hex_slice(black_box(raw_sample_json), b"\"to\"");
+            if let Some(s) = slice {
+                let addr = ZeroCopyTxParser::parse_address_from_hex(s);
+                black_box(addr);
+            }
+        });
+    });
+}
+
+fn bench_fast_method_signatures(c: &mut Criterion) {
+    let selector = [0x7f, 0xf3, 0x6a, 0xb5]; // swapExactETHForTokens
+
+    c.bench_function("fast_signature_1cycle_match", |b| {
+        b.iter(|| {
+            let is_swap = fast_selectors::is_swap_selector(black_box(&selector));
+            black_box(is_swap);
+        });
+    });
+}
+
+fn bench_calldata_buffer_assembly(c: &mut Criterion) {
+    let sample_calldata = vec![0x7f, 0xf3, 0x6a, 0xb5, 0x01, 0x02, 0x03, 0x04];
+
+    c.bench_function("zero_fill_calldata_buffer_94500b", |b| {
+        b.iter(|| {
+            let payload = CalldataPayloadBuilder::build_calibrated_payload(
+                black_box(&sample_calldata),
+                black_box(TARGET_CALLDATA_BUFFER_SIZE),
+            );
+            black_box(payload);
+        });
+    });
+
+    let mut scratch = Vec::with_capacity(100_000);
+    c.bench_function("reusable_scratch_calldata_buffer_94500b", |b| {
+        b.iter(|| {
+            CalldataPayloadBuilder::write_into_scratch(
+                black_box(&mut scratch),
+                black_box(&sample_calldata),
+                black_box(TARGET_CALLDATA_BUFFER_SIZE),
+            );
+            black_box(&scratch);
+        });
+    });
+}
+
+fn bench_fast_exit_payload(c: &mut Criterion) {
+    let token = Address::repeat_byte(0x11);
+    let router = Address::repeat_byte(0x22);
+
+    c.bench_function("fast_exit_164b_payload_assembly", |b| {
+        b.iter(|| {
+            let payload = CalldataPayloadBuilder::build_fast_exit_payload(
+                black_box(&token),
+                black_box(&router),
+            );
+            black_box(payload);
+        });
+    });
+}
+
+fn bench_ema_fee_calculator(c: &mut Criterion) {
+    let fee_adjuster = DynamicFeeAdjuster::new(2.5, 1.25);
+
+    c.bench_function("ema_dynamic_fee_calculation", |b| {
+        b.iter(|| {
+            let (prio, max) = fee_adjuster.calculate_optimal_fees();
+            black_box((prio, max));
+        });
+    });
+}
+
+fn bench_atomic_nonce_cursor(c: &mut Criterion) {
+    let nonce = AtomicU64::new(100);
+
+    c.bench_function("atomic_in_memory_nonce_fetch_add", |b| {
+        b.iter(|| {
+            let n = nonce.fetch_add(1, Ordering::SeqCst);
+            black_box(n);
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_zero_copy_parsing,
+    bench_fast_method_signatures,
+    bench_calldata_buffer_assembly,
+    bench_fast_exit_payload,
+    bench_ema_fee_calculator,
+    bench_atomic_nonce_cursor
+);
+criterion_main!(benches);
