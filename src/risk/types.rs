@@ -1,5 +1,5 @@
 use crate::types::Position;
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Instant;
@@ -35,6 +35,8 @@ pub enum ExitReason {
     PrysmTargetMcap,
     /// Prysm Strategy Target Exit: Strict Stop-Loss (-30%)
     PrysmTargetStopLoss,
+    /// The master's entry never delivered tokens (buy reverted on the Revert Guard/slippage)
+    EntryNotFilled,
 }
 
 impl std::fmt::Display for ExitReason {
@@ -54,6 +56,7 @@ impl std::fmt::Display for ExitReason {
             ExitReason::EmergencySweep => write!(f, "L6: Operator Emergency Asset Sweep (/sweep)"),
             ExitReason::PrysmTargetMcap => write!(f, "Prysm Target: Take-Profit Target Reached ($10k MCap)"),
             ExitReason::PrysmTargetStopLoss => write!(f, "Prysm Target: Strict Stop-Loss (-30% Deficit)"),
+            ExitReason::EntryNotFilled => write!(f, "Entry not filled (buy reverted or never landed)"),
         }
     }
 }
@@ -128,6 +131,29 @@ impl Default for RiskConfig {
     }
 }
 
+/// Where a position is valued and sold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitVenue {
+    /// Pons bonding curve (`position.pool_address`): value from `getReserves()`, exit via `sell()`.
+    PonsCurve,
+    /// Uniswap-V2-style router (`position.pool_address`): value from `getAmountsOut`, exit via
+    /// `swapExactTokensForETHSupportingFeeOnTransferTokens` along `[token, weth]`.
+    V2Router { weth: Address },
+}
+
+impl ExitVenue {
+    /// Venue implied by the entry calldata (V2 `swapExactETHForTokens*` or Pons `buy`).
+    pub fn from_entry_calldata(calldata: &[u8]) -> Self {
+        if crate::stream::fast_selectors::is_copyable_eth_swap(calldata)
+            && calldata.first_chunk::<4>() != Some(&crate::payload::PONS_BUY_SELECTOR)
+            && let Some((weth, _)) = crate::payload::CalldataPayloadBuilder::decode_v2_path_ends(calldata)
+        {
+            return ExitVenue::V2Router { weth };
+        }
+        ExitVenue::PonsCurve
+    }
+}
+
 /// Internal high-resolution state tracker for an open position
 #[derive(Debug, Clone)]
 pub struct PositionTracker {
@@ -156,6 +182,21 @@ pub struct PositionTracker {
     pub prysm_exit_mode: Option<crate::types::PrysmExitMode>,
     pub prysm_entry_mcap_usd: f64,
     pub current_mcap_usd: f64,
+
+    // On-chain valuation & exit
+    pub venue: ExitVenue,
+    /// Resolved ERC-20 (a Pons copy-trade may only know the curve until `pairToken()` answers).
+    pub token: Option<Address>,
+    /// Master-account token balance observed after the entry filled (zero until observed).
+    /// Valuation sells exactly this amount on the current curve state.
+    pub tokens_held: U256,
+    /// `current_mcap_usd` comes from live reserves; Target mode must not re-derive it from PnL.
+    pub mcap_from_chain: bool,
+    /// Exit allowance pre-approval already sent (so the exit is a single transaction).
+    pub exit_preapproved: bool,
+    /// Last exit that failed on-chain; the watchdog re-issues it with wider slippage.
+    pub pending_exit: Option<ExitSignal>,
+    pub exit_attempts: u32,
 }
 
 impl PositionTracker {
@@ -183,6 +224,14 @@ impl PositionTracker {
             prysm_exit_mode: None,
             prysm_entry_mcap_usd: 0.0,
             current_mcap_usd: 0.0,
+
+            venue: ExitVenue::PonsCurve,
+            token: None,
+            tokens_held: U256::ZERO,
+            mcap_from_chain: false,
+            exit_preapproved: false,
+            pending_exit: None,
+            exit_attempts: 0,
         }
     }
 }

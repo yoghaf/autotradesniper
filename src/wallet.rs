@@ -49,7 +49,12 @@ impl WalletManager {
             let phrase = mnemonic.to_string();
             info!("Generated Master Mnemonic Phrase successfully");
             *config.mnemonic_phrase.write().await = phrase.clone();
-            let _ = config.save_persisted_state().await;
+            // Fatal on failure: a mnemonic that only lives in memory is lost at the next restart,
+            // together with whatever was deposited to it.
+            config
+                .save_persisted_state()
+                .await
+                .context("Refusing to start: the newly generated mnemonic could not be persisted")?;
             phrase
         } else {
             existing_phrase.trim().to_string()
@@ -149,6 +154,30 @@ impl WalletManager {
         self.get_or_create_nonce_cursor(address).await.store(on_chain, Ordering::SeqCst);
         warn!("Nonce cursor for {:?} re-synced to {}", address, on_chain);
         Ok(on_chain)
+    }
+
+    /// Hand back a nonce whose transaction no endpoint accepted.
+    ///
+    /// When the rejection is definitive (`nonce_unused`) and nothing was allocated after it,
+    /// the cursor is rolled back with one compare-exchange: no RPC round trip, and it still
+    /// works while the read RPC is rate-limiting us (a failed re-sync would otherwise leave a
+    /// permanent gap until the next failure). In every other case (timeouts, "nonce too
+    /// low/high", a later nonce already in flight) the cursor is re-anchored from the node.
+    pub async fn release_nonce(&self, acc: &TreasuryAccount, nonce: u64, nonce_unused: bool) {
+        if nonce_unused
+            && acc
+                .nonce_cursor
+                .compare_exchange(nonce.wrapping_add(1), nonce, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            warn!("Nonce cursor for {:?} rolled back to {} (tx rejected everywhere)", acc.address, nonce);
+            return;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(2), self.resync_nonce(acc.address)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => error!("Nonce resync for {:?} failed: {:#}", acc.address, e),
+            Err(_) => error!("Nonce resync for {:?} timed out", acc.address),
+        }
     }
 
     /// Instant lock-free atomic nonce allocation (< 10 nanoseconds)
@@ -303,11 +332,12 @@ impl WalletManager {
                 );
 
                 let next_nonce = self.next_nonce_atomic(master.address).await;
+                // No fixed 21000 gas limit: on Arbitrum the limit must also cover the L1 poster
+                // component, so a bare transfer needs more. The provider's gas filler estimates it.
                 let tx = TransactionRequest::default()
                     .with_to(sub.address)
                     .with_value(amount_wei)
-                    .with_nonce(next_nonce)
-                    .with_gas_limit(21000);
+                    .with_nonce(next_nonce);
 
                 match provider.send_transaction(tx).await {
                     Ok(pending) => {

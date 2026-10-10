@@ -4,7 +4,7 @@
 use alloy::primitives::{address, Address, B256, U256};
 use alloy::sol_types::SolCall;
 use autotradesniper::config::AppConfig;
-use autotradesniper::models::prysm::{is_prysm_tag, LaunchMetadata, PrysmEngine, PRYSMCLOUD_SUBSTRING};
+use autotradesniper::models::prysm::{is_prysm_tag, LaunchMetadata, LaunchResolution, PrysmEngine, PRYSMCLOUD_SUBSTRING};
 use autotradesniper::payload::{
     CalldataPayloadBuilder, DynamicFeeAdjuster, MAX_SEQUENCER_TX_BYTES, TX_ENVELOPE_OVERHEAD,
 };
@@ -24,6 +24,12 @@ alloy::sol! {
 
 const LAUNCHPAD: Address = address!("00000000000000000000000000000000000fac70");
 const ATTACKER: Address = address!("00000000000000000000000000000000deadbeef");
+const TOKEN: Address = address!("00000000000000000000000000000000000070c3");
+const CURVE: Address = address!("00000000000000000000000000000000000c0e7e");
+
+fn resolved(token: Address, curve: Address) -> LaunchResolution {
+    LaunchResolution::Resolved { token, curve, reserves: None }
+}
 
 fn wrap_batch(inner: &[u8]) -> Vec<u8> {
     let mut out = vec![3u8];
@@ -123,6 +129,8 @@ async fn prysm_dedups_same_launch_but_not_other_launches() {
             .inspect_transaction(creator, Some(LAUNCHPAD), value, &spoof_calldata(), tx_hash, block, Instant::now())
             .await;
     }
+    engine.record_resolution(launch_a, resolved(TOKEN, CURVE)).await;
+    engine.record_resolution(launch_b, resolved(Address::repeat_byte(0x7b), Address::repeat_byte(0xcb))).await;
     engine.process_new_block(104).await;
     let first = rx.try_recv().expect("launch A released");
     assert!(is_prysm_tag(first.strategy_tag.as_deref()));
@@ -146,6 +154,7 @@ async fn prysm_staleness_uses_subsecond_precision() {
         launch_block: 100,
         launch_instant: now - Duration::from_millis(15_500),
         market_cap_usd: 5000.0,
+        launch_tx_hash: alloy::primitives::B256::ZERO,
     };
     // 15.5s truncated to 15s used to pass a 15s limit.
     assert!(engine.validate_entry_guardrails(&meta, 103, now).await.is_err());
@@ -356,83 +365,120 @@ fn topic_address_parsing_and_reserve_math() {
 
 // ── Block +1, Zero-Delay Companion & Revert Guard Tests ─────────────────────
 
-#[tokio::test]
-async fn block_plus_one_delay_scheduling() {
+async fn prysm_block_engine(delay: u64) -> (PrysmEngine, mpsc::Receiver<autotradesniper::types::TradeSignal>) {
     let mut config = AppConfig::default();
     config.prysm_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
-    *config.prysm_min_block_delay.write().await = 1; // Block +1
+    *config.prysm_min_block_delay.write().await = delay;
     *config.prysm_size_eth.write().await = 0.05;
     config.prysm_launchpads = Arc::new([LAUNCHPAD].into_iter().collect());
+    let (tx, rx) = mpsc::channel(16);
+    (PrysmEngine::new(config, tx), rx)
+}
 
-    let (tx, mut rx) = mpsc::channel(16);
-    let engine = PrysmEngine::new(config, tx);
-
-    let calldata = spoof_calldata();
-    // Launch at block 100
+#[tokio::test]
+async fn block_plus_one_fires_on_the_launch_block_once_resolved() {
+    // A tx sent after block L is observed lands in L+1 at the earliest. The former code fired
+    // when L+1 was *observed* (landing in L+2+), and fired with the launch calldata while the
+    // token was unresolved (refused by the dispatcher, entry lost).
+    let (engine, mut rx) = prysm_block_engine(1).await;
+    let launch = B256::from([1u8; 32]);
     engine
         .inspect_transaction(
             address!("1111111111111111111111111111111111111111"),
             Some(LAUNCHPAD),
-            U256::from(21_000_000_000_000_000u64), // 0.021 ETH
-            &calldata,
-            B256::from([1u8; 32]),
+            U256::from(21_000_000_000_000_000u64), // 0.021 ETH dev buy
+            &spoof_calldata(),
+            launch,
             100,
             Instant::now(),
         )
         .await;
+    assert!(rx.try_recv().is_err(), "unresolved launch: nothing is sent");
 
-    // At block 100, must NOT be dispatched
-    assert!(rx.try_recv().is_err());
-
-    // At block 101 (Block +1), must be released and dispatched!
-    engine.process_new_block(101).await;
-    let signal = rx.try_recv().expect("Should dispatch at Block +1");
-    assert_eq!(signal.block_number, 101);
+    // The background resolver lands while block 100 is still the latest: fire immediately.
+    engine.record_resolution(launch, resolved(TOKEN, CURVE)).await;
+    let signal = rx.try_recv().expect("fires on block L itself -> lands in L+1");
+    assert_eq!(signal.block_number, 100);
+    assert_eq!((signal.target_token, signal.pool_or_router), (TOKEN, CURVE));
+    assert_eq!(&signal.swap_calldata[..4], &autotradesniper::payload::PONS_BUY_SELECTOR);
+    // ethIn in the calldata equals the value the dispatcher will send.
+    assert_eq!(U256::from_be_slice(&signal.swap_calldata[4..36]), signal.entry_amount_wei);
+    // Revert Guard quoted on the post-dev-buy curve, not the initial one.
+    let min_out = U256::from_be_slice(&signal.swap_calldata[36..68]);
+    let naive = CalldataPayloadBuilder::calculate_pons_buy_revert_guard(signal.entry_amount_wei, None, None, 25.0);
+    assert!(min_out < naive && !min_out.is_zero());
 }
 
 #[tokio::test]
-async fn companion_pattern_c_zero_delay_execution() {
-    let mut config = AppConfig::default();
-    config.prysm_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
-    *config.prysm_min_block_delay.write().await = 3; // Even if config delay is 3, Pattern C must have 0 delay!
-    let launchpad = LAUNCHPAD;
-    config.prysm_launchpads = Arc::new([launchpad].into_iter().collect());
-
-    let (tx, mut rx) = mpsc::channel(16);
-    let engine = PrysmEngine::new(config, tx);
-
-    // 1. Register launch
-    let calldata = spoof_calldata();
+async fn block_plus_two_waits_for_the_block_even_when_resolved() {
+    let (engine, mut rx) = prysm_block_engine(2).await;
+    let launch = B256::from([2u8; 32]);
     engine
-        .inspect_transaction(
-            address!("1111111111111111111111111111111111111111"),
-            Some(launchpad),
-            U256::from(21_000_000_000_000_000u64),
-            &calldata,
-            B256::from([1u8; 32]),
-            100,
-            Instant::now(),
-        )
+        .inspect_transaction(Address::repeat_byte(0x11), Some(LAUNCHPAD), U256::from(21_000_000_000_000_000u64), &spoof_calldata(), launch, 100, Instant::now())
         .await;
+    engine.record_resolution(launch, resolved(TOKEN, CURVE)).await;
+    assert!(rx.try_recv().is_err(), "must not fire on block 100 (would land in 101)");
+    engine.process_new_block(101).await;
+    assert_eq!(rx.try_recv().expect("fires on 101 -> lands in 102").block_number, 101);
+}
 
-    // 2. Companion account buys immediately
+#[tokio::test]
+async fn reverted_launch_drops_the_order() {
+    let (engine, mut rx) = prysm_block_engine(1).await;
+    let launch = B256::from([3u8; 32]);
+    engine
+        .inspect_transaction(Address::repeat_byte(0x11), Some(LAUNCHPAD), U256::from(21_000_000_000_000_000u64), &spoof_calldata(), launch, 100, Instant::now())
+        .await;
+    engine.record_resolution(launch, LaunchResolution::Failed).await;
+    engine.process_new_block(105).await;
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn companion_pattern_c_buys_on_the_resolved_curve() {
+    let (engine, mut rx) = prysm_block_engine(3).await;
+    // Dev buy 0.1 ETH: outside Pola A/B ranges, so only the companion can trigger an entry.
+    let launch = B256::from([4u8; 32]);
+    engine
+        .inspect_transaction(Address::repeat_byte(0x11), Some(LAUNCHPAD), U256::from(100_000_000_000_000_000u64), &spoof_calldata(), launch, 100, Instant::now())
+        .await;
+    engine.record_resolution(launch, resolved(TOKEN, CURVE)).await;
+    assert!(rx.try_recv().is_err());
+
     let companion = autotradesniper::models::prysm::COMPANION_ACCOUNTS[0];
-    let buy_calldata = vec![0x59, 0xa8, 0x7b, 0xc1]; // Pons buy
-    engine
-        .inspect_transaction(
-            companion,
-            Some(launchpad),
-            U256::from(50_000_000_000_000_000u64),
-            &buy_calldata,
-            B256::from([2u8; 32]),
-            100,
-            Instant::now(),
-        )
-        .await;
+    // A companion *sell* on the curve must not trigger an entry.
+    let sell = CalldataPayloadBuilder::build_pons_sell_payload(U256::from(1u64), U256::ZERO, companion);
+    engine.inspect_transaction(companion, Some(CURVE), U256::ZERO, &sell, B256::from([5u8; 32]), 100, Instant::now()).await;
+    assert!(rx.try_recv().is_err());
 
-    // Must be dispatched IMMEDIATELY without waiting for block advance!
-    let signal = rx.try_recv().expect("Pattern C should execute with 0 block delay");
+    // The former lookup was keyed by the launchpad, so a real buy (sent to the curve) never matched.
+    let buy = CalldataPayloadBuilder::build_pons_buy_payload(U256::from(50_000_000_000_000_000u64), U256::ZERO, companion);
+    engine.inspect_transaction(companion, Some(CURVE), U256::from(50_000_000_000_000_000u64), &buy, B256::from([6u8; 32]), 100, Instant::now()).await;
+    let signal = rx.try_recv().expect("Pola C fires with zero block delay");
     assert!(signal.strategy_tag.unwrap().contains("Pola C"));
+    assert_eq!(signal.pool_or_router, CURVE);
+
+    // Another companion buy on the same launch does not enter twice.
+    engine.inspect_transaction(companion, Some(CURVE), U256::from(1u64), &buy, B256::from([7u8; 32]), 101, Instant::now()).await;
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn companion_confirmation_fast_tracks_a_queued_pola_a_entry() {
+    let (engine, mut rx) = prysm_block_engine(3).await;
+    let launch = B256::from([8u8; 32]);
+    engine
+        .inspect_transaction(Address::repeat_byte(0x11), Some(LAUNCHPAD), U256::from(21_000_000_000_000_000u64), &spoof_calldata(), launch, 100, Instant::now())
+        .await;
+    engine.record_resolution(launch, resolved(TOKEN, CURVE)).await;
+    assert!(rx.try_recv().is_err(), "Pola A waits for block 102");
+
+    let companion = autotradesniper::models::prysm::COMPANION_ACCOUNTS[1];
+    let buy = CalldataPayloadBuilder::build_pons_buy_payload(U256::from(1u64), U256::ZERO, companion);
+    engine.inspect_transaction(companion, Some(TOKEN), U256::from(1u64), &buy, B256::from([9u8; 32]), 100, Instant::now()).await;
+    let signal = rx.try_recv().expect("queued entry fired now");
+    assert!(signal.strategy_tag.unwrap().contains("Pola A"));
+    assert!(rx.try_recv().is_err(), "exactly one entry");
 }
 
 #[test]

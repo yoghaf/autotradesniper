@@ -31,8 +31,8 @@ impl PriceRules {
 
         // Prysm Series Strategy Dedicated Target Exit Mode Evaluation
         if tracker.is_prysm_strategy && tracker.prysm_exit_mode == Some(crate::types::PrysmExitMode::Target) {
-            // Update current market cap based on price change
-            if tracker.prysm_entry_mcap_usd > 0.0 {
+            // Without live reserves, estimate the market cap from the price change.
+            if tracker.prysm_entry_mcap_usd > 0.0 && !tracker.mcap_from_chain {
                 tracker.current_mcap_usd = tracker.prysm_entry_mcap_usd * (1.0 + (pnl_pct / 100.0)).max(0.0);
             }
 

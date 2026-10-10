@@ -34,6 +34,7 @@ fn create_sample_launch_meta(
         launch_block,
         launch_instant: Instant::now(),
         market_cap_usd,
+        launch_tx_hash: alloy::primitives::B256::ZERO,
     }
 }
 
@@ -346,32 +347,40 @@ async fn test_min_block_guard_delayed_release() {
     // Inspect launch calldata at Block #100
     // Calldata with prysmcloud image substring
     let calldata = b"launchToken(prysmcloud/token-images/pic.png)";
+    let launch_tx = alloy::primitives::B256::repeat_byte(0x42);
     engine.inspect_transaction(
         meta.creator_address,
         Some(meta.token_address),
         U256::from(20000000000000000u64), // 0.02 ETH
         calldata,
-        alloy::primitives::B256::ZERO,
+        launch_tx,
         launch_block,
         Instant::now(),
     ).await;
+    engine
+        .record_resolution(
+            launch_tx,
+            autotradesniper::models::prysm::LaunchResolution::Resolved {
+                token: address!("4444444444444444444444444444444444444444"),
+                curve: address!("5555555555555555555555555555555555555555"),
+                reserves: None,
+            },
+        )
+        .await;
 
-    // Verify order is queued and NOT dispatched yet at Block #100, #101, #102
+    // Delay 3 = land in Block #103: nothing may be sent on #100 or #101.
     assert!(rx.try_recv().is_err());
 
     engine.process_new_block(101).await;
     assert!(rx.try_recv().is_err());
 
+    // Observing #102 fires the order, so it lands in #103 (Launch #100 + 3).
     engine.process_new_block(102).await;
-    assert!(rx.try_recv().is_err());
-
-    // Advance to Block #103 (Launch #100 + 3) -> Order must be released and dispatched!
-    engine.process_new_block(103).await;
 
     let dispatched = rx.try_recv();
-    assert!(dispatched.is_ok(), "Expected dispatched signal at Block #103");
+    assert!(dispatched.is_ok(), "Expected dispatched signal on Block #102");
     let sig: TradeSignal = dispatched.unwrap();
-    assert_eq!(sig.block_number, 103);
+    assert_eq!(sig.block_number, 102);
     assert!(sig.strategy_tag.as_ref().map(|s| s.contains("Prysm")).unwrap_or(false));
 }
 
