@@ -125,8 +125,13 @@ impl AppConfig {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
 
-        let prysm_launchpads: HashSet<Address> = std::env::var("PRYSM_LAUNCHPAD_FACTORIES")
-            .unwrap_or_default()
+        // Pons Launchpad Factory addresses (evaluated by the Prysm series model).
+        // Defaults to the official PonsV2LaunchFactory (0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e) from bottradepons.
+        let raw_launchpads = std::env::var("PONS_FACTORY")
+            .or_else(|_| std::env::var("PONS_LAUNCHPAD_FACTORIES"))
+            .or_else(|_| std::env::var("PRYSM_LAUNCHPAD_FACTORIES"))
+            .unwrap_or_else(|_| "0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e".to_string());
+        let prysm_launchpads: HashSet<Address> = raw_launchpads
             .split(',')
             .filter_map(|s| Address::from_str(s.trim()).ok())
             .collect();
