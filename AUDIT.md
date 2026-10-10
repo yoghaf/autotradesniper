@@ -347,3 +347,152 @@ fast exit: amountIn=0x1111…(token) minOut=0x2222…(router) pathOffset=0 to=0x
 ```
 
 Setelah perbaikan: `tests/audit_regressions.rs` (14 test) mengunci perilaku yang benar untuk H1, M1, C4 (2 varian), M5 (dedup + presisi detik), C2, C3, ABI exit (C5), H8, M6, M7, dan tag strategi. Ditambah unit test decoder frame feed. **Total 36 test lulus.**
+
+---
+
+## 8. Audit Putaran 2 (baseline `36a4ad3`)
+
+**Cakupan:** `stream.rs`, `dispatcher.rs`, `models/prysm.rs`, `payload.rs`, `risk/`, `wallet.rs`, `config.rs`, `main.rs`, `telegram.rs`.
+**Metode:** baca baris per baris, PoC terhadap baseline (debug dan release), pengukuran mikro di `--release`, lalu perbaikan dengan test regresi end-to-end (server JSON-RPC tiruan yang mendekode tx yang benar-benar ditandatangani).
+**Status:** 60 test lulus (`cargo test`), `cargo build --release` bersih, tidak ada warning clippy baru.
+
+### 8.1 Ringkasan
+
+| Severity | Jumlah | Diperbaiki |
+|---|---|---|
+| Critical | 4 | 4 |
+| High | 7 | 7 |
+| Medium | 7 | 7 |
+
+Empat hal terpenting:
+1. **Exit berbasis harga tidak pernah bisa terpicu.** Valuasi posisi menghitung "beli lalu jual" dengan cadangan *saat ini*, sehingga PnL konstan sekitar -3% berapa pun harganya. MCap meleset 10^18, sehingga take-profit mode Target tidak pernah tercapai.
+2. **Likuidasi yang gagal meninggalkan token di wallet.** Kegagalan broadcast, error RPC `balanceOf` (dianggap 0), atau sell yang revert tetap menutup posisi. Posisi V2 dijual dengan `sell()` Pons ke router (selalu revert), dan token di akun satelit tidak pernah dijual.
+3. **Satelit (MultiAccount) dan copy-trade Pons selalu revert.** Calldata memakai `ethIn`/`minOut` milik master atau milik wallet yang di-copy, sedangkan `msg.value` berbeda.
+4. **Jalur cepat tersendat I/O jaringan.** Lookup receipt Prysm dijalankan *di dalam* pembaca feed (terukur 2,5 dtk per endpoint). Risk monitor memegang write-lock `trackers` + `positions` selama `eth_call` (terukur 2,2 dtk), sehingga `register_entry` di task sinyal ikut tertahan.
+
+### 8.2 Daftar Temuan
+
+| ID | Temuan | Lokasi (baseline) | Bukti | Status |
+|---|---|---|---|---|
+| **C7** | Valuasi PnL buta harga: `est_tokens = T·e/(E+e)` lalu dijual lagi pada `(E,T)` yang sama, sehingga hasilnya `0.98·e·E/(E+2e)` (konstan). Hard SL -20%, trailing, TP, watchdog -30%, dan Target -30% praktis mati. MCap `spot·1e9·2600` dengan `tok_res` dalam wei (meleset 10^18), sehingga TP $10k mode Target mustahil. | `risk/mod.rs:466-480` | PoC: reserve 1,68 → 4,0 ETH (harga ×5,7), PnL tetap -3,15% → -2,49%; mcap $4,4e-15 | ✅ Nilai = kuotasi jual atas **token yang benar-benar dipegang** (`balanceOf` setelah fill); mcap = `E/T·1e9·ETH_USD` |
+| **C8** | Likuidasi: (a) broadcast/sign gagal tetap menutup posisi "[SIMULATED]"; (b) error RPC `balanceOf` jadi `0`, sehingga ditutup tanpa jual; (c) "diterima endpoint" ≠ "terjual" (revert `minEthOut` tidak dideteksi); (d) `getReserves` gagal membuat `minEthOut = 1`; (e) posisi copy V2: `sell()` Pons dikirim ke router (selalu revert); (f) token satelit tidak pernah dijual; (g) monitor, watchdog, dan `/panic` bisa menjual posisi yang sama bersamaan. | `risk/mod.rs:200-386` | Test `position_value_follows_the_curve_and_failed_exit_keeps_it_open` | ✅ Konfirmasi receipt (status 1, atau saldo turun), 3 percobaan dengan slippage melebar, posisi **tetap open** saat gagal (watchdog mengulang tiap 5 dtk, maksimal 10 ronde lalu alert operator), single-flight per posisi, venue V2 (`getAmountsOut` + `swapExactTokensForETHSupportingFeeOnTransferTokens`), satelit dijual paralel, `minOut=1` hanya untuk exit darurat |
+| **C9** | Calldata per akun: satelit menerima `ethIn` dan `minTokensOut` milik master dengan `msg.value` 10% (Pons: revert / output kurang). Copy-trade Pons: `ethIn` milik wallet yang di-copy ≠ `msg.value` kita. Copy V2: `amountOutMin` untuk ukuran mereka, sehingga revert bila ukuran kita lebih kecil. Ditambah round-trip wei→f64→wei membuat `msg.value` = `ethIn - 1 wei` (3/10.000 ukuran, mis. 0,0021 ETH). | `dispatcher.rs:259-308`, `payload.rs:89-153` | PoC: satelit `ethIn=0.05` vs `msg.value=0.005`; 0,0021 ETH → 2099999999999999 | ✅ `adapt_buy_calldata`: `ethIn := value`, `minOut` diskalakan linear bila ukuran kita lebih kecil (aman karena output kurva konkaf), recipient ditulis ulang; nilai wei dipakai apa adanya |
+| **C10** | Hot path tersendat (bukan deadlock, tapi *lock convoy*): (a) `process_new_block` memanggil `get_transaction_receipt` di pembaca feed, padahal `call_rpc` mencoba endpoint satu per satu (hingga 5×2,5 dtk); (b) monitor 100 ms memegang `trackers.write` + `positions.write` selama `eth_call` per posisi, sehingga `register_entry` (Task A), watchdog, dan Telegram ikut tertahan; (c) Telegram `menu_portfolio` memegang `positions.read()` selama request HTTP Telegram. | `prysm.rs:711-763`, `risk/mod.rs:436-486`, `telegram.rs:830-868` | PoC: feed tertahan **2,50 dtk** → 6,5 µs; `positions.write()` menunggu **2,20 dtk** → 10 µs | ✅ Resolver receipt di task latar (race semua endpoint tiap 60 ms); monitor: snapshot → kuotasi paralel tanpa lock → evaluasi; guard Telegram di-scope |
+| **H10** | "Blok +1" meleset satu blok: order dilepas saat blok L+1 *teramati*, sehingga tx mendarat ≥ L+2 (ditambah lag indeks receipt, sering L+3). | `prysm.rs:587-603` | Test lama mengunci rilis di blok 101 | ✅ `delay` = blok pendaratan. Tembak saat L teramati **dan** token terselesaikan; resolusi yang tiba setelah order jatuh tempo langsung menembak tanpa menunggu blok berikutnya |
+| **H11** | Pola C mati di produksi: `recent_launches` di-key dengan alamat launchpad (ditimpa tiap launch), padahal companion membeli di **kurva**. Selain itu, *sell* oleh companion ikut memicu entry, dan key dedup berbeda dari A/B (berisiko entry ganda). | `prysm.rs:483-512`, `531` | PoC: buy companion ke kurva menghasilkan `false` | ✅ Alias kurva/token setelah resolusi; hanya selector buy; key = hash tx launch; Pola C mempercepat order A/B yang sedang antre (bukan beli dua kali) |
+| **H12** | Replay backlog: saat (re)connect, broadcaster mengirim backlog (bisa beberapa menit), dan setiap swap watchlist di dalamnya di-copy ulang. Blok yang sudah diproses HTTP bridge juga diproses lagi dari feed, sehingga copy-trade ganda. | `stream.rs:414-435` | Analisis kode | ✅ Filter umur blok (`header.timestamp`, > 5 dtk tidak di-trade) + dedup blok lintas sumber (`claim_block`, aman bila `FEED_GENESIS_BLOCK` salah) |
+| **H13** | Gas limit mengabaikan komponen L1 (poster gas Arbitrum dihitung dalam unit gas L2). Saat L1 mahal, tx ditolak "intrinsic gas too low". Rebalance memakai `gas_limit 21000` yang tidak cukup di Arbitrum. | `dispatcher.rs:299`, `wallet.rs:310` | Analisis | ✅ `NodeInterface.gasEstimateL1Component` (0xC8) tiap 2 dtk, limit = intrinsic + 300k + 1,5×L1; rebalance diestimasi provider |
+| **H14** | Revert Guard dikuotasi pada cadangan **awal** (mengabaikan dev buy di tx launch). `slippage = NaN` membuat `minTokensOut = 0` (tanpa guard). | `prysm.rs:772`, `payload.rs:271` | Tabel §8.4 | ✅ Cadangan live dari resolver, fallback `E0 + devBuy`; NaN fail-closed |
+| **H15** | Fallback simulasi di produksi: harga `rand::random` saat RPC gagal, kapasitas kurva `elapsed×2` (PreGraduation memaksa exit di 45 dtk), dan `on_inflow_event` tidak pernah dipanggil (Inactivity Decay menutup setiap posisi System di 25 dtk, M6 putaran 1). | `risk/mod.rs:489-502` | Analisis | ✅ Tanpa kuotasi berarti hanya layer berbasis waktu yang dievaluasi; kapasitas = `(E-E0)/4,2 ETH`; buy kurva dari feed diteruskan ke Layer 2 (`on_pool_buy`, akun sendiri dikecualikan) |
+| **H16** | Mnemonic baru yang gagal disimpan diabaikan (`let _ =`). Setelah restart, mnemonic lain dibuat dan dana di wallet lama hilang. | `wallet.rs:52` | Analisis | ✅ Startup gagal bila tidak bisa dipersist |
+| **M14** | Saat Prysm aktif, **setiap** tx di setiap blok di-`ecrecover` (k256 **237–358 µs/tx**). | `stream.rs:459-463` | Ukur | ✅ Hanya swap yang bisa di-copy atau tx ke launchpad allowlist |
+| **M15** | Nonce: (a) resync gagal (429) meninggalkan gap sampai kegagalan berikutnya; (b) approve gagal tanpa resync membuat sell tertahan di belakang gap; (c) resync membuat provider baru (TLS dingin). | `dispatcher.rs:357`, `risk/mod.rs:277` | Test `rejected_broadcast_rolls_the_nonce_back_without_rpc` | ✅ `release_nonce`: rollback CAS tanpa RPC bila ditolak pasti di semua endpoint (`BroadcastError::nonce_unused`); selain itu resync |
+| **M16** | `parse_address_from_topic` panic pada data RPC non-ASCII (slice di tengah karakter), di task feed. | `prysm.rs:168` | PoC panic | ✅ |
+| **M17** | Token target copy V2 = 32 byte terakhir calldata, sehingga salah bila ada byte tambahan (tracking/referral). | `stream.rs:157` | Test | ✅ `decode_v2_path_ends` (ABI + bounds check) |
+| **M18** | `eth_call`/receipt mencoba endpoint *send* lebih dulu (endpoint sequencer menolak read), sehingga ada RTT terbuang per read. | `dispatcher.rs:131` | Analisis | ✅ Read pool dipimpin `RPC_HTTP_URL` |
+| **M19** | Task A memproses sinyal berurutan (Nitro baru menjawab `eth_sendRawTransaction` setelah tx disekuens), dan log stdout (blocking) ditulis sebelum dispatch/enqueue. | `main.rs:136-158`, `stream.rs:572` | Analisis | ✅ Satu task per sinyal, sinyal > 3 dtk dibuang, log setelah enqueue |
+| **M20** | Receipt launch: status tidak dicek (launch revert diulang tiap blok sampai kedaluwarsa); log `T_LAUNCH` diterima dari emitter mana pun. | `prysm.rs:713-741` | Test | ✅ Status 0x1 wajib, emitter ∈ `PRYSM_LAUNCHPAD_FACTORIES` |
+
+### 8.3 Jawaban Pertanyaan
+
+**1a. Deadlock `RwLock`/`Mutex`?** Tidak ada siklus urutan lock, jadi tidak ada deadlock sejati. Masalah sebenarnya adalah tiga *lock-across-await* (C10). `tokio::RwLock` bersifat fair: writer yang antre memblokir reader baru, sehingga satu `eth_call` lambat berantai ke Task A, watchdog, dan Telegram. Lock di Prysm kini `std::Mutex` yang tidak pernah melewati `.await` (urutan `pending_orders` → `resolutions`).
+
+**1b. Nonce desync / gap?** Skenario lama: (i) semua endpoint menolak dan resync kena 429, sehingga gap bertahan dan setiap tx dari akun itu gagal "nonce too high" sampai kegagalan berikutnya; (ii) approve gagal tanpa resync. Keduanya sudah ditutup. Yang tersisa (kini self-healing dalam satu kegagalan): timeout setelah tx sebenarnya sudah diteruskan + node `pending` yang lag bisa memakai ulang nonce N ("nonce too low"), dan `store()` saat resync bisa memundurkan nonce yang sedang in-flight bila liquidation dan dispatch berjalan bersamaan pada akun master. Solusi tuntas: *nonce lane* per akun (lihat §8.6).
+
+**1c. Parsing aman?** Unpacker L2 sudah tahan input jahat (putaran 1). Temuan baru M16 (panic) dan M17 (salah token) sudah diperbaiki. Decoder ABI baru (`decode_v2_path_ends`, `decode_v2_amounts_out_last`) memakai `checked_add`/`get` (fuzz offset `U256::MAX` diuji). Silent drop: path V2 yang tidak terdekode kini di-log `warn`. `balanceOf` ke non-kontrak (`0x`) kini error, bukan 0.
+
+**1d. Fallback indexing lag `T_LAUNCH`?** Dulu: query di jalur feed, `Ok(None)` diulang tiap blok (tiap kali memblokir feed), `Err` jatuh ke dispatch calldata launch (ditolak dispatcher, order hilang), dan launch yang revert diulang sampai 15 dtk. Sekarang: resolver latar me-*race* semua endpoint tiap 60 ms sampai `prysm_max_signal_age_secs`, cek status dan emitter, ambil `getReserves` untuk Revert Guard, lalu langsung menembak order yang sudah jatuh tempo. Feed tidak pernah menunggu RPC.
+
+**2a. Alokasi heap di hot path.** Biaya terukur (release, container ini): `sign_hash` **128 µs**, `recover_signer` **237–358 µs** (k256) vs **51 µs** (libsecp256k1), `decode_2718` 350 ns, baca `tokio::RwLock` 106 ns, body JSON lama 1,05 µs. Artinya alokasi (puluhan sampai ratusan ns) bukan bottleneck. Yang sudah dihapus: pohon `serde_json::Value` + string hex (body kini satu buffer), salinan payload saat `BUFFER_SIZE=0` (`with_padding` memindahkan `Vec`), `input.to_vec()` di jalur Prysm. Yang tersisa: `Vec` `tx_slices` per pesan L2 (bisa `SmallVec<[&[u8]; 16]>`), `Bytes` input di `decode_2718` (hindari dengan *RLP peek* `to`+selector sebelum decode penuh), `format!("{:?}", hash)` per akun. Prioritas nyata: (1) backend **libsecp256k1** (4,7× lebih cepat untuk ecrecover); (2) **pre-sign** entry Prysm (§8.6 F1) agar 128 µs×akun keluar dari jalur picu.
+
+**2b. Jaringan.** `tcp_nodelay` sudah aktif di broadcaster. Pada WebSocket feed, Nagle hanya memengaruhi *kiriman* kita (pong), bukan latensi terima. Yang berpengaruh: co-location dengan sequencer dan beberapa feed sekaligus (§8.6 F2). HTTP/2 aktif via ALPN (fitur `http2`), sehingga beberapa tx paralel ke host yang sama tidak antre koneksi. Pool tanpa idle-timeout + ping 20 dtk sudah ada (kini juga untuk read pool). DNS: reqwest hanya me-resolve saat koneksi baru. Pin IP sequencer dengan `ClientBuilder::resolve(host, addr)` atau aktifkan fitur `hickory-dns` agar reconnect tidak menunggu DNS. Catatan penting: Nitro menjawab `eth_sendRawTransaction` setelah tx **disekuens**, jadi "latensi broadcast" sudah termasuk waktu sekuensing. Inilah alasan Task A kini satu task per sinyal.
+
+**2c. Config lock → atomik.** Ya. Per dispatch ada ±6 `tokio::RwLock` read (buffer, mode, gas limit, max fee, trade size, jumlah sub-akun), per tx yang bisa di-copy ada 1 (watchlist), dan per event Prysm ada 3–5. Total sekitar 1 µs saat tanpa kontensi, tapi bisa menunggu writer Telegram. Rekomendasi: snapshot `RuntimeParams` di `arc_swap::ArcSwap` (satu atomic load per dispatch), skalar f64 sebagai `AtomicU64` (`f64::to_bits`):
+```rust
+pub struct AtomicF64(AtomicU64);
+impl AtomicF64 {
+    pub fn load(&self) -> f64 { f64::from_bits(self.0.load(Ordering::Relaxed)) }
+    pub fn store(&self, v: f64) { self.0.store(v.to_bits(), Ordering::Relaxed) }
+}
+// hot path: let p = config.params.load(); // Arc<RuntimeParams>, tanpa .await
+```
+
+**3a. Matematika Revert Guard.** Rumus constant-product sudah benar, termasuk price impact order sendiri. Pembulatan `floor` aman, dan U256 tidak overflow (1e27×1e4). Guard sebenarnya membatasi **berapa ETH yang dibeli pihak lain sebelum kita** (min/kuotasi ≈ (E_kuotasi/E)²), dan batas itu hampir tidak bergantung pada ukuran modal:
+
+| Slippage | 0,005 ETH | 0,05 ETH | 0,2 ETH | 1 ETH |
+|---|---|---|---|---|
+| 15% | 0,14 ETH | 0,14 ETH | 0,15 ETH | 0,17 ETH |
+| 25% | 0,26 ETH | 0,26 ETH | 0,27 ETH | 0,32 ETH |
+
+Dengan kuotasi lama (cadangan awal), dev buy 0,06 ETH saja sudah memakan ~6 poin dari anggaran slippage (15% efektif tinggal 8,8%; 25% tinggal 19,6%), sehingga toleransi turun dari 0,15 ke ~0,08 ETH (slip 15%) dan dari 0,27 ke ~0,20 ETH (slip 25%). **Verifikasi wajib:** di Arbitrum, `block.number` di Solidity adalah nomor **blok L1** (bukan L2). Bila Pons menghitung jendela pajak dengan `block.number`, "Blok +1" berarti blok L1 berikutnya (~12 dtk pada chain yang settle ke Ethereum). Akibatnya setiap entry L2 "+1" jatuh di jendela 99%: Revert Guard menyelamatkan modal, tapi entry tidak pernah terisi. Header feed membawa `blockNumber` L1 untuk penjadwalan jika memang begitu.
+
+**3b. Gas limit.** Reserve 300k + intrinsic cukup untuk eksekusi buy/sell kurva, tetapi komponen L1 dulu tidak dihitung (H13). Di Arbitrum yang dibayar adalah `gasUsed × baseFee` (sisa limit dikembalikan), jadi limit besar hanya menaikkan saldo minimum `value + limit × maxFee`. Karena itu `MAX_FEE_GWEI=15` terlalu tinggi untuk L2 berbiaya ~0,01–0,1 gwei (2 juta gas × 15 gwei = 0,03 ETH tertahan per tx). Priority fee tidak membeli urutan di Arbitrum FCFS, kecuali chain memakai Timeboost (lane express dilelang).
+
+### 8.4 Perubahan Perilaku dan Konfigurasi
+
+| Hal | Sebelum | Sesudah |
+|---|---|---|
+| `PRYSM_MIN_BLOCK_DELAY` | tembak saat L+delay teramati (mendarat L+delay+1) | blok **pendaratan** (`1` = Blok +1); 0 diperlakukan 1 |
+| Order Prysm tanpa token terselesaikan | dikirim (lalu ditolak dispatcher) | ditahan sampai resolver selesai atau kedaluwarsa |
+| `ETH_USD_PRICE` | 2600 hard-coded | env, default 2600 |
+| Gas limit | `max(GAS_LIMIT, intrinsic+300k)` | `+ 1,5 × L1 component` |
+| Exit gagal | posisi ditutup | tetap open, retry dengan slippage melebar, alert setelah 10 ronde |
+| Posisi tanpa token setelah 20 dtk | dikelola sampai exit | ditutup "Entry not filled" (satelit tetap dijual) |
+| Exit allowance | approve saat exit | pre-approve begitu fill terdeteksi |
+| `register_entry` | 4 argumen | + `ExitVenue` (dari calldata entry) |
+| `PRYSM_LAUNCHPAD_FACTORIES` | cek `to` | juga harus memuat **emitter** event `T_LAUNCH` |
+
+Yang perlu diverifikasi terhadap kontrak: definisi blok jendela pajak (§8.3-3a), ABI `getReserves()` kurva (diasumsikan `(uint256 eth, uint256 token)`), dan graduation 4,2 ETH sebagai **ETH riil terkumpul** (`E - 1,68`).
+
+### 8.5 Rekomendasi Latensi (terukur)
+
+1. **libsecp256k1** untuk ecrecover: 237 µs → **51 µs** (diukur dengan menambah `alloy-consensus = { version = "2.5.0", features = ["secp256k1"] }`). Belum diaktifkan karena butuh toolchain C (cek dulu di MinGW Anda).
+2. **`tracing_appender::non_blocking`**: log `info!` adalah write stdout blocking. Log di jalur sinyal sudah dipindah ke setelah enqueue, tapi writer non-blocking menghapus sisa biayanya.
+3. **Valuasi tanpa RPC** (§8.6 F3): monitor 100 ms kini paralel dan tanpa lock, tetapi tetap 1–2 `eth_call` per posisi per tick (rawan 429).
+4. **Runtime khusus** (current-thread, core di-pin) untuk feed + dispatch, dan `mimalloc`.
+
+### 8.6 Fitur Lanjutan (contoh implementasi)
+
+**F1. Pre-signed entry (Prysm).** Begitu resolver tahu kurva, semua yang dibutuhkan tx entry sudah pasti (kurva, ukuran, minOut, recipient). Tanda tangani saat itu juga untuk tiap akun, dan saat blok picu tiba hanya broadcast byte yang sudah jadi. Ini menghapus 128 µs × akun + encoding dari jalur picu.
+```rust
+struct PreSigned { raw: bytes::Bytes, hash: String, nonce: u64, acc: TreasuryAccount }
+async fn presign(acc: &TreasuryAccount, tx: TxEip1559) -> anyhow::Result<PreSigned> {
+    let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst); // reservasi
+    let tx = TxEip1559 { nonce, ..tx };
+    let sig = acc.signer.sign_hash(&tx.signature_hash()).await?;
+    let env = TxEnvelope::Eip1559(tx.into_signed(sig));
+    Ok(PreSigned { hash: format!("{:?}", env.tx_hash()), raw: env.encoded_2718().into(), nonce, acc: acc.clone() })
+}
+// Saat order dibatalkan/kedaluwarsa: wallet.release_nonce(&p.acc, p.nonce, true) (rollback CAS).
+// Saat blok picu: broadcaster.broadcast_raw_tx(&p.raw, &p.hash).await
+```
+
+**F2. Multi-feed racing.** Jalankan beberapa koneksi feed sekaligus (feed resmi + relay sendiri di region lain). Dedup `fetch_max(seq)` yang sudah ada memastikan pesan pertama yang tiba yang diproses. Hasilnya: latensi = minimum dari N feed, dan tidak ada celah failover.
+```rust
+// StreamListener::run: satu task per URL, semuanya berbagi next_feed_seq / next_block
+let feeds: Vec<String> = std::env::var("FEED_URLS")?.split(',').map(str::to_owned).collect();
+let tasks = feeds.into_iter().map(|url| {
+    let me = self.clone(); // Arc<StreamListener>
+    tokio::spawn(async move { loop { let _ = me.listen_sequencer_feed(&url).await; tokio::time::sleep(jitter(MIN_RECONNECT_BACKOFF)).await; } })
+});
+futures_util::future::join_all(tasks).await;
+```
+
+**F3. Cermin state kurva dari feed.** Setiap `buy`/`sell` Pons yang terlihat di feed bisa langsung diterapkan ke salinan cadangan lokal (constant-product), lalu direkonsiliasi dengan `getReserves()` tiap beberapa detik. Valuasi turun dari RTT RPC (50–200 ms, rawan 429) ke mikrodetik. Stop-loss bisa terpicu di blok yang sama saat dump terlihat, sebelum node RPC mengindeksnya.
+```rust
+struct CurveMirror { eth: U256, tok: U256, synced_at: Instant }
+impl CurveMirror {
+    fn apply_buy(&mut self, eth_in: U256, fee_bps: u32) {
+        let e = eth_in - eth_in * U256::from(fee_bps) / U256::from(10_000);
+        let out = self.tok * e / (self.eth + e);
+        self.eth += e; self.tok -= out;
+    }
+    fn apply_sell(&mut self, tokens_in: U256) {
+        let gross = self.eth * tokens_in / (self.tok + tokens_in);
+        self.tok += tokens_in; self.eth -= gross;
+    }
+}
+// StreamListener: PoolBuy (sudah ada) + PoolSell -> mirror.apply_*; RiskManager membaca mirror
+```
+
+Lainnya: *nonce lane* per akun (mutex async per akun untuk alokasi + broadcast, menghapus kasus resync vs in-flight); health-check sequencer (lag feed = `now - header.timestamp`, histogram RTT `eth_sendRawTransaction` per endpoint, urutkan ulang endpoint otomatis); prediksi alamat token CREATE2 dari calldata launch (butuh source factory) agar Blok +1 tidak bergantung pada indexer; Timeboost express lane bila chain mengaktifkannya.

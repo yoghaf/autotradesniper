@@ -150,7 +150,7 @@ flowchart TD
    - Terjadi dalam jendela waktu $\le 60\text{ detik}$ sejak blok peluncuran token.
 
 ### 🛡️ Guardrails & Mode Keluar (Exit Modes):
-- **Min Block Guard (+3 Blok):** Order secara deterministik diantrikan (*queued*) dan hanya disiarkan mulai dari Blok $+3$ setelah peluncuran untuk menghindari *launch tax* blok 0.
+- **Min Block Guard (`PRYSM_MIN_BLOCK_DELAY`):** nilai ini adalah blok tempat entry *mendarat* relatif terhadap blok launch L. Order ditembakkan begitu blok `L + delay - 1` teramati di feed **dan** alamat token/kurva sudah terselesaikan dari receipt launch (resolver latar belakang), sehingga `1` = mendarat di Blok +1. Revert Guard tetap melindungi bila tx jatuh di jendela pajak 99%.
 - **Max Usia Sinyal:** $\le 15\text{ detik}$ (menolak sinyal usang/stale).
 - **Market Cap Ceiling:** $\le \$8.000\text{ USD}$ saat pemicuan order.
 - **Dua Pilihan Mode Exit:**
