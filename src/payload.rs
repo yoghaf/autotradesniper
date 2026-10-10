@@ -31,8 +31,16 @@ pub const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 pub const ERC20_ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
 /// getReserves() on Pons bonding curve
 pub const PONS_GET_RESERVES_SELECTOR: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
+/// pairToken() on Pons bonding curve to query paired ERC-20 token
+pub const PONS_PAIR_TOKEN_SELECTOR: [u8; 4] = [0x3d, 0xe3, 0x5b, 0x79];
 /// PonsV2LaunchFactory Launched event topic hash
 pub const PONS_LAUNCH_TOPIC_HEX: &str = "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607";
+/// Snipe tax applied on Pons bonding curve during Block +1 and Block +2 (6.18% = 618 bps)
+pub const PONS_SNIPE_TAX_BPS: u32 = 618;
+/// Base protocol fee on Pons bonding curve (1.00% = 100 bps)
+pub const PONS_BASE_FEE_BPS: u32 = 100;
+/// Initial virtual ETH reserve on Pons bonding curve: 1.68 ETH (in wei)
+pub const PONS_INITIAL_ETH_RESERVE_WEI: u128 = 1_680_000_000_000_000_000;
 
 /// Low-level optimized calldata payload assembler
 pub struct CalldataPayloadBuilder;
@@ -73,14 +81,20 @@ impl CalldataPayloadBuilder {
         21_000 + data_gas + 4 * padding as u64
     }
 
-    /// Rewrite the recipient of a copied V2 `swapExactETHForTokens*` call to `recipient`.
+    /// Rewrite the recipient of a copied trade calldata (Pons curve `buy` or V2 `swapExactETHForTokens*`) to `recipient`.
     ///
     /// Replaying the watched wallet's calldata verbatim would buy tokens *for that wallet*:
-    /// `to` is an explicit argument. Returns `None` for any selector whose amounts or recipients
-    /// cannot be safely re-targeted (V3 `exactInputSingle` and Universal Router encode `amountIn`
-    /// in calldata, which would no longer match our `msg.value`).
+    /// `to` or `recipient` is an explicit argument. Returns `None` for any selector whose amounts or recipients
+    /// cannot be safely re-targeted.
     pub fn retarget_swap_recipient(calldata: &[u8], recipient: Address) -> Option<Vec<u8>> {
-        // (uint256 amountOutMin, address[] path, address to, uint256 deadline)
+        if calldata.len() < 4 {
+            return None;
+        }
+        // Case 1: Pons bonding curve buy(uint256 ethIn, uint256 minTokensOut, address recipient)
+        if calldata[..4] == PONS_BUY_SELECTOR {
+            return Self::retarget_pons_buy_recipient(calldata, recipient);
+        }
+        // Case 2: Uniswap V2 swapExactETHForTokens*(uint256 amountOutMin, address[] path, address to, uint256 deadline)
         const TO_WORD: usize = 4 + 32 * 2;
         if calldata.len() < 4 + 32 * 4 || !crate::stream::fast_selectors::is_copyable_eth_swap(calldata) {
             return None;
@@ -202,6 +216,15 @@ impl CalldataPayloadBuilder {
         Some((eth_reserve, token_reserve))
     }
 
+    /// Decode `address` from 32-byte ABI return data (e.g. `pairToken()`)
+    pub fn decode_address_output(data: &[u8]) -> Option<Address> {
+        if data.len() < 32 {
+            return None;
+        }
+        let addr_bytes: [u8; 20] = data[12..32].try_into().ok()?;
+        Some(Address::from(addr_bytes))
+    }
+
     /// Pons curve output for buying tokens with `eth_in`
     pub fn calculate_pons_tokens_out(
         eth_reserve: U256,
@@ -218,6 +241,35 @@ impl CalldataPayloadBuilder {
             return U256::ZERO;
         }
         token_reserve * e / denom
+    }
+
+    /// Calculate minimum tokens out for Pons curve buy, assuming Block +1 snipe tax (6.18%)
+    /// and slippage tolerance.
+    ///
+    /// REVERT GUARD:
+    /// In Block 0 (the launch block), Pons applies a 99% buy tax.
+    /// In Block +1, Pons applies only 6.18% snipe tax.
+    /// If an order is targeted for Block +1 but is accidentally sequenced in Block 0,
+    /// actual tokens received would be ~1% of normal quote.
+    /// Because min_tokens_out is quoted for 6.18% tax with slippage tolerance (e.g. 25%),
+    /// a 99% fill violates `require(tokensOut >= minTokensOut)` and REVERTS safely on-chain,
+    /// protecting 100% of the input ETH from being taxed away!
+    pub fn calculate_pons_buy_revert_guard(
+        eth_in: U256,
+        eth_reserve: Option<U256>,
+        token_reserve: Option<U256>,
+        slippage_percent: f64,
+    ) -> U256 {
+        let er = eth_reserve.unwrap_or_else(|| U256::from(PONS_INITIAL_ETH_RESERVE_WEI));
+        let tr = token_reserve.unwrap_or_else(|| {
+            U256::from(1_000_000_000u64) * U256::from(1_000_000_000_000_000_000u64)
+        });
+        let quote = Self::calculate_pons_tokens_out(er, tr, eth_in, PONS_BASE_FEE_BPS, PONS_SNIPE_TAX_BPS);
+        if quote.is_zero() {
+            return U256::from(1);
+        }
+        let slip_factor = ((100.0 - slippage_percent.clamp(0.0, 90.0)) / 100.0 * 10_000.0) as u128;
+        (quote * U256::from(slip_factor)) / U256::from(10_000)
     }
 
     /// Pons curve net ETH out for selling `tokens_in`

@@ -353,3 +353,152 @@ fn topic_address_parsing_and_reserve_math() {
     let eth_out = CalldataPayloadBuilder::calculate_pons_eth_out(eth_res, tok_res, U256::from(10_000_000), 100, 200);
     assert!(eth_out > U256::ZERO);
 }
+
+// ── Block +1, Zero-Delay Companion & Revert Guard Tests ─────────────────────
+
+#[tokio::test]
+async fn block_plus_one_delay_scheduling() {
+    let mut config = AppConfig::default();
+    config.prysm_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+    *config.prysm_min_block_delay.write().await = 1; // Block +1
+    *config.prysm_size_eth.write().await = 0.05;
+    config.prysm_launchpads = Arc::new([LAUNCHPAD].into_iter().collect());
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let engine = PrysmEngine::new(config, tx);
+
+    let calldata = spoof_calldata();
+    // Launch at block 100
+    engine
+        .inspect_transaction(
+            address!("1111111111111111111111111111111111111111"),
+            Some(LAUNCHPAD),
+            U256::from(21_000_000_000_000_000u64), // 0.021 ETH
+            &calldata,
+            B256::from([1u8; 32]),
+            100,
+            Instant::now(),
+        )
+        .await;
+
+    // At block 100, must NOT be dispatched
+    assert!(rx.try_recv().is_err());
+
+    // At block 101 (Block +1), must be released and dispatched!
+    engine.process_new_block(101).await;
+    let signal = rx.try_recv().expect("Should dispatch at Block +1");
+    assert_eq!(signal.block_number, 101);
+}
+
+#[tokio::test]
+async fn companion_pattern_c_zero_delay_execution() {
+    let mut config = AppConfig::default();
+    config.prysm_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+    *config.prysm_min_block_delay.write().await = 3; // Even if config delay is 3, Pattern C must have 0 delay!
+    let launchpad = LAUNCHPAD;
+    config.prysm_launchpads = Arc::new([launchpad].into_iter().collect());
+
+    let (tx, mut rx) = mpsc::channel(16);
+    let engine = PrysmEngine::new(config, tx);
+
+    // 1. Register launch
+    let calldata = spoof_calldata();
+    engine
+        .inspect_transaction(
+            address!("1111111111111111111111111111111111111111"),
+            Some(launchpad),
+            U256::from(21_000_000_000_000_000u64),
+            &calldata,
+            B256::from([1u8; 32]),
+            100,
+            Instant::now(),
+        )
+        .await;
+
+    // 2. Companion account buys immediately
+    let companion = autotradesniper::models::prysm::COMPANION_ACCOUNTS[0];
+    let buy_calldata = vec![0x59, 0xa8, 0x7b, 0xc1]; // Pons buy
+    engine
+        .inspect_transaction(
+            companion,
+            Some(launchpad),
+            U256::from(50_000_000_000_000_000u64),
+            &buy_calldata,
+            B256::from([2u8; 32]),
+            100,
+            Instant::now(),
+        )
+        .await;
+
+    // Must be dispatched IMMEDIATELY without waiting for block advance!
+    let signal = rx.try_recv().expect("Pattern C should execute with 0 block delay");
+    assert!(signal.strategy_tag.unwrap().contains("Pola C"));
+}
+
+#[test]
+fn pons_buy_copy_trade_recognition_and_retargeting() {
+    let buy_payload = CalldataPayloadBuilder::build_pons_buy_payload(
+        U256::from(50_000_000_000_000_000u64),
+        U256::from(10_000_000),
+        address!("1111111111111111111111111111111111111111"),
+    );
+
+    // 1. is_copyable_eth_swap recognizes Pons buy selector
+    assert!(autotradesniper::stream::fast_selectors::is_copyable_eth_swap(&buy_payload));
+
+    // 2. retarget_swap_recipient retargets Pons buy recipient to our account
+    let our_account = address!("9999999999999999999999999999999999999999");
+    let retargeted = CalldataPayloadBuilder::retarget_swap_recipient(&buy_payload, our_account);
+    assert!(retargeted.is_some());
+    let retargeted = retargeted.unwrap();
+    assert_eq!(&retargeted[4 + 32 * 2 + 12..], our_account.as_slice());
+}
+
+#[test]
+fn pons_buy_revert_guard_protects_capital() {
+    let eth_in = U256::from(50_000_000_000_000_000u64); // 0.05 ETH
+    let er = U256::from(autotradesniper::payload::PONS_INITIAL_ETH_RESERVE_WEI); // 1.68 ETH
+    let tr = U256::from(1_000_000_000u64) * U256::from(1_000_000_000_000_000_000u64); // 1e9 tokens
+    let slippage = 25.0; // 25%
+
+    // Calculate revert guard min_tokens_out (quoted for 6.18% snipe tax + 25% slippage)
+    let min_tokens_out = CalldataPayloadBuilder::calculate_pons_buy_revert_guard(eth_in, Some(er), Some(tr), slippage);
+    assert!(min_tokens_out > U256::ZERO);
+
+    // In Block +1 (6.18% snipe tax): actual tokens out must exceed min_tokens_out
+    let actual_tokens_block1 = CalldataPayloadBuilder::calculate_pons_tokens_out(
+        er,
+        tr,
+        eth_in,
+        autotradesniper::payload::PONS_BASE_FEE_BPS,
+        autotradesniper::payload::PONS_SNIPE_TAX_BPS,
+    );
+    assert!(actual_tokens_block1 >= min_tokens_out, "Block +1 fill must succeed");
+
+    // In Block 0 (99% tax): actual tokens out is ~99% lower, far below min_tokens_out!
+    let actual_tokens_block0 = CalldataPayloadBuilder::calculate_pons_tokens_out(
+        er,
+        tr,
+        eth_in,
+        100,
+        9900, // 99% tax
+    );
+    assert!(
+        actual_tokens_block0 < min_tokens_out,
+        "Block 0 with 99% tax must violate min_tokens_out and REVERT on-chain, protecting capital"
+    );
+}
+
+#[test]
+fn lightweight_zero_buffer_calldata_size() {
+    let buy_payload = CalldataPayloadBuilder::build_pons_buy_payload(
+        U256::from(50_000_000_000_000_000u64),
+        U256::from(10_000_000),
+        address!("1111111111111111111111111111111111111111"),
+    );
+
+    let calibrated = CalldataPayloadBuilder::build_calibrated_payload(&buy_payload, 0);
+    assert_eq!(calibrated.len(), buy_payload.len());
+    assert_eq!(calibrated.len(), 4 + 32 * 3); // exactly 100 bytes!
+}
+

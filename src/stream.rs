@@ -39,6 +39,8 @@ pub const MAX_L2_BATCH_DEPTH: usize = 16;
 /// Pre-computed 4-byte DEX Swap Method Signatures as u32 integers
 /// Enables single CPU clock-cycle bitwise matching (Zero Heap Allocation)
 pub mod fast_selectors {
+    /// Pons bonding curve buy(uint256,uint256,address) -> 0x59a87bc1
+    pub const PONS_BUY: u32 = 0x59a87bc1;
     /// swapExactETHForTokens(uint256,address[],address,uint256) -> 0x7ff36ab5
     pub const SWAP_EXACT_ETH: u32 = 0x7ff36ab5;
     /// swapExactETHForTokensSupportingFeeOnTransferTokens -> 0xb6f9de95
@@ -66,7 +68,8 @@ pub mod fast_selectors {
         ]);
         matches!(
             tag,
-            SWAP_EXACT_ETH
+            PONS_BUY
+                | SWAP_EXACT_ETH
                 | SWAP_EXACT_ETH_FEE
                 | SWAP_EXACT_TOKENS
                 | EXACT_INPUT_SINGLE
@@ -75,13 +78,12 @@ pub mod fast_selectors {
         )
     }
 
-    /// Swaps that can be copied with our own `msg.value` and recipient: V2
-    /// `swapExactETHForTokens*(amountOutMin, path, to, deadline)`, where the ETH input is
-    /// `msg.value` and the recipient is a plain head word.
+    /// Swaps that can be copied with our own `msg.value` and recipient:
+    /// Pons curve `buy(uint256,uint256,address)` or V2 `swapExactETHForTokens*(...)`.
     #[inline(always)]
     pub fn is_copyable_eth_swap(calldata: &[u8]) -> bool {
         match calldata.first_chunk::<4>() {
-            Some(sel) => matches!(u32::from_be_bytes(*sel), SWAP_EXACT_ETH | SWAP_EXACT_ETH_FEE),
+            Some(sel) => matches!(u32::from_be_bytes(*sel), PONS_BUY | SWAP_EXACT_ETH | SWAP_EXACT_ETH_FEE),
             None => false,
         }
     }
@@ -573,9 +575,17 @@ impl StreamListener {
             elapsed, from, to_address, value
         );
 
-        // Step 3: Zero-copy parameter extraction (last element of the V2 `path`)
-        let target_token = ZeroCopyTxParser::extract_target_token_fast(input)
-            .unwrap_or(to_address);
+        // Step 3: Zero-copy parameter extraction (Pons curve address or last element of V2 `path`)
+        let is_pons = input
+            .first_chunk::<4>()
+            .map(|sel| u32::from_be_bytes(*sel) == fast_selectors::PONS_BUY)
+            .unwrap_or(false);
+
+        let target_token = if is_pons {
+            to_address
+        } else {
+            ZeroCopyTxParser::extract_target_token_fast(input).unwrap_or(to_address)
+        };
 
         let signal = TradeSignal {
             tx_hash,

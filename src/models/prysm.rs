@@ -584,7 +584,11 @@ impl PrysmEngine {
         tx_hash: B256,
     ) {
         let now = Instant::now();
-        let min_block_delay = *self.config.prysm_min_block_delay.read().await;
+        let min_block_delay = if report.pattern == PrysmPattern::PatternC {
+            0
+        } else {
+            *self.config.prysm_min_block_delay.read().await
+        };
         let required_block = meta.launch_block.saturating_add(min_block_delay);
 
         // One entry per token: Pola C fires again for every companion buy, and the same launch
@@ -618,7 +622,28 @@ impl PrysmEngine {
         }
 
         // Validate guardrails immediately
-        match self.validate_entry_guardrails(&meta, current_block, now).await {
+        let guardrails_res = if report.pattern == PrysmPattern::PatternC {
+            let max_age_secs = *self.config.prysm_max_signal_age_secs.read().await;
+            let max_mcap_usd = *self.config.prysm_max_mcap_usd.read().await;
+            let age = now.saturating_duration_since(meta.launch_instant);
+            if age > Duration::from_secs(max_age_secs) {
+                Err(format!(
+                    "Signal Staleness Exceeded: {:.1}s > {}s limit",
+                    age.as_secs_f64(), max_age_secs
+                ))
+            } else if meta.market_cap_usd > max_mcap_usd {
+                Err(format!(
+                    "Market Cap Ceiling Exceeded: ${:.2} > ${:.2} limit",
+                    meta.market_cap_usd, max_mcap_usd
+                ))
+            } else {
+                Ok(())
+            }
+        } else {
+            self.validate_entry_guardrails(&meta, current_block, now).await
+        };
+
+        match guardrails_res {
             Ok(_) => {
                 report.guardrails_passed = true;
                 self.stats.record_match(report.clone()).await;
@@ -741,9 +766,18 @@ impl PrysmEngine {
             let (target_token, target_pool, swap_data) = if order.token_address != order.pool_address {
                 let size_wei = U256::from((order.size_eth * 1e18) as u128);
                 let recipient = self.master_address.read().await.unwrap_or(Address::ZERO);
+                let slippage = *self.config.prysm_slippage_percent.read().await;
+                // Revert Guard: quote with Block +1 6.18% snipe tax and slippage.
+                // If this order accidentally lands in Block 0 with 99% tax, EVM reverts safely on-chain!
+                let min_tokens_out = crate::payload::CalldataPayloadBuilder::calculate_pons_buy_revert_guard(
+                    size_wei,
+                    None,
+                    None,
+                    slippage,
+                );
                 let buy_payload = crate::payload::CalldataPayloadBuilder::build_pons_buy_payload(
                     size_wei,
-                    U256::from(1),
+                    min_tokens_out,
                     recipient,
                 );
                 (order.token_address, order.pool_address, buy_payload)
@@ -794,11 +828,29 @@ impl PrysmEngine {
     ) {
         let size_eth = *self.config.prysm_size_eth.read().await;
         let size_wei = U256::from((size_eth * 1e18) as u128);
+        let slippage = *self.config.prysm_slippage_percent.read().await;
 
         info!(
-            "🎯 [Prysm Series Entry Dispatched] Pattern: {}, Size: {:.4} ETH, Slippage: 25%, Token: {:?}",
-            pattern, size_eth, meta.token_address
+            "🎯 [Prysm Series Entry Dispatched] Pattern: {}, Size: {:.4} ETH, Slippage: {:.1}%, Token: {:?}",
+            pattern, size_eth, slippage, meta.token_address
         );
+
+        let swap_payload = if meta.token_address != meta.pool_address {
+            let recipient = self.master_address.read().await.unwrap_or(Address::ZERO);
+            let min_tokens_out = crate::payload::CalldataPayloadBuilder::calculate_pons_buy_revert_guard(
+                size_wei,
+                None,
+                None,
+                slippage,
+            );
+            crate::payload::CalldataPayloadBuilder::build_pons_buy_payload(
+                size_wei,
+                min_tokens_out,
+                recipient,
+            )
+        } else {
+            swap_calldata
+        };
 
         let signal = TradeSignal {
             tx_hash,
@@ -806,7 +858,7 @@ impl PrysmEngine {
             target_token: meta.token_address,
             pool_or_router: meta.pool_address,
             entry_amount_wei: size_wei,
-            swap_calldata,
+            swap_calldata: swap_payload,
             detected_at: Instant::now(),
             block_number: meta.launch_block,
             strategy_tag: Some(format!("{}: {}", PRYSM_STRATEGY_TAG_PREFIX, pattern)),

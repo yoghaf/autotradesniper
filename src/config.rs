@@ -14,6 +14,7 @@ fn default_prysm_enabled() -> bool { false }
 fn default_prysm_size_eth() -> f64 { 0.01 }
 fn default_prysm_exit_mode() -> crate::types::PrysmExitMode { crate::types::PrysmExitMode::System }
 fn default_prysm_max_mcap_usd() -> f64 { 8000.0 }
+fn default_prysm_min_block_delay() -> u64 { 1 }
 
 /// Persistent runtime state stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +41,8 @@ pub struct RuntimeState {
     pub prysm_exit_mode: crate::types::PrysmExitMode,
     #[serde(default = "default_prysm_max_mcap_usd")]
     pub prysm_max_mcap_usd: f64,
+    #[serde(default = "default_prysm_min_block_delay")]
+    pub prysm_min_block_delay: u64,
 }
 
 /// Global shared application configuration
@@ -150,9 +153,9 @@ impl AppConfig {
         }
 
         let buffer_size = std::env::var("BUFFER_SIZE")
-            .unwrap_or_else(|_| "94500".to_string())
+            .unwrap_or_else(|_| "0".to_string())
             .parse::<usize>()
-            .unwrap_or(94500);
+            .unwrap_or(0);
 
         let gas_limit = std::env::var("GAS_LIMIT")
             .unwrap_or_else(|_| "600000".to_string())
@@ -243,7 +246,12 @@ impl AppConfig {
             prysm_size_eth: Arc::new(RwLock::new(0.01)),
             prysm_exit_mode: Arc::new(RwLock::new(crate::types::PrysmExitMode::System)),
             prysm_max_mcap_usd: Arc::new(RwLock::new(8000.0)),
-            prysm_min_block_delay: Arc::new(RwLock::new(3)),
+            prysm_min_block_delay: Arc::new(RwLock::new(
+                std::env::var("PRYSM_MIN_BLOCK_DELAY")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(1),
+            )),
             prysm_max_signal_age_secs: Arc::new(RwLock::new(15)),
             prysm_slippage_percent: Arc::new(RwLock::new(25.0)),
             prysm_target_mcap_usd: Arc::new(RwLock::new(10000.0)),
@@ -342,6 +350,9 @@ impl AppConfig {
         if let Ok(mut lock) = self.prysm_max_mcap_usd.try_write() {
             *lock = state.prysm_max_mcap_usd;
         }
+        if let Ok(mut lock) = self.prysm_min_block_delay.try_write() {
+            *lock = state.prysm_min_block_delay;
+        }
 
         Ok(())
     }
@@ -375,6 +386,7 @@ impl AppConfig {
             prysm_size_eth: *self.prysm_size_eth.read().await,
             prysm_exit_mode: *self.prysm_exit_mode.read().await,
             prysm_max_mcap_usd: *self.prysm_max_mcap_usd.read().await,
+            prysm_min_block_delay: *self.prysm_min_block_delay.read().await,
         };
 
         let json = serde_json::to_vec_pretty(&state)?;

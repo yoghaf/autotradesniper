@@ -208,12 +208,22 @@ impl RiskManager {
         if let Some(ref broadcaster) = self.broadcaster {
             match self.wallet_manager.derive_account(0).await {
                 Ok(master) => {
-                    // 1. Fetch token balance for master account
+                    // 1. Resolve token address if needed (e.g. from copy-trading where target was the curve)
+                    let token_address = if signal.token_address == signal.pool_address {
+                        match broadcaster.eth_call(signal.pool_address, &crate::payload::PONS_PAIR_TOKEN_SELECTOR).await {
+                            Ok(raw) => CalldataPayloadBuilder::decode_address_output(&raw).unwrap_or(signal.token_address),
+                            Err(_) => signal.token_address,
+                        }
+                    } else {
+                        signal.token_address
+                    };
+
+                    // Fetch token balance for master account
                     let balance_calldata = CalldataPayloadBuilder::build_erc20_balance_of_payload(master.address);
-                    let token_balance = match broadcaster.eth_call(signal.token_address, &balance_calldata).await {
+                    let token_balance = match broadcaster.eth_call(token_address, &balance_calldata).await {
                         Ok(raw) => CalldataPayloadBuilder::decode_u256_output(&raw).unwrap_or(U256::ZERO),
                         Err(e) => {
-                            warn!("Liquidation: failed to fetch token balance for {:?}: {}", signal.token_address, e);
+                            warn!("Liquidation: failed to fetch token balance for {:?}: {}", token_address, e);
                             U256::ZERO
                         }
                     };
@@ -221,10 +231,10 @@ impl RiskManager {
                     if token_balance.is_zero() {
                         warn!(
                             "Liquidation: token balance is 0 for {:?}, closing position in memory without on-chain sell",
-                            signal.token_address
+                            token_address
                         );
                     } else {
-                        info!("Liquidation: master has {:?} tokens of {:?} to liquidate", token_balance, signal.token_address);
+                        info!("Liquidation: master has {:?} tokens of {:?} to liquidate", token_balance, token_address);
 
                         let chain_id = self.config.chain_id;
                         let (priority_fee_wei, max_fee_wei) = if let Some(ref fa) = self.fee_adjuster {
@@ -236,7 +246,7 @@ impl RiskManager {
 
                         // 2. Check ERC-20 Allowance
                         let allow_calldata = CalldataPayloadBuilder::build_erc20_allowance_payload(master.address, signal.pool_address);
-                        let allowance = match broadcaster.eth_call(signal.token_address, &allow_calldata).await {
+                        let allowance = match broadcaster.eth_call(token_address, &allow_calldata).await {
                             Ok(raw) => CalldataPayloadBuilder::decode_u256_output(&raw).unwrap_or(U256::ZERO),
                             Err(_) => U256::ZERO,
                         };
@@ -253,7 +263,7 @@ impl RiskManager {
                                 gas_limit,
                                 max_fee_per_gas: max_fee_wei,
                                 max_priority_fee_per_gas: priority_fee_wei,
-                                to: TxKind::Call(signal.token_address),
+                                to: TxKind::Call(token_address),
                                 value: U256::ZERO,
                                 input: Bytes::from(approve_calldata),
                                 access_list: Default::default(),
