@@ -964,26 +964,34 @@ impl TelegramBot {
                     ));
                 }
 
-                let pos_lock = self.positions.read().await;
-                let open_pos_count = pos_lock.iter().filter(|p| p.is_open).count();
-                let closed_pos_count = pos_lock.iter().filter(|p| !p.is_open).count();
+                // Scoped: the read guard must be gone before the Telegram request below is
+                // awaited, or a slow Telegram API stalls `register_entry` and the risk monitor
+                // (both need the write lock) for the whole HTTP round trip.
+                let (open_pos_count, closed_pos_count, pnl_str) = {
+                    let pos_lock = self.positions.read().await;
+                    let open_pos_count = pos_lock.iter().filter(|p| p.is_open).count();
+                    let closed_pos_count = pos_lock.iter().filter(|p| !p.is_open).count();
 
-                let mut pnl_str = String::new();
-                for p in pos_lock.iter().rev().take(5) {
-                    let status = if p.is_open { "🟢 OPEN" } else { "⚪ CLOSED" };
-                    let sign = if p.pnl_percent >= 0.0 { "+" } else { "" };
-                    pnl_str.push_str(&format!(
-                        "[{}] <b>{}</b>: {}{:.1}% ({})\n",
-                        status,
-                        p.token_symbol,
-                        sign,
-                        p.pnl_percent,
-                        html_escape(p.exit_reason.as_deref().unwrap_or("Running"))
-                    ));
-                }
-                if pnl_str.is_empty() {
-                    pnl_str = "<i>Belum ada riwayat posisi.</i>".to_string();
-                }
+                    let mut pnl_str = String::new();
+                    for p in pos_lock.iter().rev().take(5) {
+                        let status = if p.is_open { "🟢 OPEN" } else { "⚪ CLOSED" };
+                        let sign = if p.pnl_percent >= 0.0 { "+" } else { "" };
+                        pnl_str.push_str(&format!(
+                            "[{}] <b>{}</b>: {}{:.1}% ({})\n",
+                            status,
+                            p.token_symbol,
+                            sign,
+                            p.pnl_percent,
+                            html_escape(p.exit_reason.as_deref().unwrap_or("Running"))
+                        ));
+                    }
+                    (open_pos_count, closed_pos_count, pnl_str)
+                };
+                let pnl_str = if pnl_str.is_empty() {
+                    "<i>Belum ada riwayat posisi.</i>".to_string()
+                } else {
+                    pnl_str
+                };
 
                 let text = format!(
                     "📈 <b>PORTFOLIO & STATUS PnL</b>\n\
@@ -1143,9 +1151,11 @@ impl TelegramBot {
         let sign = if pos.pnl_percent >= 0.0 { "+" } else { "" };
         let reason = html_escape(pos.exit_reason.as_deref().unwrap_or("Manual Close"));
         let tx_hash = pos.exit_tx_hash.as_deref().unwrap_or("NONE (no on-chain sell executed)");
+        // An exit alert for a position that is still open means the liquidation gave up.
+        let title = if pos.is_open { "⚠️ <b>EXIT GAGAL: TOKEN MASIH DI WALLET!</b>" } else { "📊 <b>REALISASI POSISI!</b>" };
 
         let text = format!(
-            "📊 <b>REALISASI POSISI!</b>\n\
+            "{title}\n\
              ═══════════════════════════\n\
              🪙 <b>Token:</b> {}\n\
              📈 <b>Hasil PnL:</b> <code>{sign}{:.1}%</code>\n\

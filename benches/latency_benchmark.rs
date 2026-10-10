@@ -172,6 +172,7 @@ fn bench_prysm_pattern_matching(c: &mut Criterion) {
         launch_block: 100,
         launch_instant: Instant::now(),
         market_cap_usd: 5000.0,
+        launch_tx_hash: alloy::primitives::B256::ZERO,
     };
 
     let meta_b = LaunchMetadata {
@@ -186,6 +187,7 @@ fn bench_prysm_pattern_matching(c: &mut Criterion) {
         launch_block: 100,
         launch_instant: Instant::now(),
         market_cap_usd: 5000.0,
+        launch_tx_hash: alloy::primitives::B256::ZERO,
     };
 
     c.bench_function("prysm_pattern_a_evaluation_latency", |b| {

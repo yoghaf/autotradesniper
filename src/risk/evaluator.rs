@@ -49,4 +49,19 @@ impl RiskEvaluator {
 
         None
     }
+
+    /// Layers that need no price: run when a tick has no valuation (RPC down, fill not seen).
+    /// Prysm Target mode exits only on price, so it waits for the next quote.
+    pub fn evaluate_time_rules(
+        tracker: &mut PositionTracker,
+        now: Instant,
+        config: &RiskConfig,
+    ) -> Option<ExitSignal> {
+        if tracker.is_prysm_strategy
+            && tracker.prysm_exit_mode == Some(crate::types::PrysmExitMode::Target)
+        {
+            return None;
+        }
+        FlowRules::evaluate(tracker, now, config)
+    }
 }

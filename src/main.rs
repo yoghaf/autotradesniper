@@ -1,9 +1,10 @@
 use autotradesniper::config::AppConfig;
-use autotradesniper::dispatcher::Dispatcher as EngineDispatcher;
+use autotradesniper::dispatcher::{BroadcasterPool, Dispatcher as EngineDispatcher};
 use autotradesniper::models::PrysmEngine;
 use autotradesniper::payload::DynamicFeeAdjuster;
+use autotradesniper::risk::types::ExitVenue;
 use autotradesniper::risk::RiskManager;
-use autotradesniper::stream::StreamListener;
+use autotradesniper::stream::{PoolBuy, StreamListener};
 use autotradesniper::telegram::TelegramBot;
 use autotradesniper::types::{DispatchReport, Position, TradeSignal};
 use autotradesniper::wallet::WalletManager;
@@ -12,6 +13,9 @@ use anyhow::Result;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A signal that waited this long in the queue (dispatch backlog, stalled task) is stale.
+const MAX_SIGNAL_QUEUE_AGE: Duration = Duration::from_secs(3);
 use teloxide::prelude::*;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
@@ -81,6 +85,12 @@ async fn main() -> Result<()> {
     ));
     let broadcaster = dispatcher.broadcaster();
     let keep_warm = broadcaster.spawn_keep_warm(Duration::from_secs(20));
+    // Reads (eth_call, receipts) go to RPC_HTTP_URL first: sequencer-only send endpoints
+    // reject them, which would cost a wasted round trip on every read.
+    let mut read_rpcs = vec![config.rpc_http_url.clone()];
+    read_rpcs.extend(config.send_rpcs.iter().filter(|u| **u != config.rpc_http_url).cloned());
+    let reader = Arc::new(BroadcasterPool::new(read_rpcs));
+    let keep_warm_reader = reader.spawn_keep_warm(Duration::from_secs(20));
 
     let risk_manager = Arc::new(
         RiskManager::new(
@@ -89,23 +99,30 @@ async fn main() -> Result<()> {
             positions.clone(),
             exit_alert_tx,
         )
-        .with_execution(broadcaster.clone(), fee_adjuster.clone()),
+        .with_execution(broadcaster.clone(), fee_adjuster.clone())
+        .with_reader(reader.clone()),
     );
 
     let prysm_engine = Arc::new(
         PrysmEngine::new(config.clone(), signal_tx.clone())
-            .with_broadcaster(broadcaster.clone()),
+            .with_broadcaster(reader.clone()),
     );
     if let Ok(master_acc) = wallet_manager.derive_account(0).await {
         prysm_engine.set_master_address(master_acc.address).await;
     }
 
-    let stream_listener = Arc::new(StreamListener::new(
-        config.clone(),
-        fee_adjuster.clone(),
-        prysm_engine.clone(),
-        signal_tx,
-    ));
+    // Layer 2 input: buys on pools we hold, straight from the feed.
+    let (pool_buy_tx, mut pool_buy_rx) = mpsc::channel::<PoolBuy>(4096);
+    let stream_listener = Arc::new(
+        StreamListener::new(config.clone(), fee_adjuster.clone(), prysm_engine.clone(), signal_tx)
+            .with_pool_buy_sink(pool_buy_tx),
+    );
+    let risk_flow = risk_manager.clone();
+    let flow_task = tokio::spawn(async move {
+        while let Some(buy) = pool_buy_rx.recv().await {
+            risk_flow.on_pool_buy(buy.pool, buy.buyer, buy.amount_wei).await;
+        }
+    });
 
     let authorized_chat_id = config.telegram_authorized_chat_id;
     let bot_token = config.telegram_bot_token.clone();
@@ -135,25 +152,35 @@ async fn main() -> Result<()> {
 
     let signal_task = tokio::spawn(async move {
         while let Some(signal) = signal_rx.recv().await {
-            info!("Received Signal for replication from {:?}", signal.monitored_account);
-            // Dispatch first: the Telegram alert (string formatting + enqueue) is off the hot path.
-            let dispatch = dispatcher_clone.dispatch_signal(&signal).await;
-            if let Some(ref bot_ctrl) = telegram_clone {
-                bot_ctrl.broadcast_signal_detected(authorized_chat_id, &signal).await;
+            let queued = signal.detected_at.elapsed();
+            if queued > MAX_SIGNAL_QUEUE_AGE {
+                warn!("Dropping stale signal {:?} ({:?} old)", signal.tx_hash, queued);
+                continue;
             }
-
-            match dispatch {
-                Ok(report) => {
-                    // Size the position from what was actually sent, only after the master
-                    // entry was accepted by an endpoint.
-                    risk_clone
-                        .register_entry(signal.target_token, signal.pool_or_router, report.trade_eth, signal.strategy_tag)
-                        .await;
+            // One task per signal: a slow broadcast (Nitro answers only once the tx is
+            // sequenced, up to the 2.5 s timeout) must not hold the next signal back.
+            // Nonces are atomic per account, so concurrent dispatches never share one.
+            let dispatcher = dispatcher_clone.clone();
+            let risk = risk_clone.clone();
+            let telegram = telegram_clone.clone();
+            tokio::spawn(async move {
+                // Dispatch first: logging and the Telegram alert stay off the hot path.
+                let dispatch = dispatcher.dispatch_signal(&signal).await;
+                info!("Signal from {:?} dispatched in {:?}", signal.monitored_account, signal.detected_at.elapsed());
+                if let Some(ref bot_ctrl) = telegram {
+                    bot_ctrl.broadcast_signal_detected(authorized_chat_id, &signal).await;
                 }
-                Err(e) => {
-                    error!("Error during signal dispatch: {:#}", e);
+                match dispatch {
+                    Ok(report) => {
+                        // Size the position from what was actually sent, only after the master
+                        // entry was accepted by an endpoint.
+                        let venue = ExitVenue::from_entry_calldata(&signal.swap_calldata);
+                        risk.register_entry(signal.target_token, signal.pool_or_router, report.trade_eth, signal.strategy_tag, venue)
+                            .await;
+                    }
+                    Err(e) => error!("Error during signal dispatch: {:#}", e),
                 }
-            }
+            });
         }
     });
 
@@ -251,7 +278,7 @@ async fn main() -> Result<()> {
 
     info!("Shutting down engine gracefully.");
     config.is_engine_active.store(false, std::sync::atomic::Ordering::SeqCst);
-    for task in [stream_task, signal_task, risk_task, keep_warm] {
+    for task in [stream_task, signal_task, risk_task, keep_warm, keep_warm_reader, flow_task] {
         task.abort();
     }
 

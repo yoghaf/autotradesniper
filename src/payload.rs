@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{address, Address, U256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -17,6 +17,10 @@ pub const EXECUTION_GAS_RESERVE: u64 = 300_000;
 pub const FAST_EXIT_CALLDATA_SIZE: usize = 4 + 32 * 5 + 32 + 32 * 2;
 /// swapExactTokensForETH(uint256,uint256,address[],address,uint256)
 pub const SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR: [u8; 4] = [0x18, 0xcb, 0xaf, 0xe5];
+/// swapExactTokensForETHSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)
+pub const SWAP_EXACT_TOKENS_FOR_ETH_FOT_SELECTOR: [u8; 4] = [0x79, 0x1a, 0xc9, 0x47];
+/// getAmountsOut(uint256,address[]) on a V2 router
+pub const V2_GET_AMOUNTS_OUT_SELECTOR: [u8; 4] = [0xd0, 0x6c, 0xa6, 0x1f];
 
 // Pons Bonding Curve & ERC-20 Function Selectors
 /// buy(uint256,uint256,address) on Pons bonding curve (payable)
@@ -41,6 +45,59 @@ pub const PONS_SNIPE_TAX_BPS: u32 = 618;
 pub const PONS_BASE_FEE_BPS: u32 = 100;
 /// Initial virtual ETH reserve on Pons bonding curve: 1.68 ETH (in wei)
 pub const PONS_INITIAL_ETH_RESERVE_WEI: u128 = 1_680_000_000_000_000_000;
+/// Real ETH raised (`ethReserve - initial virtual reserve`) at which the curve graduates
+/// (4.2 ETH). Verify against the deployed contract: Layer 3 exits at 90% of it.
+pub const PONS_GRADUATION_ETH_WEI: u128 = 4_200_000_000_000_000_000;
+/// Initial virtual token reserve on Pons bonding curve: 1,000,000,000 tokens (18 decimals)
+pub const PONS_INITIAL_TOKEN_RESERVE_WEI: u128 = 1_000_000_000 * 1_000_000_000_000_000_000;
+/// Total token supply used for market-cap math (1,000,000,000 tokens)
+pub const PONS_TOTAL_SUPPLY_TOKENS: f64 = 1_000_000_000.0;
+/// Creator tax assumed when quoting sells (the launch parser cannot read the real one yet).
+pub const PONS_ASSUMED_CREATOR_TAX_BPS: u32 = 200;
+/// Fallback ETH/USD reference for market-cap guards (`ETH_USD_PRICE` overrides it).
+pub const DEFAULT_ETH_USD_PRICE: f64 = 2600.0;
+
+/// Arbitrum Nitro `NodeInterface` virtual contract (answers `eth_call` only).
+pub const NODE_INTERFACE_ADDRESS: Address = address!("00000000000000000000000000000000000000c8");
+/// `gasEstimateL1Component(address,bool,bytes)` on `NodeInterface`
+pub const GAS_ESTIMATE_L1_COMPONENT_SELECTOR: [u8; 4] = [0x77, 0xd4, 0x88, 0xa2];
+
+/// ETH/USD reference for market-cap guards, read once from `ETH_USD_PRICE`.
+pub fn eth_usd_reference() -> f64 {
+    static PRICE: std::sync::LazyLock<f64> = std::sync::LazyLock::new(|| {
+        std::env::var("ETH_USD_PRICE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .unwrap_or(DEFAULT_ETH_USD_PRICE)
+    });
+    *PRICE
+}
+
+/// Fully diluted market cap in ETH from curve reserves (`price = ethReserve / tokenReserve`).
+pub fn pons_mcap_eth(eth_reserve: U256, token_reserve: U256) -> Option<f64> {
+    if token_reserve.is_zero() {
+        return None;
+    }
+    let mcap = f64::from(eth_reserve) / f64::from(token_reserve) * PONS_TOTAL_SUPPLY_TOKENS;
+    mcap.is_finite().then_some(mcap)
+}
+
+/// Share of the graduation target already raised, in percent.
+pub fn pons_curve_capacity_percent(eth_reserve: U256) -> f64 {
+    let raised = eth_reserve.saturating_sub(U256::from(PONS_INITIAL_ETH_RESERVE_WEI));
+    (f64::from(raised) / PONS_GRADUATION_ETH_WEI as f64 * 100.0).clamp(0.0, 100.0)
+}
+
+/// Curve reserves right after the launch tx's dev buy, from the initial virtual reserves.
+/// Used when live `getReserves()` is unavailable: quoting against the *initial* reserves
+/// overstates our fill by roughly `(E0 / (E0 + devBuy))^2` and tightens the Revert Guard.
+pub fn pons_reserves_after_buy(eth_in: U256) -> (U256, U256) {
+    let e0 = U256::from(PONS_INITIAL_ETH_RESERVE_WEI);
+    let t0 = U256::from(PONS_INITIAL_TOKEN_RESERVE_WEI);
+    let out = CalldataPayloadBuilder::calculate_pons_tokens_out(e0, t0, eth_in, 0, 0);
+    (e0 + eth_in, t0 - out)
+}
 
 /// Low-level optimized calldata payload assembler
 pub struct CalldataPayloadBuilder;
@@ -55,6 +112,154 @@ impl CalldataPayloadBuilder {
         let mut buffer = vec![0u8; swap_calldata.len() + buffer_size];
         buffer[..swap_calldata.len()].copy_from_slice(swap_calldata);
         buffer
+    }
+
+    /// Calldata followed by `padding` zero bytes. With no padding the input is moved, not copied.
+    #[inline]
+    pub fn with_padding(mut calldata: Vec<u8>, padding: usize) -> Vec<u8> {
+        if padding > 0 {
+            calldata.resize(calldata.len() + padding, 0);
+        }
+        calldata
+    }
+
+    /// Gas limit for a tx carrying `calldata` + `padding`.
+    ///
+    /// On Arbitrum the gas limit must also cover the L1 data-poster component (charged in L2 gas
+    /// units, it rises with L1 fees and falls with the L2 base fee). A tx whose limit is below
+    /// `intrinsic + poster gas` is rejected by the sequencer ("intrinsic gas too low"). Unused gas
+    /// is refunded, so the 1.5x margin only raises the balance needed to submit, not the cost.
+    #[inline]
+    pub fn gas_limit(calldata: &[u8], padding: usize, configured: u64, l1_component_gas: u64) -> u64 {
+        let l1 = l1_component_gas.saturating_add(l1_component_gas / 2);
+        configured.max(
+            Self::intrinsic_gas(calldata, padding)
+                .saturating_add(EXECUTION_GAS_RESERVE)
+                .saturating_add(l1),
+        )
+    }
+
+    /// Re-target a copied or strategy buy for one of our accounts sending `value` wei.
+    ///
+    /// `reference_value` is the ETH the calldata was originally quoted for (the watched
+    /// wallet's `msg.value`, or the master size for satellites). Besides the recipient, the
+    /// amounts must follow our own size:
+    /// - Pons `buy(ethIn, minTokensOut, recipient)`: `ethIn` is set to exactly `value`, so it
+    ///   always matches `msg.value`.
+    /// - Both selectors: the minimum output is scaled down linearly when we buy less than the
+    ///   reference. The curve output is concave in the input, so the scaled minimum never exceeds
+    ///   what our smaller order can fill. When we buy more, the reference minimum is kept (loose
+    ///   but never a false revert).
+    ///
+    /// Returns `None` for selectors whose amounts cannot be safely re-targeted, or when the
+    /// reference size is unknown (0).
+    pub fn adapt_buy_calldata(
+        calldata: &[u8],
+        recipient: Address,
+        value: U256,
+        reference_value: U256,
+    ) -> Option<Vec<u8>> {
+        let selector = *calldata.first_chunk::<4>()?;
+        let (min_word, recipient_word) = if selector == PONS_BUY_SELECTOR {
+            if calldata.len() < 4 + 32 * 3 {
+                return None;
+            }
+            (4 + 32, 4 + 32 * 2)
+        } else if crate::stream::fast_selectors::is_copyable_eth_swap(calldata) {
+            // swapExactETHForTokens*(amountOutMin, path, to, deadline)
+            if calldata.len() < 4 + 32 * 4 {
+                return None;
+            }
+            (4, 4 + 32 * 2)
+        } else {
+            return None;
+        };
+
+        let mut out = calldata.to_vec();
+        let reference = if selector == PONS_BUY_SELECTOR {
+            let quoted_eth_in = U256::from_be_slice(&calldata[4..36]);
+            out[4..36].copy_from_slice(&value.to_be_bytes::<32>());
+            if quoted_eth_in.is_zero() { reference_value } else { quoted_eth_in }
+        } else {
+            reference_value
+        };
+        if reference.is_zero() {
+            return None;
+        }
+        if value < reference {
+            let min_out = U256::from_be_slice(&calldata[min_word..min_word + 32]);
+            let scaled = min_out.saturating_mul(value) / reference;
+            out[min_word..min_word + 32].copy_from_slice(&scaled.to_be_bytes::<32>());
+        }
+        out[recipient_word..recipient_word + 12].fill(0);
+        out[recipient_word + 12..recipient_word + 32].copy_from_slice(recipient.as_slice());
+        Some(out)
+    }
+
+    /// `(first, last)` hop of a V2 `swapExactETHForTokens*` path (WETH, output token),
+    /// ABI-decoded with bounds checks. Reading "the last 32 bytes" instead breaks on calldata
+    /// with trailing bytes (some wallets and aggregators append tracking data) and silently
+    /// picks a wrong token.
+    pub fn decode_v2_path_ends(calldata: &[u8]) -> Option<(Address, Address)> {
+        let args = calldata.get(4..)?;
+        let word = |at: usize| -> Option<&[u8]> { args.get(at..at.checked_add(32)?) };
+        let as_usize = |w: &[u8]| -> Option<usize> {
+            if w[..24].iter().any(|&b| b != 0) {
+                return None;
+            }
+            usize::try_from(u64::from_be_bytes(w[24..32].try_into().ok()?)).ok()
+        };
+        let as_address = |w: &[u8]| -> Option<Address> {
+            w[..12].iter().all(|&b| b == 0).then(|| Address::from_slice(&w[12..32]))
+        };
+        let offset = as_usize(word(32)?)?;
+        let len = as_usize(word(offset)?)?;
+        if len < 2 {
+            return None;
+        }
+        let first_at = offset.checked_add(32)?;
+        let last_at = first_at.checked_add((len - 1).checked_mul(32)?)?;
+        Some((as_address(word(first_at)?)?, as_address(word(last_at)?)?))
+    }
+
+    /// ABI-encode `getAmountsOut(uint256 amountIn, address[] path)` on a V2 router.
+    pub fn build_v2_get_amounts_out_payload(amount_in: U256, path: &[Address]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32 * (3 + path.len()));
+        payload.extend_from_slice(&V2_GET_AMOUNTS_OUT_SELECTOR);
+        payload.extend_from_slice(&amount_in.to_be_bytes::<32>());
+        payload.extend_from_slice(&U256::from(32 * 2).to_be_bytes::<32>());
+        payload.extend_from_slice(&U256::from(path.len()).to_be_bytes::<32>());
+        for hop in path {
+            payload.extend_from_slice(&[0u8; 12]);
+            payload.extend_from_slice(hop.as_slice());
+        }
+        payload
+    }
+
+    /// Last element of the `uint256[]` returned by `getAmountsOut`.
+    pub fn decode_v2_amounts_out_last(data: &[u8]) -> Option<U256> {
+        let word = |at: usize| -> Option<U256> { data.get(at..at.checked_add(32)?).map(U256::from_be_slice) };
+        let offset = usize::try_from(word(0)?).ok()?;
+        let len = usize::try_from(word(offset)?).ok()?;
+        if len == 0 {
+            return None;
+        }
+        word(offset.checked_add(32)?.checked_add((len - 1).checked_mul(32)?)?)
+    }
+
+    /// ABI-encode `NodeInterface.gasEstimateL1Component(to, false, data)`.
+    pub fn build_l1_component_estimate_payload(to: Address, data: &[u8]) -> Vec<u8> {
+        let padded = data.len().div_ceil(32) * 32;
+        let mut payload = Vec::with_capacity(4 + 32 * 4 + padded);
+        payload.extend_from_slice(&GAS_ESTIMATE_L1_COMPONENT_SELECTOR);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(to.as_slice());
+        payload.extend_from_slice(&[0u8; 32]); // contractCreation = false
+        payload.extend_from_slice(&U256::from(32 * 3).to_be_bytes::<32>());
+        payload.extend_from_slice(&U256::from(data.len()).to_be_bytes::<32>());
+        payload.extend_from_slice(data);
+        payload.resize(4 + 32 * 4 + padded, 0);
+        payload
     }
 
     /// Pre-allocated reusable buffer pool variant
@@ -113,8 +318,31 @@ impl CalldataPayloadBuilder {
         recipient: &Address,
         deadline: u64,
     ) -> Vec<u8> {
+        Self::encode_v2_exit(SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR, amount_in, amount_out_min, path, recipient, deadline)
+    }
+
+    /// ABI-encode `swapExactTokensForETHSupportingFeeOnTransferTokens(...)`: same arguments as
+    /// `swapExactTokensForETH`, but also works for tokens that tax transfers.
+    pub fn build_v2_exit_fot_payload(
+        amount_in: U256,
+        amount_out_min: U256,
+        path: &[Address],
+        recipient: &Address,
+        deadline: u64,
+    ) -> Vec<u8> {
+        Self::encode_v2_exit(SWAP_EXACT_TOKENS_FOR_ETH_FOT_SELECTOR, amount_in, amount_out_min, path, recipient, deadline)
+    }
+
+    fn encode_v2_exit(
+        selector: [u8; 4],
+        amount_in: U256,
+        amount_out_min: U256,
+        path: &[Address],
+        recipient: &Address,
+        deadline: u64,
+    ) -> Vec<u8> {
         let mut payload = Vec::with_capacity(4 + 32 * (6 + path.len()));
-        payload.extend_from_slice(&SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR);
+        payload.extend_from_slice(&selector);
         payload.extend_from_slice(&amount_in.to_be_bytes::<32>());
         payload.extend_from_slice(&amount_out_min.to_be_bytes::<32>());
         // Offset of the dynamic `path` tail, measured from the start of the arguments.
@@ -268,7 +496,9 @@ impl CalldataPayloadBuilder {
         if quote.is_zero() {
             return U256::from(1);
         }
-        let slip_factor = ((100.0 - slippage_percent.clamp(0.0, 90.0)) / 100.0 * 10_000.0) as u128;
+        // NaN would cast to a zero factor, i.e. minTokensOut = 0 and no guard at all: fail closed.
+        let slippage = if slippage_percent.is_finite() { slippage_percent.clamp(0.0, 90.0) } else { 0.0 };
+        let slip_factor = ((100.0 - slippage) / 100.0 * 10_000.0) as u128;
         (quote * U256::from(slip_factor)) / U256::from(10_000)
     }
 
@@ -307,6 +537,8 @@ pub struct DynamicFeeAdjuster {
     ema_base_fee_atomic: Arc<AtomicU64>,
     /// Atomic representation of current EMA Priority Fee (stored as micro-Gwei integer, 1e-6 Gwei)
     ema_priority_fee_atomic: Arc<AtomicU64>,
+    /// Latest `NodeInterface.gasEstimateL1Component` for a ~100 byte buy (L2 gas units).
+    l1_component_gas: Arc<AtomicU64>,
 }
 
 impl DynamicFeeAdjuster {
@@ -320,7 +552,30 @@ impl DynamicFeeAdjuster {
             min_priority_fee_gwei: min_priority_gwei,
             ema_base_fee_atomic: Arc::new(AtomicU64::new(initial_base_nano)),
             ema_priority_fee_atomic: Arc::new(AtomicU64::new(initial_prio_nano)),
+            l1_component_gas: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Record the latest L1 poster-gas estimate (from the background refresher).
+    #[inline]
+    pub fn set_l1_component_gas(&self, gas: u64) {
+        self.l1_component_gas.store(gas, Ordering::Relaxed);
+    }
+
+    /// Latest L1 poster-gas estimate in L2 gas units (0 until the first successful query).
+    #[inline]
+    pub fn l1_component_gas(&self) -> u64 {
+        self.l1_component_gas.load(Ordering::Relaxed)
+    }
+
+    /// `(priority, max fee)` in wei with `MAX_FEE_GWEI` applied (`cap_gwei <= 0` = no cap).
+    /// The priority fee never exceeds the max fee (the tx would be invalid otherwise).
+    #[inline]
+    pub fn capped_fees(&self, cap_gwei: f64) -> (u128, u128) {
+        let (ema_priority_wei, ema_max_fee_wei) = self.calculate_optimal_fees();
+        let cap_wei = if cap_gwei.is_finite() { (cap_gwei.max(0.0) * 1e9) as u128 } else { 0 };
+        let max_fee_wei = if cap_wei > 0 { ema_max_fee_wei.min(cap_wei) } else { ema_max_fee_wei };
+        (ema_priority_wei.min(max_fee_wei), max_fee_wei)
     }
 
     /// Feed a newly received block's fee metrics into the EMA estimator

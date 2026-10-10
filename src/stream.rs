@@ -28,6 +28,13 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// HTTP fallback never replays more than this many blocks after a stall (stale signals).
 const MAX_HTTP_CATCHUP_BLOCKS: u64 = 32;
+/// Transactions in blocks older than this are not acted on. On (re)connect the broadcaster
+/// replays its backlog (possibly minutes of blocks); without this every watched swap in it was
+/// copied again as if it had just happened.
+const MAX_SIGNAL_BLOCK_AGE_SECS: u64 = 5;
+/// Feed and HTTP block numbers further apart than this mean `FEED_GENESIS_BLOCK` is wrong;
+/// cross-source de-duplication is then skipped so neither source can starve the other.
+const MAX_BLOCK_NUMBERING_SKEW: u64 = 10_000;
 
 /// `arbostypes.L1MessageType_L2Message`: only these feed messages carry an L2 message payload.
 pub const L1_MESSAGE_TYPE_L2_MESSAGE: u8 = 3;
@@ -236,6 +243,29 @@ struct L1IncomingMessage<'a> {
 #[derive(Deserialize)]
 struct L1Header {
     kind: u8,
+    /// L2 block timestamp (seconds) assigned by the sequencer.
+    #[serde(default)]
+    timestamp: u64,
+}
+
+/// A curve/pool buy seen on the feed (Layer 2 inflow input for the risk engine).
+#[derive(Debug, Clone, Copy)]
+pub struct PoolBuy {
+    pub pool: Address,
+    pub buyer: Address,
+    pub amount_wei: U256,
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Too old to trade on (unknown timestamp = fresh).
+fn is_stale_block(timestamp_secs: u64, now_secs: u64) -> bool {
+    timestamp_secs != 0 && now_secs.saturating_sub(timestamp_secs) > MAX_SIGNAL_BLOCK_AGE_SECS
 }
 
 /// Real-Time Sequencer Feed & Signal Replication Stream Listener
@@ -246,7 +276,14 @@ pub struct StreamListener {
     signal_tx: mpsc::Sender<TradeSignal>,
     /// Highest feed sequence number processed + 1 (0 = none); drops duplicates after reconnects.
     next_feed_seq: AtomicU64,
+    /// Highest L2 block processed by either source + 1, so blocks the HTTP bridge already
+    /// handled are not processed again from the feed backlog (and vice versa).
+    next_block: AtomicU64,
+    skew_warned: AtomicBool,
+    /// Feed messages skipped as too old (backlog replay, or a skewed system clock).
+    stale_skipped: AtomicU64,
     fee_refresher_started: AtomicBool,
+    pool_buy_tx: Option<mpsc::Sender<PoolBuy>>,
 }
 
 impl StreamListener {
@@ -262,8 +299,42 @@ impl StreamListener {
             prysm_engine,
             signal_tx,
             next_feed_seq: AtomicU64::new(0),
+            next_block: AtomicU64::new(0),
+            skew_warned: AtomicBool::new(false),
+            stale_skipped: AtomicU64::new(0),
             fee_refresher_started: AtomicBool::new(false),
+            pool_buy_tx: None,
         }
+    }
+
+    /// Forward every curve buy seen on the feed (risk engine Layer 2 input).
+    pub fn with_pool_buy_sink(mut self, tx: mpsc::Sender<PoolBuy>) -> Self {
+        self.pool_buy_tx = Some(tx);
+        self
+    }
+
+    /// Read-only form of `claim_block` (does not reserve the block).
+    fn is_block_processed(&self, block: u64) -> bool {
+        let next = self.next_block.load(Ordering::Relaxed);
+        next > block && next - 1 - block <= MAX_BLOCK_NUMBERING_SKEW
+    }
+
+    /// Claim `block` for processing; false if the other source already processed it.
+    fn claim_block(&self, block: u64) -> bool {
+        let prev = self.next_block.fetch_max(block.saturating_add(1), Ordering::Relaxed);
+        if prev <= block {
+            return true;
+        }
+        if prev - 1 - block > MAX_BLOCK_NUMBERING_SKEW {
+            if !self.skew_warned.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "Feed and RPC block numbers differ by > {} (block #{} vs #{}): check FEED_GENESIS_BLOCK",
+                    MAX_BLOCK_NUMBERING_SKEW, block, prev - 1
+                );
+            }
+            return true;
+        }
+        false
     }
 
     /// Background fee refresher to poll gas prices from RPC without adding latency to the sequencer feed
@@ -286,6 +357,26 @@ impl StreamListener {
                 "params": []
             });
 
+            // L1 poster gas for a representative ~100 byte buy, priced by NodeInterface.
+            let sample_buy = crate::payload::CalldataPayloadBuilder::build_pons_buy_payload(
+                U256::from(u64::MAX),
+                U256::from(u64::MAX),
+                Address::repeat_byte(0xab),
+            );
+            let l1_call = crate::payload::CalldataPayloadBuilder::build_l1_component_estimate_payload(
+                Address::repeat_byte(0xab),
+                &sample_buy,
+            );
+            let l1_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "eth_call",
+                "params": [{
+                    "to": format!("{:?}", crate::payload::NODE_INTERFACE_ADDRESS),
+                    "data": alloy::hex::encode_prefixed(&l1_call),
+                }, "latest"]
+            });
+
             let mut tick = tokio::time::interval(Duration::from_secs(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -300,6 +391,16 @@ impl StreamListener {
                             }
                         }
                     }
+                }
+                // `gasEstimateForL1` is the first return word (uint64).
+                let l1_gas = async {
+                    let json: serde_json::Value = client.post(&rpc_http).json(&l1_payload).send().await.ok()?.json().await.ok()?;
+                    let raw = alloy::hex::decode(json.get("result")?.as_str()?).ok()?;
+                    let word = crate::payload::CalldataPayloadBuilder::decode_u256_output(&raw)?;
+                    u64::try_from(word).ok()
+                };
+                if let Some(gas) = l1_gas.await {
+                    fee_adjuster.set_l1_component_gas(gas);
                 }
             }
         });
@@ -363,9 +464,23 @@ impl StreamListener {
     /// Returns `Ok(())` on an orderly close and `Err` on handshake failure, transport error
     /// or a silent (half-open) connection.
     async fn listen_sequencer_feed(&self, feed_url: &str) -> Result<()> {
-        let (mut ws_stream, _) = connect_async(feed_url)
+        let (mut ws_stream, response) = connect_async(feed_url)
             .await
             .context("Failed to connect to Arbitrum Sequencer Feed WebSocket")?;
+
+        // Nitro feed servers announce their chain; a feed for another chain would be fatal.
+        if let Some(chain) = response
+            .headers()
+            .get("Arbitrum-Chain-Id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            anyhow::ensure!(
+                chain == self.config.chain_id,
+                "Feed {} serves chain {} but CHAIN_ID is {}",
+                feed_url, chain, self.config.chain_id
+            );
+        }
 
         info!("⚡ Successfully connected to Real-Time Sequencer Feed ({})", feed_url);
         let mut b64_buf = Vec::with_capacity(64 * 1024);
@@ -383,12 +498,12 @@ impl StreamListener {
             match msg {
                 Message::Text(text) => {
                     if self.config.is_engine_running() {
-                        self.handle_feed_frame(text.as_bytes(), &mut b64_buf).await;
+                        self.handle_feed_frame(text.as_bytes(), &mut b64_buf, Instant::now()).await;
                     }
                 }
                 Message::Binary(bin) => {
                     if self.config.is_engine_running() {
-                        self.handle_feed_frame(&bin, &mut b64_buf).await;
+                        self.handle_feed_frame(&bin, &mut b64_buf, Instant::now()).await;
                     }
                 }
                 Message::Close(frame) => {
@@ -402,7 +517,7 @@ impl StreamListener {
     }
 
     /// Decode one broadcaster frame and process each contained message in order.
-    async fn handle_feed_frame(&self, frame: &[u8], b64_buf: &mut Vec<u8>) {
+    async fn handle_feed_frame(&self, frame: &[u8], b64_buf: &mut Vec<u8>, received_at: Instant) {
         let parsed: FeedFrame<'_> = match serde_json::from_slice(frame) {
             Ok(f) => f,
             Err(e) => {
@@ -411,6 +526,7 @@ impl StreamListener {
             }
         };
 
+        let now_secs = unix_now_secs();
         for m in parsed.messages {
             let seq = m.sequence_number;
             if self.next_feed_seq.fetch_max(seq.saturating_add(1), Ordering::Relaxed) > seq {
@@ -418,11 +534,24 @@ impl StreamListener {
             }
             // Every feed message produces exactly one L2 block.
             let block_number = self.config.feed_genesis_block.saturating_add(seq);
+            if !self.claim_block(block_number) {
+                continue; // already processed by the HTTP bridge
+            }
             let incoming = m.message.message;
             let carries_l2 = incoming.header.as_ref().is_none_or(|h| h.kind == L1_MESSAGE_TYPE_L2_MESSAGE);
+            let stale = incoming.header.as_ref().is_some_and(|h| is_stale_block(h.timestamp, now_secs));
+            if stale && self.stale_skipped.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
+                warn!(
+                    "Skipping feed message #{} as stale ({}s old): backlog replay after (re)connect. \
+                     If this persists, the system clock is off (run NTP).",
+                    seq,
+                    incoming.header.as_ref().map_or(0, |h| now_secs.saturating_sub(h.timestamp))
+                );
+            }
 
             b64_buf.clear();
             let l2_bytes: &[u8] = if carries_l2
+                && !stale
                 && base64::engine::general_purpose::STANDARD
                     .decode_vec(incoming.l2_msg.as_bytes(), b64_buf)
                     .is_ok()
@@ -431,13 +560,12 @@ impl StreamListener {
             } else {
                 &[]
             };
-            self.process_l2_message(block_number, l2_bytes).await;
+            self.process_l2_message(block_number, l2_bytes, received_at).await;
         }
     }
 
     /// Process raw L2 sequencer bytes: release matured block queues & inspect transactions
-    async fn process_l2_message(&self, block_number: u64, l2_bytes: &[u8]) {
-        let start = Instant::now();
+    async fn process_l2_message(&self, block_number: u64, l2_bytes: &[u8], start: Instant) {
 
         // 1. Notify Prysm Series Strategy of block progression (releases matured +3 block orders)
         self.prysm_engine.process_new_block(block_number).await;
@@ -455,13 +583,17 @@ impl StreamListener {
             // `_exact`: trailing bytes make Nitro reject the tx, so we must not act on it either.
             let Ok(envelope) = TxEnvelope::decode_2718_exact(tx_raw) else { continue };
             let input = envelope.input();
+            let to = envelope.to();
 
-            // ecrecover costs tens of µs; skip it for txs no pipeline can act on.
-            if !prysm_enabled && !fast_selectors::is_copyable_eth_swap(input) {
+            // ecrecover costs ~360 µs (k256): only pay it for txs a pipeline can act on.
+            // Copy-trades and Pola C are buys; Pola A/B are calls into an allowlisted launchpad.
+            // Previously, enabling Prysm recovered the sender of every tx in every block.
+            let needs_sender = fast_selectors::is_copyable_eth_swap(input)
+                || (prysm_enabled && to.is_some_and(|t| self.config.prysm_launchpads.contains(&t)));
+            if !needs_sender {
                 continue;
             }
             let Ok(from) = envelope.recover_signer() else { continue };
-            let to = envelope.to();
             let value = envelope.value();
             let tx_hash = *envelope.tx_hash();
 
@@ -501,14 +633,25 @@ impl StreamListener {
                     let from_block = (last_block + 1)
                         .max(current_block.saturating_sub(MAX_HTTP_CATCHUP_BLOCKS - 1));
                     for block_num in from_block..=current_block {
+                        if self.is_block_processed(block_num) {
+                            last_block = block_num;
+                            continue; // the feed already covered it: skip the fetch too
+                        }
                         // `.full()`: the default request returns only tx hashes.
                         let block = match provider.get_block_by_number(block_num.into()).full().await {
                             Ok(Some(b)) => b,
                             // Retry this block on the next tick instead of silently skipping it.
                             Ok(None) | Err(_) => break,
                         };
+                        last_block = block_num;
+                        if !self.claim_block(block_num) {
+                            continue; // the feed already processed it
+                        }
                         let start = Instant::now();
                         self.prysm_engine.process_new_block(block_num).await;
+                        if is_stale_block(block.header.timestamp, unix_now_secs()) {
+                            continue;
+                        }
 
                         if let BlockTransactions::Full(txs) = block.transactions {
                             for tx in txs {
@@ -525,7 +668,6 @@ impl StreamListener {
                                     .await;
                             }
                         }
-                        last_block = block_num;
                     }
                 }
                 Ok(_) => {}
@@ -564,27 +706,35 @@ impl StreamListener {
             None => return, // Contract creation, not a swap
         };
 
+        let is_pons = input
+            .first_chunk::<4>()
+            .is_some_and(|sel| u32::from_be_bytes(*sel) == fast_selectors::PONS_BUY);
+
+        // Layer 2 input: every curve buy, watched or not (the risk task filters by pool).
+        if is_pons
+            && !value.is_zero()
+            && let Some(sink) = self.pool_buy_tx.as_ref()
+        {
+            let _ = sink.try_send(PoolBuy { pool: to_address, buyer: from, amount_wei: value });
+        }
+
         // Step 2: Fast watchlist lookup (O(1) in HashSet)
         if !self.config.is_in_watchlist(&from).await {
             return;
         }
 
-        let elapsed = start_time.elapsed().as_micros();
-        info!(
-            "⚡ ZERO-COPY ON-CHAIN SIGNAL DETECTED in {} µs! Account: {:?} -> Router: {:?}, Value: {} wei",
-            elapsed, from, to_address, value
-        );
-
-        // Step 3: Zero-copy parameter extraction (Pons curve address or last element of V2 `path`)
-        let is_pons = input
-            .first_chunk::<4>()
-            .map(|sel| u32::from_be_bytes(*sel) == fast_selectors::PONS_BUY)
-            .unwrap_or(false);
-
+        // Step 3: Target token (Pons: the curve, resolved to its token later; V2: last path hop,
+        // ABI-decoded). A path that does not decode is not copied.
         let target_token = if is_pons {
             to_address
         } else {
-            ZeroCopyTxParser::extract_target_token_fast(input).unwrap_or(to_address)
+            match crate::payload::CalldataPayloadBuilder::decode_v2_path_ends(input) {
+                Some((_, token)) => token,
+                None => {
+                    warn!("Watched swap {:?} has an undecodable path; not copied", tx_hash);
+                    return;
+                }
+            }
         };
 
         let signal = TradeSignal {
@@ -600,8 +750,13 @@ impl StreamListener {
         };
 
         // Never block the feed reader on a full queue: a backlog of 1000 signals is stale anyway.
-        if let Err(e) = self.signal_tx.try_send(signal) {
-            error!("Dropping trade signal (queue unavailable): {}", e);
+        // Logging (a blocking stdout write) happens only after the signal is queued.
+        match self.signal_tx.try_send(signal) {
+            Ok(()) => info!(
+                "⚡ ZERO-COPY ON-CHAIN SIGNAL queued in {} µs! Account: {:?} -> Router: {:?}, Value: {} wei",
+                start_time.elapsed().as_micros(), from, to_address, value
+            ),
+            Err(e) => error!("Dropping trade signal (queue unavailable): {}", e),
         }
     }
 }
