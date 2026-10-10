@@ -58,8 +58,8 @@ impl TelegramBot {
         // Bounded channel to prevent memory bloat during on-chain activity spikes
         let (alert_queue_tx, alert_queue_rx) = mpsc::channel::<QueuedTelegramAlert>(500);
 
+        // Spawn dedicated background rate-limited message consumer (1 msg/sec limit)
         let bot_clone = bot.clone();
-        // Spawn independent async rate-limiting worker (1 msg/sec token bucket)
         tokio::spawn(async move {
             Self::run_rate_limited_alert_worker(bot_clone, alert_queue_rx).await;
         });
@@ -85,7 +85,7 @@ impl TelegramBot {
         while let Some(alert) = alert_rx.recv().await {
             let res = bot
                 .send_message(ChatId(alert.chat_id), alert.text)
-                .parse_mode(ParseMode::MarkdownV2)
+                .parse_mode(ParseMode::Html)
                 .await;
 
             if let Err(e) = res {
@@ -171,18 +171,18 @@ impl TelegramBot {
         let max_mcap = *self.config.prysm_max_mcap_usd.read().await;
 
         format!(
-            "🔬 *STRATEGI: SERI PRYSM (FAST\\-PATH PATTERN)*\n\
+            "🔬 <b>STRATEGI: SERI PRYSM (FAST-PATH PATTERN)</b>\n\
              ═══════════════════════════\n\
-             • *Status Model*   : [{}]\n\
-             • *Modal Entri*    : `{:.4} ETH`\n\
-             • *Mode Exit*      : {}\n\
-             • *Pola Aktif*     : Pola A (Prysmcloud), Pola B (.lat), Pola C (Companion)\n\
-             • *Max MCap Entri* : `${:.0} USD`\n\
-             • *Min Block Guard*: `+3 Blok` (Anti\\-Launch Tax Protection)\n\
-             • *Max Usia Sinyal*: `15 Detik`\n\
-             • *Toleransi Slip* : `25.0%`\n\
+             • <b>Status Model</b>   : [{}]\n\
+             • <b>Modal Entri</b>    : <code>{:.4} ETH</code>\n\
+             • <b>Mode Exit</b>      : {}\n\
+             • <b>Pola Aktif</b>     : Pola A (Prysmcloud), Pola B (.lat), Pola C (Companion)\n\
+             • <b>Max MCap Entri</b> : ${:.0} USD\n\
+             • <b>Min Block Guard</b>: +3 Blok (Anti-Launch Tax Protection)\n\
+             • <b>Max Usia Sinyal</b>: 15 Detik\n\
+             • <b>Toleransi Slip</b> : 25.0%\n\
              ═══════════════════════════\n\
-             _Sistem mengevaluasi metadata calldata peluncuran token secara mandiri\\._",
+             <i>Sistem mengevaluasi metadata calldata peluncuran token secara mandiri.</i>",
             status_str,
             size_eth,
             exit_mode,
@@ -206,30 +206,30 @@ impl TelegramBot {
         for (i, r) in recents.iter().enumerate() {
             let status = if r.guardrails_passed { "✅ Eksekusi" } else { "❌ Ditolak" };
             recent_str.push_str(&format!(
-                "{}\\. *{}* \\- `{}` \\({}\\)\n   _{}_\n",
+                "{}. <b>{}</b> - <code>{:?}</code> ({})\n   <i>{}</i>\n",
                 i + 1,
                 r.pattern,
-                format!("{:?}", r.token_address),
+                r.token_address,
                 status,
-                r.reason.replace('-', "\\-").replace('_', "\\_")
+                r.reason
             ));
         }
         if recent_str.is_empty() {
-            recent_str = "_Belum ada riwayat kecocokan pola\\._".to_string();
+            recent_str = "<i>Belum ada riwayat kecocokan pola.</i>".to_string();
         }
 
         format!(
-            "📊 *STATISTIK & RIWAYAT MATCH SERI PRYSM*\n\
+            "📊 <b>STATISTIK & RIWAYAT MATCH SERI PRYSM</b>\n\
              ═══════════════════════════\n\
-             🔍 *Total Transaksi Dipindai:* {}\n\
-             🎯 *Pola A (Prysmcloud Storage):* {} match\n\
-             🌐 *Pola B (Domain .lat / 0.021 ETH):* {} match\n\
-             👥 *Pola C (Companion Trade Signals):* {} match\n\n\
-             🚀 *Total Order Tereksekusi:* {}\n\
-             ⏱️ *Ditolak (Signal Staleness > 15s):* {}\n\
-             📈 *Ditolak (Market Cap > $8k USD):* {}\n\
+             🔍 <b>Total Transaksi Dipindai:</b> {}\n\
+             🎯 <b>Pola A (Prysmcloud Storage):</b> {} match\n\
+             🌐 <b>Pola B (Domain .lat / 0.021 ETH):</b> {} match\n\
+             👥 <b>Pola C (Companion Trade Signals):</b> {} match\n\n\
+             🚀 <b>Total Order Tereksekusi:</b> {}\n\
+             ⏱️ <b>Ditolak (Signal Staleness > 15s):</b> {}\n\
+             📈 <b>Ditolak (Market Cap > $8k USD):</b> {}\n\
              ═══════════════════════════\n\
-             *Riwayat Kecocokan Terakhir:*\n\
+             <b>Riwayat Kecocokan Terakhir:</b>\n\
              {}\n\
              ═══════════════════════════",
             evaluated, a, b, c, executed, rej_stale, rej_mcap, recent_str
@@ -285,17 +285,17 @@ impl TelegramBot {
                 InlineKeyboardButton::callback(mode_btn_text, "cfg_toggle_mode"),
             ],
             vec![
-                InlineKeyboardButton::callback("🎯 TP: +25%", "cfg_tp:25"),
-                InlineKeyboardButton::callback("🎯 TP: +35%", "cfg_tp:35"),
-                InlineKeyboardButton::callback("🎯 TP: +50%", "cfg_tp:50"),
+                InlineKeyboardButton::callback("🎯 Target Profit: +25%", "cfg_tp:25.0"),
+                InlineKeyboardButton::callback("🎯 Target Profit: +35%", "cfg_tp:35.0"),
+                InlineKeyboardButton::callback("🎯 Target Profit: +50%", "cfg_tp:50.0"),
             ],
             vec![
-                InlineKeyboardButton::callback("⏱ Exit: 30s", "cfg_exit:30"),
-                InlineKeyboardButton::callback("⏱ Exit: 45s", "cfg_exit:45"),
-                InlineKeyboardButton::callback("⏱ Exit: 60s", "cfg_exit:60"),
+                InlineKeyboardButton::callback("⏱ Exit Decay: 30s", "cfg_exit:30"),
+                InlineKeyboardButton::callback("⏱ Exit Decay: 45s", "cfg_exit:45"),
+                InlineKeyboardButton::callback("⏱ Exit Decay: 60s", "cfg_exit:60"),
             ],
             vec![
-                InlineKeyboardButton::callback("📦 Calibrate Buffer (94.5 KB)", "cfg_buffer_default"),
+                InlineKeyboardButton::callback("📦 Calldata Buffer: 94.500b", "cfg_buffer_default"),
             ],
             vec![
                 InlineKeyboardButton::callback("🔙 Kembali ke Menu Utama", "menu_main"),
@@ -303,7 +303,7 @@ impl TelegramBot {
         ])
     }
 
-    /// Format Main Dashboard Summary Text
+    /// Format Main Dashboard Summary Text (Clean HTML Format)
     pub async fn get_dashboard_text(&self) -> String {
         let is_running = self.config.is_engine_running();
         let status_emoji = if is_running { "🟢 ACTIVE" } else { "🔴 PAUSED" };
@@ -322,33 +322,33 @@ impl TelegramBot {
             .unwrap_or_else(|_| "Not configured".to_string());
 
         format!(
-            "🤖 *AUTOTRADE SNIPER ENGINE DASHBOARD*\n\
+            "🤖 <b>AUTOTRADE SNIPER ENGINE DASHBOARD</b>\n\
              ═══════════════════════════\n\
-             ⚡ *Engine Status:* {}\n\
-             ⛓️ *Network:* Arbitrum Nitro / Robinhood Chain (ID: {})\n\
+             ⚡ <b>Engine Status:</b> {}\n\
+             ⛓️ <b>Network:</b> Arbitrum Nitro / Robinhood Chain (ID: {})\n\
              \n\
-             💼 *Master Account:*\n\
-             `{}`\n\
-             👥 *Satellite Sub-Accounts:* {} akun aktif\n\
-             🎯 *Watchlist Monitored:* {} akun\n\
+             💼 <b>Master Account:</b>\n\
+             <code>{}</code>\n\
+             👥 <b>Satellite Sub-Accounts:</b> {} akun aktif\n\
+             🎯 <b>Watchlist Monitored:</b> {} akun\n\
              \n\
-             ⚙️ *Execution Parameters:*\n\
-             • *Mode:* {}\n\
-             • *Batch Calldata Buffer:* {} bytes (~{:.1} KB)\n\
-             • *Static Gas Limit:* {} gas\n\
-             • *Entry Trade:* {:.4} ETH\n\
-             • *Take Profit Target:* +{:.1}%\n\
-             • *Time-Decay Exit:* {} detik\n\
+             ⚙️ <b>Execution Parameters:</b>\n\
+             • <b>Mode:</b> {}\n\
+             • <b>Batch Calldata Buffer:</b> {} bytes (~{:.1} KB)\n\
+             • <b>Static Gas Limit:</b> {} gas\n\
+             • <b>Entry Trade:</b> {:.4} ETH\n\
+             • <b>Take Profit Target:</b> +{:.1}%\n\
+             • <b>Time-Decay Exit:</b> {} detik\n\
              \n\
-             🛡️ *6-Layer Risk Architecture:* ARMED 🟢\n\
-             • L1: Trailing Stop (+20% act, -15% peak) & Hard SL (-20%)\n\
-             • L2: Quiet Market (30s <0.1 ETH) & Inactivity Decay (25s)\n\
-             • L3: Pre-Graduation Guard (90%) & Secondary Pool Trail\n\
+             🛡️ <b>6-Layer Risk Architecture:</b> ARMED 🟢\n\
+             • L1: Trailing Stop (+20% act, -15% peak) &amp; Hard SL (-20%)\n\
+             • L2: Quiet Market (30s &lt;0.1 ETH) &amp; Inactivity Decay (25s)\n\
+             • L3: Pre-Graduation Guard (90%) &amp; Secondary Pool Trail\n\
              • L4: Mempool Approval Anomaly Sensor (≥3 Approvals)\n\
              • L5: Watchdog Supervisor (5s interval, 600s max hold)\n\
              • L6: Operator Emergency Controls (/panic, /pause, /sweep)\n\
              ═══════════════════════════\n\
-             _Gunakan tombol menu di bawah untuk mengelola sistem._",
+             <i>Gunakan tombol menu di bawah untuk mengelola sistem.</i>",
             status_emoji,
             self.config.chain_id,
             master_addr,
@@ -383,17 +383,18 @@ impl TelegramBot {
                     self.bot
                         .send_message(
                             ChatId(chat_id),
-                            format!("✅ Alamat `{}` berhasil ditambahkan ke Watchlist!", addr),
+                            format!("✅ Alamat <code>{}</code> berhasil ditambahkan ke Watchlist!", addr),
                         )
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .parse_mode(ParseMode::Html)
                         .reply_markup(Self::signals_keyboard())
                         .await?;
                 } else {
                     self.bot
                         .send_message(
                             ChatId(chat_id),
-                            "❌ Format alamat tidak valid! Masukkan alamat EVM yang benar (misal: `0x...`):",
+                            "❌ Format alamat tidak valid! Masukkan alamat EVM yang benar (misal: <code>0x...</code>):",
                         )
+                        .parse_mode(ParseMode::Html)
                         .await?;
                 }
                 return Ok(());
@@ -408,11 +409,11 @@ impl TelegramBot {
                                 ChatId(chat_id),
                                 format!(
                                     "✅ Frasa Mnemonic berhasil diimpor!\n\n\
-                                     🔑 *Alamat Master Baru:*\n`{:?}`",
+                                     🔑 <b>Alamat Master Baru:</b>\n<code>{:?}</code>",
                                     master.address
                                 ),
                             )
-                            .parse_mode(ParseMode::MarkdownV2)
+                            .parse_mode(ParseMode::Html)
                             .reply_markup(Self::treasury_keyboard())
                             .await?;
                     }
@@ -422,6 +423,7 @@ impl TelegramBot {
                                 ChatId(chat_id),
                                 format!("❌ Gagal mengimpor mnemonic: {}. Coba masukkan 12 kata kembali:", e),
                             )
+                            .parse_mode(ParseMode::Html)
                             .await?;
                     }
                 }
@@ -438,16 +440,16 @@ impl TelegramBot {
                         self.bot
                             .send_message(
                                 ChatId(chat_id),
-                                format!("✅ Modal entri Seri Prysm diubah menjadi `{:.4} ETH`!\n\n{}", size, p_text),
+                                format!("✅ Modal entri Seri Prysm diubah menjadi <code>{:.4} ETH</code>!\n\n{}", size, p_text),
                             )
-                            .parse_mode(ParseMode::MarkdownV2)
+                            .parse_mode(ParseMode::Html)
                             .reply_markup(Self::prysm_keyboard(is_enabled))
                             .await?;
                     } else {
                         self.bot.send_message(ChatId(chat_id), "❌ Nilai modal harus lebih besar dari 0 ETH:").await?;
                     }
                 } else {
-                    self.bot.send_message(ChatId(chat_id), "❌ Format angka tidak valid! Masukkan angka desimal (misal: `0.02`):").await?;
+                    self.bot.send_message(ChatId(chat_id), "❌ Format angka tidak valid! Masukkan angka desimal (misal: <code>0.02</code>):").parse_mode(ParseMode::Html).await?;
                 }
                 return Ok(());
             }
@@ -460,7 +462,7 @@ impl TelegramBot {
                 let is_running = self.config.is_engine_running();
                 self.bot
                     .send_message(ChatId(chat_id), dashboard_text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await?;
             }
@@ -469,7 +471,7 @@ impl TelegramBot {
                 let is_enabled = self.config.is_prysm_enabled();
                 self.bot
                     .send_message(ChatId(chat_id), text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::prysm_keyboard(is_enabled))
                     .await?;
             }
@@ -477,7 +479,7 @@ impl TelegramBot {
                 let text = self.get_dashboard_text().await;
                 self.bot
                     .send_message(ChatId(chat_id), text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .await?;
             }
             "/panic" => {
@@ -485,7 +487,7 @@ impl TelegramBot {
                 let is_running = self.config.is_engine_running();
                 self.bot
                     .send_message(ChatId(chat_id), alert_text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await?;
             }
@@ -494,7 +496,7 @@ impl TelegramBot {
                 let is_running = self.config.is_engine_running();
                 self.bot
                     .send_message(ChatId(chat_id), alert_text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await?;
             }
@@ -503,7 +505,7 @@ impl TelegramBot {
                 let is_running = self.config.is_engine_running();
                 self.bot
                     .send_message(ChatId(chat_id), alert_text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await?;
             }
@@ -512,7 +514,7 @@ impl TelegramBot {
                 let is_running = self.config.is_engine_running();
                 self.bot
                     .send_message(ChatId(chat_id), dashboard_text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await?;
             }
@@ -537,7 +539,7 @@ impl TelegramBot {
                 let text = self.get_dashboard_text().await;
                 let is_running = self.config.is_engine_running();
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await;
             }
@@ -545,51 +547,51 @@ impl TelegramBot {
                 let is_now_running = self.config.toggle_engine().await;
                 let text = self.get_dashboard_text().await;
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_now_running))
                     .await;
             }
             "menu_signals" => {
                 let watchlist = self.config.watchlist_accounts.read().await;
                 let text = format!(
-                    "🎯 *SIGNAL ACCOUNTS MANAGER*\n\
+                    "🎯 <b>SIGNAL ACCOUNTS MANAGER</b>\n\
                      ═══════════════════════════\n\
-                     Saat ini ada *{}* alamat akun pantauan aktif.\n\
+                     Saat ini ada <b>{}</b> alamat akun pantauan aktif.\n\
                      Pilih aksi di bawah:",
                     watchlist.len()
                 );
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::signals_keyboard())
                     .await;
             }
             "sig_add" => {
                 self.user_states.write().await.insert(chat_id, UserState::AwaitingAddAddress);
-                let text = "➕ *TAMBAH ALAMAT PANTAUAN*\n\n\
-                            Kirimkan alamat dompet EVM (format `0x...`) yang ingin dipantau transaksinya:";
+                let text = "➕ <b>TAMBAH ALAMAT PANTAUAN</b>\n\n\
+                            Kirimkan alamat dompet EVM (format <code>0x...</code>) yang ingin dipantau transaksinya:";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .await;
             }
             "sig_list" => {
                 let watchlist = self.config.watchlist_accounts.read().await;
                 let mut list_str = String::new();
                 for (i, addr) in watchlist.iter().enumerate() {
-                    list_str.push_str(&format!("{}\\. `{}`\n", i + 1, addr));
+                    list_str.push_str(&format!("{}. <code>{}</code>\n", i + 1, addr));
                 }
                 if list_str.is_empty() {
-                    list_str = "_Belum ada alamat dalam daftar pantauan\\._".to_string();
+                    list_str = "<i>Belum ada alamat dalam daftar pantauan.</i>".to_string();
                 }
 
                 let text = format!(
-                    "📋 *DAFTAR AKUN PANTAUAN (WATCHLIST)*\n\
+                    "📋 <b>DAFTAR AKUN PANTAUAN (WATCHLIST)</b>\n\
                      ═══════════════════════════\n\
                      {}\n\
                      ═══════════════════════════",
                     list_str
                 );
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::signals_keyboard())
                     .await;
             }
@@ -604,9 +606,9 @@ impl TelegramBot {
                 }
                 buttons.push(vec![InlineKeyboardButton::callback("🔙 Kembali", "menu_signals")]);
 
-                let text = "➖ *PILIH ALAMAT YANG AKAN DIHAPUS:*";
+                let text = "➖ <b>PILIH ALAMAT YANG AKAN DIHAPUS:</b>";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(InlineKeyboardMarkup::new(buttons))
                     .await;
             }
@@ -614,9 +616,9 @@ impl TelegramBot {
                 let addr_str = &s["del_addr:".len()..];
                 if let Ok(addr) = Address::from_str(addr_str) {
                     self.config.remove_watchlist_account(&addr).await;
-                    let text = format!("✅ Alamat `{}` berhasil dihapus dari Watchlist!", addr);
+                    let text = format!("✅ Alamat <code>{}</code> berhasil dihapus dari Watchlist!", addr);
                     let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .parse_mode(ParseMode::Html)
                         .reply_markup(Self::signals_keyboard())
                         .await;
                 }
@@ -626,20 +628,20 @@ impl TelegramBot {
                 let mut summary_text = String::new();
                 for s in summaries {
                     summary_text.push_str(&format!(
-                        "• *{}*\n  Path: `{}`\n  Alamat: `{}`\n  Saldo: `{:.4} ETH`\n\n",
+                        "• <b>{}</b>\n  Path: <code>{}</code>\n  Alamat: <code>{}</code>\n  Saldo: <code>{:.4} ETH</code>\n\n",
                         s.role, s.derivation_path, s.address, s.balance_eth
                     ));
                 }
 
                 let text = format!(
-                    "💼 *TREASURY & WALLETS MANAGER*\n\
+                    "💼 <b>TREASURY & WALLETS MANAGER</b>\n\
                      ═══════════════════════════\n\
                      {}\
                      ═══════════════════════════",
                     summary_text
                 );
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::treasury_keyboard())
                     .await;
             }
@@ -647,25 +649,25 @@ impl TelegramBot {
                 let new_phrase = self.wallet_manager.generate_new_mnemonic().await?;
                 let master = self.wallet_manager.get_master_account().await?;
                 let text = format!(
-                    "🔑 *AKUN INDUK BARU BERHASIL DIBUAT!*\n\
+                    "🔑 <b>AKUN INDUK BARU BERHASIL DIBUAT!</b>\n\
                      ═══════════════════════════\n\
-                     *Alamat Master:*\n`{:?}`\n\n\
-                     *12\\-Word Mnemonic Recovery Phrase:*\n\
-                     `{}`\n\n\
-                     ⚠️ _SIMPAN FRASA INI DENGAN AMAN! Seluruh sub-akun diturunkan dari frasa ini\\._",
+                     <b>Alamat Master:</b>\n<code>{:?}</code>\n\n\
+                     <b>12-Word Mnemonic Recovery Phrase:</b>\n\
+                     <code>{}</code>\n\n\
+                     ⚠️ <i>SIMPAN FRASA INI DENGAN AMAN! Seluruh sub-akun diturunkan dari frasa ini.</i>",
                     master.address, new_phrase
                 );
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::treasury_keyboard())
                     .await;
             }
             "tr_import_wallet" => {
                 self.user_states.write().await.insert(chat_id, UserState::AwaitingMnemonic);
-                let text = "📥 *IMPOR FRASA MNEMONIC*\n\n\
-                            Kirimkan 12 kata pemulihan BIP\\-39 dipisahkan dengan spasi:";
+                let text = "📥 <b>IMPOR FRASA MNEMONIC</b>\n\n\
+                            Kirimkan 12 kata pemulihan BIP-39 dipisahkan dengan spasi:";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .await;
             }
             s if s.starts_with("tr_sub:") => {
@@ -673,9 +675,9 @@ impl TelegramBot {
                 if let Ok(count) = count_str.parse::<usize>() {
                     *self.config.sub_account_count.write().await = count;
                     let _ = self.config.save_persisted_state().await;
-                    let text = format!("👥 Jumlah Sub\\-Akun Satelit diatur ke *{}* akun\\.", count);
+                    let text = format!("👥 Jumlah Sub-Akun Satelit diatur ke <b>{}</b> akun.", count);
                     let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .parse_mode(ParseMode::Html)
                         .reply_markup(Self::treasury_keyboard())
                         .await;
                 }
@@ -684,41 +686,41 @@ impl TelegramBot {
                 let _ = self.bot.edit_message_text(
                     ChatId(chat_id),
                     message_id,
-                    "⛽ *Memproses Rebalance Saldo Operasional...*",
-                ).parse_mode(ParseMode::MarkdownV2).await;
+                    "⛽ <b>Memproses Rebalance Saldo Operasional...</b>",
+                ).parse_mode(ParseMode::Html).await;
 
                 let rebalances = self.wallet_manager.rebalance_gas().await?;
                 let mut res_str = String::new();
                 for r in rebalances {
                     let status_icon = if r.success { "✅" } else { "❌" };
                     res_str.push_str(&format!(
-                        "{} Alamat `{}`: Alokasi `{:.4} ETH` (TX: `{}`)\n",
+                        "{} Alamat <code>{}</code>: Alokasi <code>{:.4} ETH</code> (TX: <code>{}</code>)\n",
                         status_icon, r.sub_account_address, r.amount_eth, r.tx_hash
                     ));
                 }
                 if res_str.is_empty() {
-                    res_str = "Seluruh Sub\\-Akun sudah memiliki saldo di atas ambang batas\\.".to_string();
+                    res_str = "Seluruh Sub-Akun sudah memiliki saldo di atas ambang batas.".to_string();
                 }
 
                 let text = format!(
-                    "⛽ *HASIL REBALANCE OPERASIONAL*\n\
+                    "⛽ <b>HASIL REBALANCE OPERASIONAL</b>\n\
                      ═══════════════════════════\n\
                      {}\n\
                      ═══════════════════════════",
                     res_str
                 );
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::treasury_keyboard())
                     .await;
             }
             "menu_settings" => {
                 let mode = *self.config.execution_mode.read().await;
-                let text = "⚙️ *EXECUTION SETTINGS*\n\
+                let text = "⚙️ <b>EXECUTION SETTINGS</b>\n\
                             ═══════════════════════════\n\
                             Sesuaikan parameter eksekusi, target profit, dan stop-loss waktu di bawah:";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::settings_keyboard(mode))
                     .await;
             }
@@ -732,9 +734,9 @@ impl TelegramBot {
                 drop(mode_lock);
                 let _ = self.config.save_persisted_state().await;
 
-                let text = format!("🔄 Mode eksekusi diubah menjadi *{}*", new_mode);
+                let text = format!("🔄 Mode eksekusi diubah menjadi <b>{}</b>", new_mode);
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::settings_keyboard(new_mode))
                     .await;
             }
@@ -744,9 +746,9 @@ impl TelegramBot {
                     *self.config.target_profit_percent.write().await = tp;
                     let _ = self.config.save_persisted_state().await;
                     let mode = *self.config.execution_mode.read().await;
-                    let text = format!("🎯 Target Profit diatur ke *\\+{}%*", tp);
+                    let text = format!("🎯 Target Profit diatur ke <b>+{}%</b>", tp);
                     let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .parse_mode(ParseMode::Html)
                         .reply_markup(Self::settings_keyboard(mode))
                         .await;
                 }
@@ -757,9 +759,9 @@ impl TelegramBot {
                     *self.config.time_decay_exit_seconds.write().await = exit_secs;
                     let _ = self.config.save_persisted_state().await;
                     let mode = *self.config.execution_mode.read().await;
-                    let text = format!("⏱ Time\\-Decay Exit limit diatur ke *{} detik*", exit_secs);
+                    let text = format!("⏱ Time-Decay Exit limit diatur ke <b>{} detik</b>", exit_secs);
                     let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                        .parse_mode(ParseMode::MarkdownV2)
+                        .parse_mode(ParseMode::Html)
                         .reply_markup(Self::settings_keyboard(mode))
                         .await;
                 }
@@ -768,9 +770,9 @@ impl TelegramBot {
                 *self.config.buffer_size.write().await = 94500;
                 let _ = self.config.save_persisted_state().await;
                 let mode = *self.config.execution_mode.read().await;
-                let text = "📦 Calldata buffer dikalibrasi ke *94\\.500 bytes* \\(~94\\.5 KB\\) sesuai kuota batch L2\\.";
+                let text = "📦 Calldata buffer dikalibrasi ke <b>94.500 bytes</b> (~94.5 KB) sesuai kuota batch L2.";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::settings_keyboard(mode))
                     .await;
             }
@@ -781,7 +783,7 @@ impl TelegramBot {
                 for w in summaries {
                     total_eth += w.balance_eth;
                     wallet_str.push_str(&format!(
-                        "• *{}*: `{:.4} ETH`\n",
+                        "• <b>{}</b>: <code>{:.4} ETH</code>\n",
                         w.role, w.balance_eth
                     ));
                 }
@@ -795,7 +797,7 @@ impl TelegramBot {
                     let status = if p.is_open { "🟢 OPEN" } else { "⚪ CLOSED" };
                     let sign = if p.pnl_percent >= 0.0 { "+" } else { "" };
                     pnl_str.push_str(&format!(
-                        "[{}] *{}*: {}{:.1}% ({})\n",
+                        "[{}] <b>{}</b>: {}{:.1}% ({})\n",
                         status,
                         p.token_symbol,
                         sign,
@@ -804,25 +806,25 @@ impl TelegramBot {
                     ));
                 }
                 if pnl_str.is_empty() {
-                    pnl_str = "_Belum ada riwayat posisi\\._".to_string();
+                    pnl_str = "<i>Belum ada riwayat posisi.</i>".to_string();
                 }
 
                 let text = format!(
-                    "📈 *PORTFOLIO & STATUS PnL*\n\
+                    "📈 <b>PORTFOLIO & STATUS PnL</b>\n\
                      ═══════════════════════════\n\
-                     💰 *Total Saldo Treasury:* `{:.4} ETH`\n\n\
-                     *Distribusi Saldo:*\n\
+                     💰 <b>Total Saldo Treasury:</b> <code>{:.4} ETH</code>\n\n\
+                     <b>Distribusi Saldo:</b>\n\
                      {}\n\
-                     📊 *Statistik Posisi:*\n\
+                     📊 <b>Statistik Posisi:</b>\n\
                      • Open Positions: {}\n\
                      • Closed Trades: {}\n\n\
-                     *Riwayat PnL Terakhir:*\n\
+                     <b>Riwayat PnL Terakhir:</b>\n\
                      {}\n\
                      ═══════════════════════════",
                     total_eth, wallet_str, open_pos_count, closed_pos_count, pnl_str
                 );
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(InlineKeyboardMarkup::new(vec![vec![
                         InlineKeyboardButton::callback("🔙 Kembali ke Menu Utama", "menu_main"),
                     ]]))
@@ -832,7 +834,7 @@ impl TelegramBot {
                 let text = EmergencyControls::handle_panic(&self.risk_manager).await;
                 let is_running = self.config.is_engine_running();
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await;
             }
@@ -840,17 +842,17 @@ impl TelegramBot {
                 let text = EmergencyControls::handle_sweep(&self.risk_manager).await;
                 let is_running = self.config.is_engine_running();
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::main_menu_keyboard(is_running))
                     .await;
             }
             "menu_models" => {
-                let text = "🔬 *MODEL STRATEGI TRADING*\n\
+                let text = "🔬 <b>MODEL STRATEGI TRADING</b>\n\
                             ═══════════════════════════\n\
                             Pilih modul strategi mandiri di bawah untuk melihat konfigurasi, \
                             status metrik, dan riwayat pola:";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::models_keyboard())
                     .await;
             }
@@ -858,7 +860,7 @@ impl TelegramBot {
                 let text = self.get_prysm_dashboard_text().await;
                 let is_enabled = self.config.is_prysm_enabled();
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::prysm_keyboard(is_enabled))
                     .await;
             }
@@ -866,16 +868,16 @@ impl TelegramBot {
                 let is_now_enabled = self.config.toggle_prysm_strategy().await;
                 let text = self.get_prysm_dashboard_text().await;
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::prysm_keyboard(is_now_enabled))
                     .await;
             }
             "prysm_set_size" => {
                 self.user_states.write().await.insert(chat_id, UserState::AwaitingPrysmSize);
-                let text = "✏️ *UBAH MODAL ENTRI SERI PRYSM*\n\n\
-                            Kirimkan jumlah ETH untuk setiap eksekusi Seri Prysm \\(misal: `0.01` atau `0.025`\\):";
+                let text = "✏️ <b>UBAH MODAL ENTRI SERI PRYSM</b>\n\n\
+                            Kirimkan jumlah ETH untuk setiap eksekusi Seri Prysm (misal: <code>0.01</code> atau <code>0.025</code>):";
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .await;
             }
             "prysm_toggle_exit" => {
@@ -883,14 +885,14 @@ impl TelegramBot {
                 let text = self.get_prysm_dashboard_text().await;
                 let is_enabled = self.config.is_prysm_enabled();
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(Self::prysm_keyboard(is_enabled))
                     .await;
             }
             "prysm_stats" => {
                 let text = self.get_prysm_stats_text().await;
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
-                    .parse_mode(ParseMode::MarkdownV2)
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(InlineKeyboardMarkup::new(vec![vec![
                         InlineKeyboardButton::callback("🔙 Kembali ke Seri Prysm", "menu_prysm"),
                     ]]))
@@ -913,15 +915,15 @@ impl TelegramBot {
     /// Broadcast live alert when on-chain signal is detected (Non-blocking)
     pub async fn broadcast_signal_detected(&self, target_chat: i64, signal: &TradeSignal) {
         let text = format!(
-            "🔔 *SINYAL TERDETEKSI!*\n\
+            "🔔 <b>SINYAL TERDETEKSI!</b>\n\
              ═══════════════════════════\n\
-             👤 *Akun Pantauan:*\n`{:?}`\n\n\
-             🪙 *Target Token:*\n`{:?}`\n\n\
-             🏊 *Pool / Router:*\n`{:?}`\n\n\
-             💵 *Entry Amount:* `{} wei`\n\
-             ⛓️ *Blok Sequencer:* `#{}`\n\
+             👤 <b>Akun Pantauan:</b>\n<code>{:?}</code>\n\n\
+             🪙 <b>Target Token:</b>\n<code>{:?}</code>\n\n\
+             🏊 <b>Pool / Router:</b>\n<code>{:?}</code>\n\n\
+             💵 <b>Entry Amount:</b> <code>{} wei</code>\n\
+             ⛓️ <b>Blok Sequencer:</b> <code>#{}</code>\n\
              ═══════════════════════════\n\
-             _Mengeksekusi batch sequence calldata buffer..._",
+             <i>Mengeksekusi batch sequence calldata buffer...</i>",
             signal.monitored_account,
             signal.target_token,
             signal.pool_or_router,
@@ -936,18 +938,18 @@ impl TelegramBot {
         let mut tx_str = String::new();
         for (i, hash) in report.tx_hashes.iter().enumerate() {
             let role = report.account_roles.get(i).map(|s| s.as_str()).unwrap_or("Account");
-            tx_str.push_str(&format!("• *{}*:\n  `{}`\n", role, hash));
+            tx_str.push_str(&format!("• <b>{}</b>:\n  <code>{}</code>\n", role, hash));
         }
 
         let text = format!(
-            "🚀 *DISPATCH BERHASIL!*\n\
+            "🚀 <b>DISPATCH BERHASIL!</b>\n\
              ═══════════════════════════\n\
-             ⛓️ *Dieksekusi pada Blok:* `#{}`\n\
-             ⚙️ *Mode:* {}\n\
-             📦 *Calldata Buffer Size:* `{} bytes`\n\
-             ⛽ *Gas Limit:* `{}` gas\n\
-             ⚡ *Latensi Eksekusi:* `{} µs`\n\n\
-             📝 *Daftar Transaksi:*\n\
+             ⛓️ <b>Dieksekusi pada Blok:</b> <code>#{}</code>\n\
+             ⚙️ <b>Mode:</b> {}\n\
+             📦 <b>Calldata Buffer Size:</b> <code>{} bytes</code>\n\
+             ⛽ <b>Gas Limit:</b> <code>{}</code> gas\n\
+             ⚡ <b>Latensi Eksekusi:</b> <code>{} µs</code>\n\n\
+             📝 <b>Daftar Transaksi:</b>\n\
              {}\
              ═══════════════════════════",
             report.block_number,
@@ -967,14 +969,14 @@ impl TelegramBot {
         let tx_hash = pos.exit_tx_hash.as_deref().unwrap_or("0x0");
 
         let text = format!(
-            "📊 *REALISASI POSISI!*\n\
+            "📊 <b>REALISASI POSISI!</b>\n\
              ═══════════════════════════\n\
-             🪙 *Token:* {}\n\
-             📈 *Hasil PnL:* `{sign}{:.1}%`\n\
-             💵 *Modal Entri:* `{:.4} ETH`\n\
-             💰 *Nilai Keluar:* `{:.4} ETH`\n\
-             📌 *Alasan Keluar:* {}\n\
-             📝 *TX Exit (Calldata standar ~164 byte):*\n`{}`\n\
+             🪙 <b>Token:</b> {}\n\
+             📈 <b>Hasil PnL:</b> <code>{sign}{:.1}%</code>\n\
+             💵 <b>Modal Entri:</b> <code>{:.4} ETH</code>\n\
+             💰 <b>Nilai Keluar:</b> <code>{:.4} ETH</code>\n\
+             📌 <b>Alasan Keluar:</b> {}\n\
+             📝 <b>TX Exit (Calldata standar ~164 byte):</b>\n<code>{}</code>\n\
              ═══════════════════════════",
             pos.token_symbol,
             pos.pnl_percent,

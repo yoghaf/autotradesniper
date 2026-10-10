@@ -12,14 +12,14 @@ impl EmergencyControls {
     pub async fn handle_panic(risk_manager: &Arc<RiskManager>) -> String {
         let liquidated_count = risk_manager.panic_sell_all().await;
         format!(
-            "🚨 *EMERGENCY PANIC SELL ACTIVATED\\!*\n\
+            "🚨 <b>EMERGENCY PANIC SELL ACTIVATED!</b>\n\
              ═══════════════════════════\n\
-             ⚡ *Status:* Engine intake PAUSED \\[🔴\\]\n\
-             🎯 *Posisi Dilikuidasi:* {} posisi aktif\n\
-             📦 *Payload:* Calldata standar ~164 byte \\(Zero padding\\)\n\
-             🛡️ *Slippage Darurat:* 50\\.0%\n\
+             ⚡ <b>Status:</b> Engine intake PAUSED [🔴]\n\
+             🎯 <b>Posisi Dilikuidasi:</b> {} posisi aktif\n\
+             📦 <b>Payload:</b> Calldata standar ~164 byte (Zero padding)\n\
+             🛡️ <b>Slippage Darurat:</b> 50.0%\n\
              ═══════════════════════════\n\
-             _Seluruh posisi terbuka telah ditutup seketika\\. Intake sinyal dinonaktifkan\\._",
+             <i>Seluruh posisi terbuka telah ditutup seketika. Intake sinyal dinonaktifkan.</i>",
             liquidated_count
         )
     }
@@ -29,19 +29,19 @@ impl EmergencyControls {
     pub async fn handle_pause(risk_manager: &Arc<RiskManager>) -> String {
         let is_running = risk_manager.pause_engine().await;
         if !is_running {
-            "⏸ *ENGINE INTAKE PAUSED\\!*\n\
+            "⏸ <b>ENGINE INTAKE PAUSED!</b>\n\
              ═══════════════════════════\n\
-             ⚡ *Status:* Signal intake BEKU \\[🔴\\]\n\
-             🛡️ *Supervisi Risiko:* Tetap AKTIF \\(Lapis 1\\-5 terus mengawal posisi terbuka\\)\n\
+             ⚡ <b>Status:</b> Signal intake BEKU [🔴]\n\
+             🛡️ <b>Supervisi Risiko:</b> Tetap AKTIF (Lapis 1-5 terus mengawal posisi terbuka)\n\
              ═══════════════════════════\n\
-             _Tidak ada transaksi beli baru yang akan dieksekusi\\._"
+             <i>Tidak ada transaksi beli baru yang akan dieksekusi.</i>"
                 .to_string()
         } else {
-            "▶️ *ENGINE INTAKE RESUMED\\!*\n\
+            "▶️ <b>ENGINE INTAKE RESUMED!</b>\n\
              ═══════════════════════════\n\
-             ⚡ *Status:* Signal intake AKTIF \\[🟢\\]\n\
+             ⚡ <b>Status:</b> Signal intake AKTIF [🟢]\n\
              ═══════════════════════════\n\
-             _Sistem siap mereplikasi sinyal baru dari watchlist\\._"
+             <i>Sistem siap mereplikasi sinyal baru dari watchlist.</i>"
                 .to_string()
         }
     }
@@ -51,22 +51,22 @@ impl EmergencyControls {
     pub async fn handle_sweep(risk_manager: &Arc<RiskManager>) -> String {
         let swept_tokens = risk_manager.sweep_assets().await;
         let details = if swept_tokens.is_empty() {
-            "_Tidak ada saldo token residual yang terdeteksi\\._".to_string()
+            "<i>Tidak ada saldo token residual yang terdeteksi.</i>".to_string()
         } else {
             swept_tokens
                 .iter()
-                .map(|t| format!("• `{}`", t.replace('-', "\\-").replace('_', "\\_")))
+                .map(|t| format!("• <code>{}</code>", t))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
 
         format!(
-            "🧹 *EMERGENCY ASSET SWEEP EXECUTED\\!*\n\
+            "🧹 <b>EMERGENCY ASSET SWEEP EXECUTED!</b>\n\
              ═══════════════════════════\n\
-             💼 *Target:* Master & Deterministic Satellite Sub\\-Accounts\n\
-             🪙 *Token Dikonversi ke ETH:*\n{}\n\
+             💼 <b>Target:</b> Master & Deterministic Satellite Sub-Accounts\n\
+             🪙 <b>Token Dikonversi ke ETH:</b>\n{}\n\
              ═══════════════════════════\n\
-             _Saldo residual telah dilikuidasi kembali ke Native ETH\\._",
+             <i>Saldo residual telah dilikuidasi kembali ke Native ETH.</i>",
             details
         )
     }
