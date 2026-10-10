@@ -4,14 +4,45 @@ use alloy::primitives::{address, Address, B256, U256};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 /// Image URL substring characteristic of Prysm Series operator
 pub const PRYSMCLOUD_SUBSTRING: &str = "prysmcloud/token-images";
+
+/// Prefix of every `TradeSignal::strategy_tag` emitted by this engine ("Prysm: Pola A ...").
+pub const PRYSM_STRATEGY_TAG_PREFIX: &str = "Prysm";
+
+/// Single source of truth for "is this a Prysm signal/position" (main, dispatcher, risk).
+#[inline]
+pub fn is_prysm_tag(tag: Option<&str>) -> bool {
+    tag.is_some_and(|t| t.starts_with(PRYSM_STRATEGY_TAG_PREFIX))
+}
+
+/// A token is entered at most once within this window (Pola C fires per companion buy).
+const ENTRY_DEDUP_WINDOW: Duration = Duration::from_secs(600);
+
+/// Entry de-duplication key. While the launched token's address is unresolved (the parser
+/// still reports the launchpad as the token), keying by address would collapse every launch
+/// on that launchpad into one, so the triggering tx hash is used instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EntryKey {
+    Token(Address),
+    Tx(B256),
+}
+
+impl EntryKey {
+    fn for_match(meta: &LaunchMetadata, tx_hash: B256) -> Self {
+        if meta.token_address != meta.pool_address {
+            EntryKey::Token(meta.token_address)
+        } else {
+            EntryKey::Tx(tx_hash)
+        }
+    }
+}
 
 /// Known Companion Accounts triggering Pola C trade signals
 pub const COMPANION_ACCOUNTS: [Address; 2] = [
@@ -134,6 +165,9 @@ pub struct PrysmEngine {
     recent_launches: Arc<RwLock<HashMap<Address, LaunchMetadata>>>,
     pending_orders: Arc<RwLock<Vec<PendingPrysmOrder>>>,
     signal_tx: mpsc::Sender<TradeSignal>,
+    /// Entries already queued/dispatched (sync mutex: never held across an await).
+    entered_tokens: Mutex<HashMap<EntryKey, Instant>>,
+    warned_no_launchpads: AtomicBool,
 }
 
 impl PrysmEngine {
@@ -144,6 +178,21 @@ impl PrysmEngine {
             recent_launches: Arc::new(RwLock::new(HashMap::new())),
             pending_orders: Arc::new(RwLock::new(Vec::new())),
             signal_tx,
+            entered_tokens: Mutex::new(HashMap::new()),
+            warned_no_launchpads: AtomicBool::new(false),
+        }
+    }
+
+    /// Claim the single entry slot for `key`; false if it was claimed within the window.
+    fn try_claim_entry(&self, key: EntryKey, now: Instant) -> bool {
+        let mut entered = self.entered_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        entered.retain(|_, at| now.saturating_duration_since(*at) < ENTRY_DEDUP_WINDOW);
+        match entered.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(now);
+                true
+            }
         }
     }
 
@@ -247,13 +296,12 @@ impl PrysmEngine {
             return false;
         }
 
-        // 2. Check timing against launch instant (<= 60s)
+        // 2. Check timing against launch instant (<= 60s, sub-second precision)
         if let Some(meta) = launch_meta {
-            if meta.token_address == token {
-                let elapsed_secs = now.duration_since(meta.launch_instant).as_secs();
-                if elapsed_secs <= 60 {
-                    return true;
-                }
+            if meta.token_address == token
+                && now.saturating_duration_since(meta.launch_instant) <= Duration::from_secs(60)
+            {
+                return true;
             }
         }
 
@@ -271,12 +319,13 @@ impl PrysmEngine {
         let max_age_secs = *self.config.prysm_max_signal_age_secs.read().await;
         let max_mcap_usd = *self.config.prysm_max_mcap_usd.read().await;
 
-        // 1. Signal Staleness check: <= 15s
-        let age_secs = now.duration_since(meta.launch_instant).as_secs();
-        if age_secs > max_age_secs {
+        // 1. Signal Staleness check: <= 15s. Compare Durations: `as_secs()` truncation would
+        //    let a 15.9s-old signal through a 15s limit.
+        let age = now.saturating_duration_since(meta.launch_instant);
+        if age > Duration::from_secs(max_age_secs) {
             return Err(format!(
-                "Signal Staleness Exceeded: {}s > {}s limit",
-                age_secs, max_age_secs
+                "Signal Staleness Exceeded: {:.1}s > {}s limit",
+                age.as_secs_f64(), max_age_secs
             ));
         }
 
@@ -290,11 +339,11 @@ impl PrysmEngine {
 
         // 3. Min Block Guard (+3 blocks)
         let min_delay = *self.config.prysm_min_block_delay.read().await;
-        if current_block < meta.launch_block + min_delay {
+        let required_block = meta.launch_block.saturating_add(min_delay);
+        if current_block < required_block {
             return Err(format!(
                 "Awaiting Min Block Guard: Current Block #{} < Required Block #{}",
-                current_block,
-                meta.launch_block + min_delay
+                current_block, required_block
             ));
         }
 
@@ -311,6 +360,14 @@ impl PrysmEngine {
         simulated_mcap_usd: f64,
     ) -> Option<LaunchMetadata> {
         if input.is_empty() {
+            return None;
+        }
+
+        // Byte-level prefilter: almost no calldata matches, and `from_utf8_lossy` allocates a
+        // full copy for any non-UTF-8 input (i.e. nearly every transaction).
+        if memchr::memmem::find(input, PRYSMCLOUD_SUBSTRING.as_bytes()).is_none()
+            && memchr::memmem::find(input, b".lat").is_none()
+        {
             return None;
         }
 
@@ -350,15 +407,9 @@ impl PrysmEngine {
             return None;
         }
 
-        // Calculate Dev Buy in ETH:
-        // Either from tx value (wei / 1e18) or calldata word
-        let dev_buy_from_value = value_wei.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
-        let dev_buy_eth = if dev_buy_from_value > 0.001 {
-            dev_buy_from_value
-        } else {
-            // Fallback: look for 0.021 ETH characteristic Dev Buy
-            0.021
-        };
+        // Dev Buy in ETH from the launch tx value. There is deliberately no fallback: the former
+        // hard-coded 0.021 ETH default made every zero-value tx pass the Pola A/B dev-buy check.
+        let dev_buy_eth = f64::from(value_wei) / 1e18;
 
         // Creator Tax (bps): Default to 200 bps (2%) if standard launch, max allowed is 300 bps
         let creator_tax_bps = 200;
@@ -400,14 +451,15 @@ impl PrysmEngine {
             return;
         }
 
-        self.stats.total_evaluated.fetch_add(1, Ordering::SeqCst);
+        self.stats.total_evaluated.fetch_add(1, Ordering::Relaxed);
         let to_addr = to.unwrap_or_default();
         let now = Instant::now();
 
         // 1. Check for Companion Accounts Buy (Pola C)
         if COMPANION_ACCOUNTS.contains(&from) {
-            let launches = self.recent_launches.read().await;
-            if let Some(meta) = launches.get(&to_addr) {
+            // Clone and release the read guard before any await below.
+            let launch = self.recent_launches.read().await.get(&to_addr).cloned();
+            if let Some(meta) = launch.as_ref() {
                 if Self::evaluate_pattern_c(from, to_addr, Some(meta), now) {
                     let elapsed = start_time.elapsed().as_micros();
                     info!(
@@ -436,6 +488,18 @@ impl PrysmEngine {
         }
 
         // 2. Check for Token Launch creation calldata (Pola A & Pola B)
+        // Only calls into an allowlisted launchpad factory count as launches. Without this, any
+        // contract (or EOA) receiving a tx whose calldata contains the marker strings would be
+        // treated as a "token" and receive our entry ETH.
+        if !self.config.prysm_launchpads.contains(&to_addr) {
+            if self.config.prysm_launchpads.is_empty()
+                && !self.warned_no_launchpads.swap(true, Ordering::Relaxed)
+            {
+                warn!("Prysm Pola A/B disabled: PRYSM_LAUNCHPAD_FACTORIES is empty (fail-closed)");
+            }
+            return;
+        }
+
         // Assume initial launch market cap starts at ~$4,500 - $6,000 USD
         let simulated_mcap = 5000.0;
         if let Some(meta) = Self::parse_launch_calldata(from, to_addr, value, input, block_number, simulated_mcap) {
@@ -497,9 +561,17 @@ impl PrysmEngine {
     ) {
         let now = Instant::now();
         let min_block_delay = *self.config.prysm_min_block_delay.read().await;
-        let required_block = meta.launch_block + min_block_delay;
+        let required_block = meta.launch_block.saturating_add(min_block_delay);
 
-        // If current block is before the required anti-tax block (launch + 3), queue order!
+        // One entry per token: Pola C fires again for every companion buy, and the same launch
+        // can be seen twice (feed + HTTP bridge).
+        if !self.try_claim_entry(EntryKey::for_match(&meta, tx_hash), now) {
+            info!("[Prysm] Token {:?} already queued/entered, skipping duplicate match", meta.token_address);
+            return;
+        }
+
+        // Release happens when block `required_block` is *observed*, so the entry tx lands in
+        // block `required_block + 1` or later.
         if current_block < required_block {
             info!(
                 "⏳ [Prysm Min Block Guard Armed] Queueing order for Block #{} (Current: #{}, Target: Token {:?})",
@@ -546,27 +618,41 @@ impl PrysmEngine {
         let mut ready_orders = Vec::new();
         {
             let mut pending_lock = self.pending_orders.write().await;
-            let mut remaining = Vec::new();
-            for order in pending_lock.drain(..) {
-                if current_block >= order.scheduled_block {
-                    ready_orders.push(order);
-                } else {
-                    remaining.push(order);
+            if !pending_lock.is_empty() {
+                let mut i = 0;
+                while i < pending_lock.len() {
+                    if current_block >= pending_lock[i].scheduled_block {
+                        ready_orders.push(pending_lock.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
                 }
             }
-            *pending_lock = remaining;
         }
 
-        for order in ready_orders {
-            let max_age_secs = *self.config.prysm_max_signal_age_secs.read().await;
-            let age_secs = now.duration_since(order.created_at).as_secs();
+        let max_age = Duration::from_secs(*self.config.prysm_max_signal_age_secs.read().await);
+        let max_mcap_usd = *self.config.prysm_max_mcap_usd.read().await;
+        for mut order in ready_orders {
+            let age = now.saturating_duration_since(order.created_at);
 
-            if age_secs > max_age_secs {
+            if age > max_age {
                 warn!(
-                    "⚠️ [Prysm Pending Order Expired] Age {}s > {}s limit for Token {:?}",
-                    age_secs, max_age_secs, order.token_address
+                    "⚠️ [Prysm Pending Order Expired] Age {:.1}s > {}s limit for Token {:?}",
+                    age.as_secs_f64(), max_age.as_secs(), order.token_address
                 );
-                self.stats.rejected_staleness.fetch_add(1, Ordering::SeqCst);
+                order.report.rejection_reason = Some("Signal Staleness Exceeded (queued order)".to_string());
+                self.stats.record_match(order.report).await;
+                continue;
+            }
+
+            // Queued orders get the same valuation guardrail as immediate ones.
+            if order.report.market_cap_usd > max_mcap_usd {
+                warn!(
+                    "⚠️ [Prysm Guardrail Rejection] Market Cap Ceiling Exceeded at release: ${:.2} > ${:.2} for {:?}",
+                    order.report.market_cap_usd, max_mcap_usd, order.token_address
+                );
+                order.report.rejection_reason = Some("Market Cap Ceiling Exceeded (queued order)".to_string());
+                self.stats.record_match(order.report).await;
                 continue;
             }
 
@@ -585,16 +671,23 @@ impl PrysmEngine {
                 swap_calldata: order.swap_calldata,
                 detected_at: Instant::now(),
                 block_number: current_block,
-                strategy_tag: Some(format!("Prysm: {}", order.report.pattern)),
+                strategy_tag: Some(format!("{}: {}", PRYSM_STRATEGY_TAG_PREFIX, order.report.pattern)),
             };
 
-            let _ = self.signal_tx.send(signal).await;
-            self.stats.total_executed.fetch_add(1, Ordering::SeqCst);
+            match self.signal_tx.try_send(signal) {
+                Ok(()) => {
+                    order.report.guardrails_passed = true;
+                    self.stats.record_match(order.report).await;
+                }
+                Err(e) => warn!("Failed to enqueue matured Prysm order: {}", e),
+            }
         }
 
         // Cleanup stale launch records older than 120s
         let mut launches = self.recent_launches.write().await;
-        launches.retain(|_, v| v.launch_instant.elapsed() < Duration::from_secs(120));
+        if !launches.is_empty() {
+            launches.retain(|_, v| v.launch_instant.elapsed() < Duration::from_secs(120));
+        }
     }
 
     /// Dispatch verified entry into trading execution channel
@@ -622,10 +715,10 @@ impl PrysmEngine {
             swap_calldata,
             detected_at: Instant::now(),
             block_number: meta.launch_block,
-            strategy_tag: Some(format!("Prysm: {}", pattern)),
+            strategy_tag: Some(format!("{}: {}", PRYSM_STRATEGY_TAG_PREFIX, pattern)),
         };
 
-        if let Err(e) = self.signal_tx.send(signal).await {
+        if let Err(e) = self.signal_tx.try_send(signal) {
             warn!("Failed to dispatch Prysm trade signal: {}", e);
         }
     }

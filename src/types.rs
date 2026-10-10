@@ -84,6 +84,8 @@ pub struct DispatchReport {
     pub gas_limit: u64,
     pub priority_fee_gwei: f64,
     pub latency_micros: u128,
+    /// ETH actually sent by the master account (positions must be sized from this)
+    pub trade_eth: f64,
 }
 
 /// Active or closed trading position

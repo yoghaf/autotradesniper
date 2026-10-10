@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -6,8 +6,17 @@ use std::sync::Arc;
 pub const TARGET_CALLDATA_BUFFER_SIZE: usize = 94_500;
 /// Gas Limit static allocation for Arbitrum Nitro transactions
 pub const STATIC_GAS_LIMIT: u64 = 600_000;
-/// Fast exit compact payload size (standard swapExactTokensForETH ABI)
-pub const FAST_EXIT_CALLDATA_SIZE: usize = 164;
+/// Nitro sequencer default `--execution.sequencer.max-tx-data-size`: larger encoded txs are
+/// rejected with "oversized data", so padding is clamped to stay below it.
+pub const MAX_SEQUENCER_TX_BYTES: usize = 95_000;
+/// Worst-case EIP-1559 envelope bytes around the calldata (type, RLP headers, fees, to, value, sig).
+pub const TX_ENVELOPE_OVERHEAD: usize = 256;
+/// Gas kept for swap execution on top of intrinsic calldata gas (Arbitrum also adds L1 poster gas).
+pub const EXECUTION_GAS_RESERVE: u64 = 300_000;
+/// Fast exit payload size for a 2-hop path: selector + 5 head words + path length + 2 addresses
+pub const FAST_EXIT_CALLDATA_SIZE: usize = 4 + 32 * 5 + 32 + 32 * 2;
+/// swapExactTokensForETH(uint256,uint256,address[],address,uint256)
+pub const SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR: [u8; 4] = [0x18, 0xcb, 0xaf, 0xe5];
 
 /// Low-level optimized calldata payload assembler
 pub struct CalldataPayloadBuilder;
@@ -15,76 +24,79 @@ pub struct CalldataPayloadBuilder;
 impl CalldataPayloadBuilder {
     /// Zero-fill optimized calldata buffer construction
     ///
-    /// Copies `swap_calldata` and writes `buffer_size` zero bytes using low-level
-    /// memory filling (`slice::fill(0)` / `memset`), avoiding repeated reallocation
-    /// or high-level iteration.
-    #[inline(always)]
+    /// `vec![0; n]` maps to `alloc_zeroed` (calloc), which for large buffers hands out
+    /// pre-zeroed pages, so the padding costs no explicit memset.
+    #[inline]
     pub fn build_calibrated_payload(swap_calldata: &[u8], buffer_size: usize) -> Vec<u8> {
-        let total_size = swap_calldata.len() + buffer_size;
-        let mut buffer = Vec::with_capacity(total_size);
-
-        // 1. Copy swap instructions
-        buffer.extend_from_slice(swap_calldata);
-
-        // 2. Instant low-level zero-padding using pre-allocated slice fill
-        let current_len = buffer.len();
-        buffer.resize(total_size, 0);
-
-        // Memory zero-fill optimization: ensures contiguous zeroed block in-place
-        unsafe {
-            std::ptr::write_bytes(
-                buffer.as_mut_ptr().add(current_len),
-                0u8,
-                buffer_size,
-            );
-        }
-
+        let mut buffer = vec![0u8; swap_calldata.len() + buffer_size];
+        buffer[..swap_calldata.len()].copy_from_slice(swap_calldata);
         buffer
     }
 
     /// Pre-allocated reusable buffer pool variant
     /// Writes into a caller-provided reusable scratch buffer to achieve ZERO heap allocations
-    #[inline(always)]
-    pub fn write_into_scratch(
-        dest: &mut Vec<u8>,
-        swap_calldata: &[u8],
-        buffer_size: usize,
-    ) {
+    #[inline]
+    pub fn write_into_scratch(dest: &mut Vec<u8>, swap_calldata: &[u8], buffer_size: usize) {
         dest.clear();
-        let total_size = swap_calldata.len() + buffer_size;
-        if dest.capacity() < total_size {
-            dest.reserve(total_size - dest.capacity());
-        }
-
+        // `reserve` is relative to len (0 after clear), so this guarantees one allocation at most.
+        dest.reserve(swap_calldata.len() + buffer_size);
         dest.extend_from_slice(swap_calldata);
-        let offset = dest.len();
-        dest.resize(total_size, 0);
-
-        unsafe {
-            std::ptr::write_bytes(
-                dest.as_mut_ptr().add(offset),
-                0u8,
-                buffer_size,
-            );
-        }
+        dest.resize(swap_calldata.len() + buffer_size, 0);
     }
 
-    /// Construct ultra-compact fast exit liquidation payload (~164 bytes)
-    /// Standard ABI: swapExactTokensForETH(uint256,uint256,address[],address,uint256)
-    #[inline(always)]
-    pub fn build_fast_exit_payload(token_address: &Address, router_or_pool: &Address) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(FAST_EXIT_CALLDATA_SIZE);
-        // selector: 0x18cbafe5
-        payload.extend_from_slice(&[0x18, 0xcb, 0xaf, 0xe5]);
+    /// Largest padding that keeps the signed tx under the sequencer's size cap.
+    #[inline]
+    pub fn clamp_padding(calldata_len: usize, requested: usize) -> usize {
+        requested.min(MAX_SEQUENCER_TX_BYTES.saturating_sub(calldata_len + TX_ENVELOPE_OVERHEAD))
+    }
 
-        // Packed 160-byte argument space (5 words: amountIn, minOut, pathOffset, to, deadline)
-        let mut args = [0u8; 160];
-        // Embed token address into path offset word
-        args[12..32].copy_from_slice(token_address.as_slice());
-        // Embed recipient / router into destination word
-        args[44..64].copy_from_slice(router_or_pool.as_slice());
+    /// EIP-2028 intrinsic gas for `calldata` followed by `padding` zero bytes.
+    #[inline]
+    pub fn intrinsic_gas(calldata: &[u8], padding: usize) -> u64 {
+        let data_gas: u64 = calldata.iter().map(|&b| if b == 0 { 4u64 } else { 16 }).sum();
+        21_000 + data_gas + 4 * padding as u64
+    }
 
-        payload.extend_from_slice(&args);
+    /// Rewrite the recipient of a copied V2 `swapExactETHForTokens*` call to `recipient`.
+    ///
+    /// Replaying the watched wallet's calldata verbatim would buy tokens *for that wallet*:
+    /// `to` is an explicit argument. Returns `None` for any selector whose amounts or recipients
+    /// cannot be safely re-targeted (V3 `exactInputSingle` and Universal Router encode `amountIn`
+    /// in calldata, which would no longer match our `msg.value`).
+    pub fn retarget_swap_recipient(calldata: &[u8], recipient: Address) -> Option<Vec<u8>> {
+        // (uint256 amountOutMin, address[] path, address to, uint256 deadline)
+        const TO_WORD: usize = 4 + 32 * 2;
+        if calldata.len() < 4 + 32 * 4 || !crate::stream::fast_selectors::is_copyable_eth_swap(calldata) {
+            return None;
+        }
+        let mut out = calldata.to_vec();
+        out[TO_WORD..TO_WORD + 12].fill(0);
+        out[TO_WORD + 12..TO_WORD + 32].copy_from_slice(recipient.as_slice());
+        Some(out)
+    }
+
+    /// ABI-encode `swapExactTokensForETH(amountIn, amountOutMin, path, to, deadline)`.
+    pub fn build_fast_exit_payload(
+        amount_in: U256,
+        amount_out_min: U256,
+        path: &[Address],
+        recipient: &Address,
+        deadline: u64,
+    ) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32 * (6 + path.len()));
+        payload.extend_from_slice(&SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR);
+        payload.extend_from_slice(&amount_in.to_be_bytes::<32>());
+        payload.extend_from_slice(&amount_out_min.to_be_bytes::<32>());
+        // Offset of the dynamic `path` tail, measured from the start of the arguments.
+        payload.extend_from_slice(&U256::from(32 * 5).to_be_bytes::<32>());
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(recipient.as_slice());
+        payload.extend_from_slice(&U256::from(deadline).to_be_bytes::<32>());
+        payload.extend_from_slice(&U256::from(path.len()).to_be_bytes::<32>());
+        for hop in path {
+            payload.extend_from_slice(&[0u8; 12]);
+            payload.extend_from_slice(hop.as_slice());
+        }
         payload
     }
 }
@@ -101,9 +113,9 @@ pub struct DynamicFeeAdjuster {
     priority_multiplier: f64,
     /// Minimum priority fee in Gwei floor
     min_priority_fee_gwei: f64,
-    /// Atomic representation of current EMA Base Fee (stored as nano-Gwei integer)
+    /// Atomic representation of current EMA Base Fee (stored as micro-Gwei integer, 1e-6 Gwei)
     ema_base_fee_atomic: Arc<AtomicU64>,
-    /// Atomic representation of current EMA Priority Fee (stored as nano-Gwei integer)
+    /// Atomic representation of current EMA Priority Fee (stored as micro-Gwei integer, 1e-6 Gwei)
     ema_priority_fee_atomic: Arc<AtomicU64>,
 }
 

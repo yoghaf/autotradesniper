@@ -93,6 +93,11 @@ pub struct RiskConfig {
     pub max_hold_seconds: u64,
     /// L5: Maximum duration to tolerate quoter failure in seconds (default 30s)
     pub pool_quote_timeout_seconds: u64,
+
+    /// Prysm Target mode: take-profit market cap in USD (default $10,000)
+    pub prysm_target_mcap_usd: f64,
+    /// Prysm Target mode: strict stop-loss in percent (default 30.0 -> -30%)
+    pub prysm_target_stop_loss_percent: f64,
 }
 
 impl Default for RiskConfig {
@@ -116,6 +121,9 @@ impl Default for RiskConfig {
             watchdog_loss_percent: 30.0,
             max_hold_seconds: 600,
             pool_quote_timeout_seconds: 30,
+
+            prysm_target_mcap_usd: 10_000.0,
+            prysm_target_stop_loss_percent: 30.0,
         }
     }
 }

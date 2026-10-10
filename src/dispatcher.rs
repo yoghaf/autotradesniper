@@ -1,13 +1,14 @@
 use crate::config::AppConfig;
-use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, STATIC_GAS_LIMIT};
+use crate::models::prysm::is_prysm_tag;
+use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, EXECUTION_GAS_RESERVE};
 use crate::types::{DispatchReport, ExecutionMode, TradeSignal};
 use crate::wallet::WalletManager;
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::eip2718::Encodable2718;
-use alloy::primitives::{Bytes, TxKind, U256};
+use alloy::primitives::{Address, Bytes, TxKind, U256};
 use alloy::signers::Signer;
-use anyhow::Result;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use anyhow::{Context, Result};
+use reqwest::header::CONTENT_TYPE;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,82 +19,112 @@ use tracing::{error, info, warn};
 #[derive(Clone)]
 pub struct BroadcasterPool {
     client: reqwest::Client,
-    send_rpcs: Vec<String>,
+    send_rpcs: Arc<[String]>,
 }
 
 impl BroadcasterPool {
     pub fn new(send_rpcs: Vec<String>) -> Self {
         let client = reqwest::Client::builder()
             .tcp_nodelay(true)
-            .pool_idle_timeout(Some(Duration::from_secs(90)))
-            .pool_max_idle_per_host(10)
+            .tcp_keepalive(Some(Duration::from_secs(15)))
+            // Signals can be minutes apart; an idle timeout would hand the next trade a cold
+            // TCP + TLS handshake. `spawn_keep_warm` keeps the sessions alive instead.
+            .pool_idle_timeout(None)
+            .pool_max_idle_per_host(16)
+            .connect_timeout(Duration::from_millis(1500))
             .timeout(Duration::from_millis(2500))
             .build()
             .unwrap_or_default();
-        Self { client, send_rpcs }
+        Self { client, send_rpcs: send_rpcs.into() }
+    }
+
+    /// Periodic cheap `eth_chainId` to every endpoint so TLS sessions stay warm.
+    pub fn spawn_keep_warm(&self, every: Duration) -> tokio::task::JoinHandle<()> {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let body = bytes::Bytes::from_static(br#"{"jsonrpc":"2.0","id":0,"method":"eth_chainId","params":[]}"#);
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let pings = pool.send_rpcs.iter().map(|rpc| {
+                    pool.client.post(rpc.as_str()).header(CONTENT_TYPE, "application/json").body(body.clone()).send()
+                });
+                futures_util::future::join_all(pings).await;
+            }
+        })
     }
 
     /// Broadcast raw signed transaction concurrently across all endpoints.
     /// The instant ANY endpoint accepts (or reports 'already known'), returns immediately!
+    ///
+    /// Each endpoint request runs in its own task: slower endpoints are not cancelled when the
+    /// first one answers, so their pooled connections survive and the transaction keeps
+    /// propagating redundantly. The JSON body is serialized once and shared (refcounted).
     pub async fn broadcast_raw_tx(&self, raw_hex: &str, expected_hash: &str) -> Result<String, String> {
-        let payload = serde_json::json!({
+        if self.send_rpcs.is_empty() {
+            return Err("no SEND_RPCS endpoints configured".to_string());
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "eth_sendRawTransaction",
             "params": [raw_hex]
-        });
+        }))
+        .map(bytes::Bytes::from)
+        .map_err(|e| e.to_string())?;
 
-        let mut futures = FuturesUnordered::new();
-        for rpc in &self.send_rpcs {
-            let rpc = rpc.clone();
+        let (tx, mut rx) = mpsc::channel(self.send_rpcs.len());
+        for rpc in self.send_rpcs.iter().cloned() {
             let client = self.client.clone();
-            let payload = payload.clone();
-            let hash_clone = expected_hash.to_string();
-
-            futures.push(async move {
-                let resp = client.post(&rpc)
-                    .json(&payload)
-                    .send()
-                    .await;
-
-                match resp {
-                    Ok(res) => {
-                        if let Ok(json) = res.json::<serde_json::Value>().await {
-                            if let Some(err) = json.get("error") {
-                                let err_msg = err.to_string().to_lowercase();
-                                if err_msg.contains("already known") || err_msg.contains("known transaction") {
-                                    return Ok((rpc, hash_clone));
-                                }
-                                return Err((rpc, err_msg));
-                            }
-                            if let Some(res_val) = json.get("result") {
-                                if let Some(h) = res_val.as_str() {
-                                    return Ok((rpc, h.to_string()));
-                                }
-                                return Ok((rpc, hash_clone));
-                            }
-                        }
-                        Err((rpc, "Invalid JSON response".to_string()))
-                    }
-                    Err(e) => Err((rpc, e.to_string())),
-                }
+            let body = body.clone();
+            let tx = tx.clone();
+            let expected = expected_hash.to_owned();
+            tokio::spawn(async move {
+                let res = Self::send_one(&client, &rpc, body, &expected).await;
+                let _ = tx.send((rpc, res)).await;
             });
         }
+        drop(tx);
 
         let mut all_errors = Vec::new();
-        while let Some(res) = futures.next().await {
+        while let Some((rpc, res)) = rx.recv().await {
             match res {
-                Ok((rpc, hash)) => {
+                Ok(hash) => {
                     info!("🚀 Direct Sequencer/RPC Broadcast Accepted by [{}] -> {}", rpc, hash);
                     return Ok(hash);
                 }
-                Err((rpc, err)) => {
-                    all_errors.push(format!("{}: {}", rpc, err));
-                }
+                Err(err) => all_errors.push(format!("{}: {}", rpc, err)),
             }
         }
-
         Err(all_errors.join(" | "))
+    }
+
+    async fn send_one(client: &reqwest::Client, rpc: &str, body: bytes::Bytes, expected: &str) -> Result<String, String> {
+        let res = client
+            .post(rpc)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = res.status();
+        let json: serde_json::Value = res
+            .json()
+            .await
+            .map_err(|e| format!("HTTP {}: non JSON-RPC body ({})", status, e))?;
+        if let Some(err) = json.get("error") {
+            let err_msg = err.to_string().to_lowercase();
+            if err_msg.contains("already known") || err_msg.contains("known transaction") {
+                return Ok(expected.to_owned());
+            }
+            return Err(err_msg);
+        }
+        match json.get("result").and_then(|r| r.as_str()) {
+            Some(h) if h.eq_ignore_ascii_case(expected) => Ok(h.to_owned()),
+            Some(h) => Err(format!("endpoint returned hash {} != locally computed {}", h, expected)),
+            None => Err(format!("HTTP {}: response without result", status)),
+        }
     }
 }
 
@@ -123,180 +154,174 @@ impl Dispatcher {
         }
     }
 
+    pub fn broadcaster(&self) -> Arc<BroadcasterPool> {
+        self.broadcaster.clone()
+    }
+
     /// Dispatch transactions with In-Memory Nonce Caching, EMA Fee Calibration,
     /// and Pipelined Parallel Signing directly to the Sequencer.
     ///
-    /// Internal compute latency: < 50 microseconds.
-    pub async fn dispatch_signal(&self, signal: TradeSignal) -> Result<DispatchReport> {
+    /// Returns `Err` unless at least one transaction was accepted by an endpoint, so callers
+    /// never register a position for a buy that was never broadcast.
+    pub async fn dispatch_signal(&self, signal: &TradeSignal) -> Result<DispatchReport> {
         let start_time = Instant::now();
+        let is_strategy = is_prysm_tag(signal.strategy_tag.as_deref());
+
+        // A strategy entry must name a resolved token. Prysm currently sets token == router ==
+        // the launch tx's `to`; replaying the launch calldata there would create a duplicate
+        // token, not buy the target.
+        if is_strategy && signal.target_token == signal.pool_or_router {
+            anyhow::bail!(
+                "Refusing {:?} entry: token address unresolved (target == router {:?}); launch calldata replay disabled",
+                signal.strategy_tag, signal.pool_or_router
+            );
+        }
+        // Copy-trades are re-targeted per account; reject anything we cannot re-target before
+        // a single nonce is consumed.
+        if !is_strategy && CalldataPayloadBuilder::retarget_swap_recipient(&signal.swap_calldata, Address::ZERO).is_none() {
+            anyhow::bail!("Refusing copy-trade: selector cannot be re-targeted to our recipient");
+        }
+
         let buffer_size = *self.config.buffer_size.read().await;
         let exec_mode = *self.config.execution_mode.read().await;
-        let trade_eth = *self.config.default_trade_eth.read().await;
+        let configured_gas_limit = *self.config.gas_limit.read().await;
+        let max_fee_cap_gwei = *self.config.max_fee_gwei.read().await;
+        // Strategy signals carry their own size (e.g. prysm_size_eth); copy-trades use the default.
+        let trade_eth = if is_strategy {
+            f64::from(signal.entry_amount_wei) / 1e18
+        } else {
+            *self.config.default_trade_eth.read().await
+        };
+        anyhow::ensure!(trade_eth.is_finite() && trade_eth > 0.0, "Invalid trade size {} ETH", trade_eth);
 
-        // 1. Zero-Fill Memory Optimized Calldata Buffer Construction
-        // Assembles ~94,500 bytes via vectorized contiguous memset (< 5 µs)
-        let buffered_calldata = CalldataPayloadBuilder::build_calibrated_payload(
-            &signal.swap_calldata,
-            buffer_size,
-        );
-        let calldata_len = buffered_calldata.len();
-
-        // 2. Adaptive Fee Calculation via Exponential Moving Average (EMA) (< 20 ns)
-        let (priority_fee_wei, max_fee_wei) = self.fee_adjuster.calculate_optimal_fees();
+        // Adaptive fee (EMA), capped by MAX_FEE_GWEI. The priority fee never exceeds max fee
+        // (invalid tx otherwise); note Arbitrum ignores tips for ordering.
+        let (ema_priority_wei, ema_max_fee_wei) = self.fee_adjuster.calculate_optimal_fees();
+        let cap_wei = (max_fee_cap_gwei.max(0.0) * 1e9) as u128;
+        let max_fee_wei = if cap_wei > 0 { ema_max_fee_wei.min(cap_wei) } else { ema_max_fee_wei };
+        let priority_fee_wei = ema_priority_wei.min(max_fee_wei);
         let priority_fee_gwei = priority_fee_wei as f64 / 1e9;
 
-        info!(
-            "📦 Zero-Fill Calldata Calibrated: {} bytes | EMA Dynamic Fee: {:.2} Gwei",
-            calldata_len, priority_fee_gwei
-        );
-
         let value_wei = U256::from((trade_eth * 1e18) as u128);
+        let satellite_value_wei = U256::from(((trade_eth * 0.1).max(0.001) * 1e18) as u128);
 
-        let mut tx_hashes = Vec::new();
-        let mut account_roles = Vec::new();
+        let accounts = self.wallet_manager.get_all_accounts_shared().await?;
+        let account_count = match exec_mode {
+            ExecutionMode::Single => 1,
+            ExecutionMode::MultiAccount => accounts.len(),
+        };
 
-        match exec_mode {
-            ExecutionMode::Single => {
-                // Single Mode: Master Account only
-                let master = self.wallet_manager.get_master_account().await?;
-                // In-memory atomic nonce retrieval: 0ms RPC roundtrip latency!
-                let nonce = master.nonce_cursor.fetch_add(1, Ordering::SeqCst);
+        let mut handles = Vec::with_capacity(account_count);
+        let mut calldata_len = 0;
+        let mut gas_limit_used = configured_gas_limit;
+        for acc in accounts.iter().take(account_count).cloned() {
+            let swap = if is_strategy {
+                signal.swap_calldata.clone()
+            } else {
+                CalldataPayloadBuilder::retarget_swap_recipient(&signal.swap_calldata, acc.address)
+                    .context("copy-trade re-targeting failed")?
+            };
+            // Padding never pushes the signed tx over the sequencer's size cap.
+            let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
+            let gas_limit = configured_gas_limit
+                .max(CalldataPayloadBuilder::intrinsic_gas(&swap, padding) + EXECUTION_GAS_RESERVE);
+            let payload = CalldataPayloadBuilder::build_calibrated_payload(&swap, padding);
+            calldata_len = payload.len();
+            gas_limit_used = gas_limit;
 
+            let broadcaster = self.broadcaster.clone();
+            let target_router = signal.pool_or_router;
+            let chain_id = self.config.chain_id;
+            let acc_value_wei = if acc.index == 0 { value_wei } else { satellite_value_wei };
+
+            // Atomic in-memory nonce allocation (< 10 ns)
+            let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst);
+
+            // Pipelined parallel dispatch worker
+            handles.push(tokio::spawn(async move {
                 let tx = TxEip1559 {
-                    chain_id: self.config.chain_id,
+                    chain_id,
                     nonce,
-                    gas_limit: STATIC_GAS_LIMIT,
+                    gas_limit,
                     max_fee_per_gas: max_fee_wei,
                     max_priority_fee_per_gas: priority_fee_wei,
-                    to: TxKind::Call(signal.pool_or_router),
-                    value: value_wei,
-                    input: Bytes::from(buffered_calldata),
+                    to: TxKind::Call(target_router),
+                    value: acc_value_wei,
+                    input: Bytes::from(payload),
                     access_list: Default::default(),
                 };
 
-                let sig = master.signer.sign_hash(&tx.signature_hash()).await.map_err(|e| anyhow::anyhow!(e))?;
-                let signed_tx = tx.into_signed(sig);
-                let envelope = TxEnvelope::Eip1559(signed_tx);
-                let hash = format!("{:?}", envelope.tx_hash());
-                let mut raw_bytes = Vec::new();
-                envelope.encode_2718(&mut raw_bytes);
-                let raw_hex = format!("0x{}", hex::encode(&raw_bytes));
-
-                match self.broadcaster.broadcast_raw_tx(&raw_hex, &hash).await {
-                    Ok(confirmed_hash) => {
-                        info!("✅ [Master Account] TX Broadcast: {} (Nonce: {})", confirmed_hash, nonce);
-                        tx_hashes.push(confirmed_hash);
-                        account_roles.push("Master Account".to_string());
-                    }
-                    Err(e) => {
-                        warn!("Master Account broadcast attempt: {}", e);
-                        let sim_hash = format!("0xsim_{:x}", rand::random::<u64>());
-                        tx_hashes.push(sim_hash);
-                        account_roles.push("Master Account (Simulated)".to_string());
-                    }
-                }
-            }
-            ExecutionMode::MultiAccount => {
-                // Multi-Account Sequence Mode:
-                // Pipelined parallel transaction signing & concurrent broadcast directly to Sequencer
-                let all_accounts = self.wallet_manager.get_all_accounts().await?;
-                let mut handles = Vec::with_capacity(all_accounts.len());
-
-                for (idx, acc) in all_accounts.into_iter().enumerate() {
-                    let broadcaster = self.broadcaster.clone();
-                    let payload_clone = buffered_calldata.clone();
-                    let target_router = signal.pool_or_router;
-                    let chain_id = self.config.chain_id;
-
-                    // Atomic in-memory nonce allocation (< 10 ns)
-                    let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst);
-
-                    let acc_value_wei = if idx == 0 {
-                        value_wei
-                    } else {
-                        // Satellite micro transaction
-                        U256::from(((trade_eth * 0.1).max(0.001) * 1e18) as u128)
-                    };
-
-                    let role_desc = acc.role.clone();
-
-                    // Pipelined parallel dispatch worker
-                    let handle = tokio::spawn(async move {
-                        let tx = TxEip1559 {
-                            chain_id,
-                            nonce,
-                            gas_limit: STATIC_GAS_LIMIT,
-                            max_fee_per_gas: max_fee_wei,
-                            max_priority_fee_per_gas: priority_fee_wei,
-                            to: TxKind::Call(target_router),
-                            value: acc_value_wei,
-                            input: Bytes::from(payload_clone),
-                            access_list: Default::default(),
-                        };
-
-                        let sig = match acc.signer.sign_hash(&tx.signature_hash()).await {
-                            Ok(s) => s,
-                            Err(e) => return (role_desc, Err(e.to_string())),
-                        };
-                        let signed_tx = tx.into_signed(sig);
-                        let envelope = TxEnvelope::Eip1559(signed_tx);
+                let result = match acc.signer.sign_hash(&tx.signature_hash()).await {
+                    Ok(sig) => {
+                        let envelope = TxEnvelope::Eip1559(tx.into_signed(sig));
                         let hash = format!("{:?}", envelope.tx_hash());
-                        let mut raw_bytes = Vec::new();
-                        envelope.encode_2718(&mut raw_bytes);
-                        let raw_hex = format!("0x{}", hex::encode(&raw_bytes));
-
-                        match broadcaster.broadcast_raw_tx(&raw_hex, &hash).await {
-                            Ok(confirmed_hash) => (role_desc, Ok(confirmed_hash)),
-                            Err(e) => (role_desc, Err(e)),
-                        }
-                    });
-
-                    handles.push(handle);
-                }
-
-                // Await all parallel broadcast tasks
-                for handle in handles {
-                    if let Ok((role, res)) = handle.await {
-                        match res {
-                            Ok(hash) => {
-                                info!("✅ [{}] Parallel TX Broadcast: {}", role, hash);
-                                tx_hashes.push(hash);
-                                account_roles.push(role);
-                            }
-                            Err(err_msg) => {
-                                warn!("Broadcast attempt for [{}]: {}", role, err_msg);
-                                let sim_hash = format!("0xsim_{:x}", rand::random::<u64>());
-                                tx_hashes.push(sim_hash);
-                                account_roles.push(format!("{} (Simulated)", role));
-                            }
-                        }
+                        let raw_hex = alloy::hex::encode_prefixed(envelope.encoded_2718());
+                        broadcaster.broadcast_raw_tx(&raw_hex, &hash).await
                     }
+                    Err(e) => Err(e.to_string()),
+                };
+                (acc.index, acc.address, acc.role, nonce, result)
+            }));
+        }
+
+        let mut tx_hashes = Vec::new();
+        let mut account_roles = Vec::new();
+        let mut failures = Vec::new();
+        let mut master_accepted = false;
+        for handle in handles {
+            let (index, address, role, nonce, result) = handle.await.context("dispatch worker panicked")?;
+            match result {
+                Ok(hash) => {
+                    info!("✅ [{}] TX Broadcast: {} (Nonce: {})", role, hash, nonce);
+                    master_accepted |= index == 0;
+                    tx_hashes.push(hash);
+                    account_roles.push(role);
+                }
+                Err(err_msg) => {
+                    warn!("Broadcast failed for [{}] (nonce {}): {}", role, nonce, err_msg);
+                    // The nonce was allocated but (most likely) never used: re-anchor it, or
+                    // every later tx from this account would wait behind a nonce gap.
+                    match tokio::time::timeout(Duration::from_secs(2), self.wallet_manager.resync_nonce(address)).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => error!("Nonce resync for {:?} failed: {:#}", address, e),
+                        Err(_) => error!("Nonce resync for {:?} timed out", address),
+                    }
+                    failures.push(format!("[{}] {}", role, err_msg));
                 }
             }
         }
 
         let latency_micros = start_time.elapsed().as_micros();
         info!(
-            "⚡ Pipelined Dispatch completed in {} µs ({} transactions broadcast)",
+            "⚡ Pipelined Dispatch completed in {} µs ({} accepted, {} failed)",
             latency_micros,
-            tx_hashes.len()
+            tx_hashes.len(),
+            failures.len()
         );
-
         let report = DispatchReport {
             tx_hashes,
             account_roles,
             block_number: signal.block_number,
             calldata_size_bytes: calldata_len,
             execution_mode: exec_mode,
-            gas_limit: STATIC_GAS_LIMIT,
+            gas_limit: gas_limit_used,
             priority_fee_gwei,
             latency_micros,
+            trade_eth,
         };
 
-        if let Err(e) = self.report_tx.send(report.clone()).await {
+        if !report.tx_hashes.is_empty()
+            && let Err(e) = self.report_tx.try_send(report.clone())
+        {
             error!("Failed to send dispatch report: {}", e);
         }
 
+        // The master (index 0) carries the position; satellites alone do not open one.
+        anyhow::ensure!(
+            master_accepted,
+            "Master entry was not accepted by any endpoint: {}",
+            failures.join(" || ")
+        );
         Ok(report)
     }
 }

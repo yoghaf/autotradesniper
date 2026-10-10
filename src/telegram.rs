@@ -26,6 +26,25 @@ pub enum UserState {
     AwaitingPrysmSize,
 }
 
+/// Maximum satellite sub-accounts selectable from Telegram (callback data is client-controlled).
+const MAX_SUB_ACCOUNTS: usize = 10;
+
+/// Escape text for Telegram `ParseMode::Html`. Unescaped `<`/`&` (e.g. "< 0.1 ETH" in exit
+/// reasons, or attacker-chosen URLs from launch calldata) make Telegram reject the message.
+pub fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Outgoing telemetry alert message payload for rate-limited async dispatch
 #[derive(Debug, Clone)]
 pub struct QueuedTelegramAlert {
@@ -211,7 +230,7 @@ impl TelegramBot {
                 r.pattern,
                 r.token_address,
                 status,
-                r.reason
+                html_escape(&r.reason)
             ));
         }
         if recent_str.is_empty() {
@@ -364,9 +383,20 @@ impl TelegramBot {
         )
     }
 
+    /// Only the configured operator chat may control the engine. Anyone can message a bot, and
+    /// every handler below moves funds or replaces the wallet. Unset (0) denies everyone.
+    fn is_authorized(&self, chat_id: i64) -> bool {
+        let authorized = self.config.telegram_authorized_chat_id;
+        authorized != 0 && chat_id == authorized
+    }
+
     /// Dispatch incoming Telegram message
     pub async fn handle_message(&self, msg: Message) -> Result<()> {
         let chat_id = msg.chat.id.0;
+        if !self.is_authorized(chat_id) {
+            warn!("Ignoring Telegram message from unauthorized chat {}", chat_id);
+            return Ok(());
+        }
         let text = msg.text().unwrap_or_default().trim();
 
         let current_state = {
@@ -400,6 +430,10 @@ impl TelegramBot {
                 return Ok(());
             }
             UserState::AwaitingMnemonic => {
+                // Do not leave the seed phrase sitting in the chat history.
+                if let Err(e) = self.bot.delete_message(msg.chat.id, msg.id).await {
+                    warn!("Could not delete mnemonic message from chat: {}", e);
+                }
                 match self.wallet_manager.set_mnemonic(text).await {
                     Ok(_) => {
                         self.user_states.write().await.insert(chat_id, UserState::Idle);
@@ -531,6 +565,10 @@ impl TelegramBot {
             None => return Ok(()),
         };
         let chat_id = message.chat().id.0;
+        if !self.is_authorized(chat_id) {
+            warn!("Ignoring Telegram callback from unauthorized chat {}", chat_id);
+            return Ok(());
+        }
         let message_id = message.id();
 
         match data.as_str() {
@@ -672,7 +710,8 @@ impl TelegramBot {
             }
             s if s.starts_with("tr_sub:") => {
                 let count_str = &s["tr_sub:".len()..];
-                if let Ok(count) = count_str.parse::<usize>() {
+                // Unbounded counts would derive (and fund) an arbitrary number of accounts.
+                if let Some(count) = count_str.parse::<usize>().ok().filter(|c| (1..=MAX_SUB_ACCOUNTS).contains(c)) {
                     *self.config.sub_account_count.write().await = count;
                     let _ = self.config.save_persisted_state().await;
                     let text = format!("👥 Jumlah Sub-Akun Satelit diatur ke <b>{}</b> akun.", count);
@@ -742,7 +781,7 @@ impl TelegramBot {
             }
             s if s.starts_with("cfg_tp:") => {
                 let tp_str = &s["cfg_tp:".len()..];
-                if let Ok(tp) = tp_str.parse::<f64>() {
+                if let Some(tp) = tp_str.parse::<f64>().ok().filter(|tp| tp.is_finite() && *tp > 0.0 && *tp <= 1000.0) {
                     *self.config.target_profit_percent.write().await = tp;
                     let _ = self.config.save_persisted_state().await;
                     let mode = *self.config.execution_mode.read().await;
@@ -755,7 +794,7 @@ impl TelegramBot {
             }
             s if s.starts_with("cfg_exit:") => {
                 let exit_str = &s["cfg_exit:".len()..];
-                if let Ok(exit_secs) = exit_str.parse::<u64>() {
+                if let Some(exit_secs) = exit_str.parse::<u64>().ok().filter(|s| (1..=3600).contains(s)) {
                     *self.config.time_decay_exit_seconds.write().await = exit_secs;
                     let _ = self.config.save_persisted_state().await;
                     let mode = *self.config.execution_mode.read().await;
@@ -802,7 +841,7 @@ impl TelegramBot {
                         p.token_symbol,
                         sign,
                         p.pnl_percent,
-                        p.exit_reason.as_deref().unwrap_or("Running")
+                        html_escape(p.exit_reason.as_deref().unwrap_or("Running"))
                     ));
                 }
                 if pnl_str.is_empty() {
@@ -965,8 +1004,8 @@ impl TelegramBot {
     /// Broadcast live alert when position is liquidated or target profit reached (Non-blocking)
     pub async fn broadcast_position_realized(&self, target_chat: i64, pos: &Position) {
         let sign = if pos.pnl_percent >= 0.0 { "+" } else { "" };
-        let reason = pos.exit_reason.as_deref().unwrap_or("Manual Close");
-        let tx_hash = pos.exit_tx_hash.as_deref().unwrap_or("0x0");
+        let reason = html_escape(pos.exit_reason.as_deref().unwrap_or("Manual Close"));
+        let tx_hash = pos.exit_tx_hash.as_deref().unwrap_or("NONE (no on-chain sell executed)");
 
         let text = format!(
             "📊 <b>REALISASI POSISI!</b>\n\
@@ -976,7 +1015,7 @@ impl TelegramBot {
              💵 <b>Modal Entri:</b> <code>{:.4} ETH</code>\n\
              💰 <b>Nilai Keluar:</b> <code>{:.4} ETH</code>\n\
              📌 <b>Alasan Keluar:</b> {}\n\
-             📝 <b>TX Exit (Calldata standar ~164 byte):</b>\n<code>{}</code>\n\
+             📝 <b>TX Exit:</b>\n<code>{}</code>\n\
              ═══════════════════════════",
             pos.token_symbol,
             pos.pnl_percent,

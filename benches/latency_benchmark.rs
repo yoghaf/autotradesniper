@@ -67,13 +67,18 @@ fn bench_calldata_buffer_assembly(c: &mut Criterion) {
 
 fn bench_fast_exit_payload(c: &mut Criterion) {
     let token = Address::repeat_byte(0x11);
-    let router = Address::repeat_byte(0x22);
+    let weth = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+    let path = [token, weth];
 
-    c.bench_function("fast_exit_164b_payload_assembly", |b| {
+    c.bench_function("fast_exit_260b_payload_assembly", |b| {
         b.iter(|| {
             let payload = CalldataPayloadBuilder::build_fast_exit_payload(
-                black_box(&token),
-                black_box(&router),
+                black_box(alloy::primitives::U256::from(1_000_000u64)),
+                black_box(alloy::primitives::U256::from(1u64)),
+                black_box(&path),
+                black_box(&recipient),
+                black_box(1_900_000_000),
             );
             black_box(payload);
         });

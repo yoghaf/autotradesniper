@@ -322,14 +322,13 @@ async fn test_entry_guardrails_staleness_and_mcap() {
 
 #[tokio::test]
 async fn test_min_block_guard_delayed_release() {
-    let config = AppConfig::default();
+    let mut config = AppConfig::default();
     config.prysm_enabled.store(true, std::sync::atomic::Ordering::SeqCst);
     *config.prysm_min_block_delay.write().await = 3;
     *config.prysm_size_eth.write().await = 0.01;
 
     let (tx, mut rx) = mpsc::channel(100);
-    let engine = PrysmEngine::new(config, tx);
-
+    
     let launch_block = 100;
     let meta = create_sample_launch_meta(
         Some("https://vercel/prysmcloud/token-images/pic.png".to_string()),
@@ -340,6 +339,9 @@ async fn test_min_block_guard_delayed_release() {
         launch_block,
         5000.0,
     );
+    // Pola A/B only arm for calls into an allowlisted launchpad factory
+    config.prysm_launchpads = std::sync::Arc::new([meta.token_address].into_iter().collect());
+    let engine = PrysmEngine::new(config, tx);
 
     // Inspect launch calldata at Block #100
     // Calldata with prysmcloud image substring
@@ -490,25 +492,8 @@ async fn test_tx_envelope_sign_and_encode() {
 
 #[test]
 fn test_l2_message_unpacking_kind3_and_kind4() {
-    fn extract_l2_txs<'a>(bytes: &'a [u8], out: &mut Vec<&'a [u8]>) {
-        if bytes.is_empty() {
-            return;
-        }
-        let kind = bytes[0];
-        if kind == 4 {
-            out.push(&bytes[1..]);
-        } else if kind == 3 {
-            let mut i = 1;
-            while i + 8 <= bytes.len() {
-                let n = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap_or_default()) as usize;
-                i += 8;
-                if i + n <= bytes.len() {
-                    extract_l2_txs(&bytes[i..i + n], out);
-                }
-                i += n;
-            }
-        }
-    }
+    // Exercise the production unpacker, not a copy of it.
+    use autotradesniper::stream::extract_l2_txs;
 
     // Construct a mock kind 4 message (single tx)
     let mock_tx1 = vec![0x02, 0xaa, 0xbb];

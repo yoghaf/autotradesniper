@@ -22,6 +22,15 @@ impl RiskEvaluator {
             return Some(signal);
         }
 
+        // Prysm Target mode exits only on its MCap take-profit / strict stop-loss (plus the
+        // independent Layer 5 watchdog); the quiet/idle/graduation heuristics would otherwise
+        // close every Target position long before the take-profit can be reached.
+        if tracker.is_prysm_strategy
+            && tracker.prysm_exit_mode == Some(crate::types::PrysmExitMode::Target)
+        {
+            return None;
+        }
+
         // 2. Evaluate Layer 2: Flow Rules & Inactivity Decay
         if let Some(signal) = FlowRules::evaluate(tracker, now, config) {
             return Some(signal);

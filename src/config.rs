@@ -3,7 +3,8 @@ use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -49,6 +50,9 @@ pub struct AppConfig {
     pub feed_url: String,
     pub send_rpcs: Vec<String>,
     pub chain_id: u64,
+    /// L2 block number of feed message #0 (`FEED_GENESIS_BLOCK`, 0 for fresh Orbit chains).
+    /// Keeps feed-derived block numbers consistent with the HTTP poller's real block numbers.
+    pub feed_genesis_block: u64,
     pub telegram_bot_token: String,
     pub telegram_authorized_chat_id: i64,
 
@@ -78,8 +82,13 @@ pub struct AppConfig {
     pub prysm_slippage_percent: Arc<RwLock<f64>>,
     pub prysm_target_mcap_usd: Arc<RwLock<f64>>,
     pub prysm_target_stop_loss_percent: Arc<RwLock<f64>>,
+    /// Launchpad factory contracts whose launch calldata may arm Pola A/B (`PRYSM_LAUNCHPAD_FACTORIES`).
+    /// Empty = Pola A/B fail closed, so arbitrary contracts cannot spoof a launch.
+    pub prysm_launchpads: Arc<HashSet<Address>>,
 
     state_path: String,
+    /// Serializes state file writes so concurrent saves cannot interleave.
+    save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppConfig {
@@ -107,6 +116,17 @@ impl AppConfig {
             .unwrap_or_else(|_| "4663".to_string())
             .parse::<u64>()
             .unwrap_or(4663);
+
+        let feed_genesis_block = std::env::var("FEED_GENESIS_BLOCK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let prysm_launchpads: HashSet<Address> = std::env::var("PRYSM_LAUNCHPAD_FACTORIES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| Address::from_str(s.trim()).ok())
+            .collect();
 
         let telegram_bot_token = std::env::var("TELEGRAM_BOT_TOKEN")
             .unwrap_or_default();
@@ -199,6 +219,7 @@ impl AppConfig {
             feed_url,
             send_rpcs,
             chain_id,
+            feed_genesis_block,
             telegram_bot_token,
             telegram_authorized_chat_id,
             mnemonic_phrase: Arc::new(RwLock::new(env_mnemonic)),
@@ -227,12 +248,18 @@ impl AppConfig {
             prysm_slippage_percent: Arc::new(RwLock::new(25.0)),
             prysm_target_mcap_usd: Arc::new(RwLock::new(10000.0)),
             prysm_target_stop_loss_percent: Arc::new(RwLock::new(30.0)),
+            prysm_launchpads: Arc::new(prysm_launchpads),
 
             state_path,
+            save_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
-        // Try restoring persisted runtime state if present
-        let _ = config.load_persisted_state();
+        // Restore persisted runtime state. A state file that exists but cannot be parsed is fatal:
+        // silently continuing would make WalletManager generate a fresh mnemonic and overwrite
+        // the only copy of the old one.
+        config
+            .load_persisted_state()
+            .with_context(|| format!("Refusing to start: '{}' exists but is unreadable", config.state_path))?;
 
         Ok(config)
     }
@@ -350,8 +377,12 @@ impl AppConfig {
             prysm_max_mcap_usd: *self.prysm_max_mcap_usd.read().await,
         };
 
-        let json = serde_json::to_string_pretty(&state)?;
-        std::fs::write(&self.state_path, json)?;
+        let json = serde_json::to_vec_pretty(&state)?;
+        let path = PathBuf::from(&self.state_path);
+        let _guard = self.save_lock.lock().await;
+        tokio::task::spawn_blocking(move || write_private_atomic(&path, &json))
+            .await
+            .context("State writer task failed")??;
         Ok(())
     }
 
@@ -377,6 +408,12 @@ impl AppConfig {
 
     pub fn is_engine_running(&self) -> bool {
         self.is_engine_active.load(Ordering::SeqCst)
+    }
+
+    /// Idempotent engine intake switch (use instead of `toggle_engine` when the target state matters)
+    pub async fn set_engine_running(&self, running: bool) {
+        self.is_engine_active.store(running, Ordering::SeqCst);
+        let _ = self.save_persisted_state().await;
     }
 
     pub async fn toggle_engine(&self) -> bool {
@@ -428,4 +465,27 @@ impl AppConfig {
         drop(lock);
         let _ = self.save_persisted_state().await;
     }
+}
+
+/// Write `data` to `path` atomically (temp file + fsync + rename) with owner-only permissions.
+/// The state file holds the master mnemonic, so it must never be world-readable or half-written.
+fn write_private_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }

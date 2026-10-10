@@ -33,6 +33,9 @@ pub struct WalletManager {
     config: AppConfig,
     mnemonic: Arc<RwLock<String>>,
     nonce_cache: Arc<RwLock<HashMap<Address, Arc<AtomicU64>>>>,
+    /// Derived accounts (index 0 = master). BIP-39 seed stretching is 2048 rounds of
+    /// PBKDF2-HMAC-SHA512, so it runs once per mnemonic / sub-account count, never per trade.
+    accounts_cache: Arc<RwLock<Option<Arc<Vec<TreasuryAccount>>>>>,
 }
 
 impl WalletManager {
@@ -52,19 +55,14 @@ impl WalletManager {
             existing_phrase.trim().to_string()
         };
 
-        let manager = Self {
+        // Nonces are synced by the caller (see `sync_initial_nonces`) before any dispatch,
+        // so the first trade never goes out with a stale cursor of 0.
+        Ok(Self {
             config,
             mnemonic: Arc::new(RwLock::new(mnemonic_phrase)),
             nonce_cache: Arc::new(RwLock::new(HashMap::new())),
-        };
-
-        // Try syncing initial nonces in background
-        let mgr_clone = manager.clone();
-        tokio::spawn(async move {
-            let _ = mgr_clone.sync_initial_nonces().await;
-        });
-
-        Ok(manager)
+            accounts_cache: Arc::new(RwLock::new(None)),
+        })
     }
 
     /// Update mnemonic phrase (e.g. from Telegram import or new wallet generation)
@@ -77,6 +75,7 @@ impl WalletManager {
         *self.config.mnemonic_phrase.write().await = normalized.to_string();
         self.config.save_persisted_state().await?;
         self.nonce_cache.write().await.clear();
+        *self.accounts_cache.write().await = None;
         info!("Updated Master Mnemonic Phrase in treasury");
 
         let _ = self.sync_initial_nonces().await;
@@ -99,33 +98,57 @@ impl WalletManager {
 
     /// Retrieve or create the atomic nonce cursor for an address
     async fn get_or_create_nonce_cursor(&self, address: Address) -> Arc<AtomicU64> {
-        let mut cache = self.nonce_cache.write().await;
-        if let Some(cursor) = cache.get(&address) {
-            cursor.clone()
-        } else {
-            let cursor = Arc::new(AtomicU64::new(0));
-            cache.insert(address, cursor.clone());
-            cursor
+        if let Some(cursor) = self.nonce_cache.read().await.get(&address) {
+            return cursor.clone();
         }
+        self.nonce_cache
+            .write()
+            .await
+            .entry(address)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
     }
 
-    /// Synchronize initial on-chain nonces from node once at startup
+    /// Synchronize on-chain nonces (`pending` tag) into the in-memory cursors.
+    ///
+    /// Uses `fetch_max` so a cursor that already advanced past the node's view is never
+    /// rewound (rewinding would hand out a nonce that is already in flight).
     pub async fn sync_initial_nonces(&self) -> Result<()> {
-        let accounts = self.get_all_accounts().await?;
-        let rpc_http = self.config.rpc_http_url.clone();
-        let provider = match ProviderBuilder::new().connect(&rpc_http).await {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
+        let accounts = self.get_all_accounts_shared().await?;
+        let provider = ProviderBuilder::new()
+            .connect(&self.config.rpc_http_url)
+            .await
+            .context("Nonce sync: RPC connect failed")?;
 
-        for acc in accounts {
-            if let Ok(on_chain_nonce) = provider.get_transaction_count(acc.address).await {
-                let cursor = self.get_or_create_nonce_cursor(acc.address).await;
-                cursor.store(on_chain_nonce, Ordering::SeqCst);
-                info!("Synced in-memory nonce cursor for {:?}: {}", acc.address, on_chain_nonce);
+        for acc in accounts.iter() {
+            match provider.get_transaction_count(acc.address).pending().await {
+                Ok(on_chain_nonce) => {
+                    acc.nonce_cursor.fetch_max(on_chain_nonce, Ordering::SeqCst);
+                    info!("Synced in-memory nonce cursor for {:?}: {}", acc.address, on_chain_nonce);
+                }
+                Err(e) => warn!("Nonce sync failed for {:?}: {}", acc.address, e),
             }
         }
         Ok(())
+    }
+
+    /// Re-anchor one account's cursor to the node's `pending` nonce.
+    ///
+    /// Called after a broadcast that no endpoint accepted: the allocated nonce was burned, and
+    /// without a resync every later transaction from this account would sit behind a nonce gap.
+    pub async fn resync_nonce(&self, address: Address) -> Result<u64> {
+        let provider = ProviderBuilder::new()
+            .connect(&self.config.rpc_http_url)
+            .await
+            .context("Nonce resync: RPC connect failed")?;
+        let on_chain = provider
+            .get_transaction_count(address)
+            .pending()
+            .await
+            .context("Nonce resync: eth_getTransactionCount failed")?;
+        self.get_or_create_nonce_cursor(address).await.store(on_chain, Ordering::SeqCst);
+        warn!("Nonce cursor for {:?} re-synced to {}", address, on_chain);
+        Ok(on_chain)
     }
 
     /// Instant lock-free atomic nonce allocation (< 10 nanoseconds)
@@ -136,63 +159,74 @@ impl WalletManager {
 
     /// Derive an account at index using BIP-44: m/44'/60'/0'/0/{index}
     pub async fn derive_account(&self, index: usize) -> Result<TreasuryAccount> {
+        let accounts = self.get_all_accounts_shared().await?;
+        if let Some(acc) = accounts.get(index) {
+            return Ok(acc.clone());
+        }
         let phrase = self.mnemonic.read().await.clone();
-        let mnemonic = Mnemonic::parse_normalized(&phrase)
-            .context("Failed to parse BIP-39 mnemonic for derivation")?;
-        let seed = mnemonic.to_seed("");
+        let mut derived = tokio::task::spawn_blocking(move || derive_signers(&phrase, index..=index))
+            .await
+            .context("Key derivation task failed")??;
+        let (path, signer) = derived.pop().context("Derivation returned no key")?;
+        Ok(self.make_account(index, path, signer).await)
+    }
 
-        let path_str = format!("m/44'/60'/0'/0/{}", index);
-        let derivation_path = DerivationPath::from_str(&path_str)
-            .context("Invalid derivation path")?;
-
-        let xprv = XPrv::derive_from_path(&seed, &derivation_path)
-            .context("Failed to derive private key from path")?;
-
-        let priv_bytes = xprv.private_key().to_bytes();
-        let signer = PrivateKeySigner::from_slice(&priv_bytes)
-            .context("Failed to create signer from private key bytes")?;
-
+    async fn make_account(&self, index: usize, derivation_path: String, signer: PrivateKeySigner) -> TreasuryAccount {
         let address = signer.address();
         let role = if index == 0 {
             "Master Account (Treasury & Core Executor)".to_string()
         } else {
             format!("Sub-Account #{} (Satellite Dispatcher)", index)
         };
-
-        let nonce_cursor = self.get_or_create_nonce_cursor(address).await;
-
-        Ok(TreasuryAccount {
+        TreasuryAccount {
             role,
             index,
-            derivation_path: path_str,
+            derivation_path,
             address,
             signer,
-            nonce_cursor,
-        })
+            nonce_cursor: self.get_or_create_nonce_cursor(address).await,
+        }
+    }
+
+    /// Cached master + sub-accounts. Re-derives only when the mnemonic or the configured
+    /// sub-account count changes; the hot path clones an `Arc`.
+    pub async fn get_all_accounts_shared(&self) -> Result<Arc<Vec<TreasuryAccount>>> {
+        let count = *self.config.sub_account_count.read().await;
+        if let Some(cached) = self.accounts_cache.read().await.as_ref().filter(|c| c.len() == count + 1) {
+            return Ok(cached.clone());
+        }
+
+        let mut cache = self.accounts_cache.write().await;
+        if let Some(cached) = cache.as_ref().filter(|c| c.len() == count + 1) {
+            return Ok(cached.clone());
+        }
+        let phrase = self.mnemonic.read().await.clone();
+        let derived = tokio::task::spawn_blocking(move || derive_signers(&phrase, 0..=count))
+            .await
+            .context("Key derivation task failed")??;
+        let mut accounts = Vec::with_capacity(derived.len());
+        for (index, (path, signer)) in derived.into_iter().enumerate() {
+            accounts.push(self.make_account(index, path, signer).await);
+        }
+        let accounts = Arc::new(accounts);
+        *cache = Some(accounts.clone());
+        Ok(accounts)
     }
 
     /// Get the Master Account (Index 0)
     pub async fn get_master_account(&self) -> Result<TreasuryAccount> {
-        self.derive_account(0).await
+        let accounts = self.get_all_accounts_shared().await?;
+        accounts.first().cloned().context("Master account missing")
     }
 
     /// Get all Satellite Sub-Accounts according to current configuration count (Index 1..=N)
     pub async fn get_sub_accounts(&self) -> Result<Vec<TreasuryAccount>> {
-        let count = *self.config.sub_account_count.read().await;
-        let mut sub_accounts = Vec::with_capacity(count);
-        for i in 1..=count {
-            sub_accounts.push(self.derive_account(i).await?);
-        }
-        Ok(sub_accounts)
+        Ok(self.get_all_accounts_shared().await?[1..].to_vec())
     }
 
     /// Get all accounts (Master + Sub-Accounts)
     pub async fn get_all_accounts(&self) -> Result<Vec<TreasuryAccount>> {
-        let mut list = Vec::new();
-        list.push(self.get_master_account().await?);
-        let mut subs = self.get_sub_accounts().await?;
-        list.append(&mut subs);
-        Ok(list)
+        Ok(self.get_all_accounts_shared().await?.as_ref().clone())
     }
 
     /// Fetch real-time ETH balances for all accounts
@@ -205,10 +239,7 @@ impl WalletManager {
         for acc in accounts {
             let balance_eth = if let Some(ref p) = provider {
                 match p.get_balance(acc.address).await {
-                    Ok(wei) => {
-                        let wei_f = wei.to_string().parse::<f64>().unwrap_or(0.0);
-                        wei_f / 1e18
-                    }
+                    Ok(wei) => wei_to_eth(wei),
                     Err(_) => 0.0,
                 }
             } else {
@@ -243,27 +274,21 @@ impl WalletManager {
 
         let provider = match provider_res {
             Ok(p) => p,
-            Err(e) => {
-                warn!("Gas rebalance provider connect failed: {}. Generating simulated result.", e);
-                let mut results = Vec::new();
-                for sub in sub_accounts {
-                    results.push(GasRebalanceResult {
-                        sub_account_address: format!("{:?}", sub.address),
-                        amount_eth: target_balance_eth,
-                        tx_hash: format!("0xrebal_sim_{:x}", rand::random::<u64>()),
-                        success: true,
-                    });
-                }
-                return Ok(results);
-            }
+            Err(e) => anyhow::bail!("Gas rebalance provider connect failed: {}", e),
         };
 
         let mut results = Vec::new();
 
         for sub in sub_accounts {
-            let current_balance_wei = provider.get_balance(sub.address).await
-                .unwrap_or(U256::ZERO);
-            let current_balance_f = current_balance_wei.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+            // A failed balance read must not be treated as "0 ETH" (that would trigger a top-up).
+            let current_balance_wei = match provider.get_balance(sub.address).await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("Skipping rebalance for {:?}: balance query failed: {}", sub.address, e);
+                    continue;
+                }
+            };
+            let current_balance_f = wei_to_eth(current_balance_wei);
 
             if current_balance_f < min_balance_eth {
                 let deficit_eth = target_balance_eth - current_balance_f;
@@ -297,6 +322,8 @@ impl WalletManager {
                     }
                     Err(e) => {
                         error!("Failed to rebalance gas for {:?}: {}", sub.address, e);
+                        // The allocated nonce was not consumed on-chain; re-anchor the cursor.
+                        let _ = self.resync_nonce(master.address).await;
                         results.push(GasRebalanceResult {
                             sub_account_address: format!("{:?}", sub.address),
                             amount_eth: deficit_eth,
@@ -315,4 +342,31 @@ impl WalletManager {
 
         Ok(results)
     }
+}
+
+/// Wei -> ETH as f64 without a String round-trip.
+fn wei_to_eth(wei: U256) -> f64 {
+    f64::from(wei) / 1e18
+}
+
+/// Derive `(path, signer)` for BIP-44 indices `m/44'/60'/0'/0/{i}`.
+/// CPU-bound (PBKDF2 + secp256k1): call it from `spawn_blocking`, never on a Tokio worker.
+fn derive_signers(
+    phrase: &str,
+    indices: std::ops::RangeInclusive<usize>,
+) -> Result<Vec<(String, PrivateKeySigner)>> {
+    let mnemonic = Mnemonic::parse_normalized(phrase)
+        .context("Failed to parse BIP-39 mnemonic for derivation")?;
+    let seed = mnemonic.to_seed("");
+    let mut out = Vec::with_capacity(indices.clone().count());
+    for index in indices {
+        let path_str = format!("m/44'/60'/0'/0/{}", index);
+        let derivation_path = DerivationPath::from_str(&path_str).context("Invalid derivation path")?;
+        let xprv = XPrv::derive_from_path(&seed, &derivation_path)
+            .context("Failed to derive private key from path")?;
+        let signer = PrivateKeySigner::from_slice(&xprv.private_key().to_bytes())
+            .context("Failed to create signer from private key bytes")?;
+        out.push((path_str, signer));
+    }
+    Ok(out)
 }

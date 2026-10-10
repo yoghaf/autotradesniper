@@ -16,7 +16,8 @@ impl PriceRules {
         tracker.current_price_eth = current_spot_price;
 
         let entry_price = tracker.entry_price_eth;
-        if entry_price <= 0.0 {
+        // A NaN/inf quote would poison pnl and silently disable every comparison below.
+        if !(entry_price > 0.0 && entry_price.is_finite() && current_spot_price.is_finite()) {
             return None;
         }
 
@@ -35,32 +36,32 @@ impl PriceRules {
                 tracker.current_mcap_usd = tracker.prysm_entry_mcap_usd * (1.0 + (pnl_pct / 100.0)).max(0.0);
             }
 
-            // Target Exit Rule 1: Take-Profit at Market Cap >= $10,000 USD
-            if tracker.current_mcap_usd >= 10000.0 {
+            // Target Exit Rule 1: Take-Profit at Market Cap >= target (default $10,000 USD)
+            if tracker.current_mcap_usd >= config.prysm_target_mcap_usd {
                 return Some(ExitSignal {
                     position_id: tracker.position.id.clone(),
                     token_address: token_addr,
                     pool_address: pool_addr,
                     reason: ExitReason::PrysmTargetMcap,
                     reason_description: format!(
-                        "Prysm Target Take-Profit Reached: Market Cap ${:.2} >= $10,000.00 USD (PnL: +{:.2}%)",
-                        tracker.current_mcap_usd, pnl_pct
+                        "Prysm Target Take-Profit Reached: Market Cap ${:.2} >= ${} USD (PnL: +{:.2}%)",
+                        tracker.current_mcap_usd, usd_grouped(config.prysm_target_mcap_usd), pnl_pct
                     ),
                     is_emergency: false,
                     slippage_percent: 5.0,
                 });
             }
 
-            // Target Exit Rule 2: Strict Stop-Loss at -30% Deficit
-            if pnl_pct <= -30.0 {
+            // Target Exit Rule 2: Strict Stop-Loss (default -30% Deficit)
+            if pnl_pct <= -config.prysm_target_stop_loss_percent {
                 return Some(ExitSignal {
                     position_id: tracker.position.id.clone(),
                     token_address: token_addr,
                     pool_address: pool_addr,
                     reason: ExitReason::PrysmTargetStopLoss,
                     reason_description: format!(
-                        "Prysm Target Strict Stop-Loss Hit: {:.2}% <= -30.00% Deficit Threshold",
-                        pnl_pct
+                        "Prysm Target Strict Stop-Loss Hit: {:.2}% <= -{:.2}% Deficit Threshold",
+                        pnl_pct, config.prysm_target_stop_loss_percent
                     ),
                     is_emergency: false,
                     slippage_percent: 5.0,
@@ -122,4 +123,19 @@ impl PriceRules {
 
         None
     }
+}
+
+/// `10000.0` -> `"10,000.00"` for operator-facing messages.
+fn usd_grouped(value: f64) -> String {
+    let fixed = format!("{:.2}", value);
+    let (int_part, frac) = fixed.split_once('.').unwrap_or((&fixed, "00"));
+    let (sign, digits) = int_part.strip_prefix('-').map_or(("", int_part), |d| ("-", d));
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    format!("{}{}.{}", sign, grouped, frac)
 }

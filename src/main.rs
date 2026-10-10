@@ -9,7 +9,9 @@ use autotradesniper::types::{DispatchReport, Position, TradeSignal};
 use autotradesniper::wallet::WalletManager;
 
 use anyhow::Result;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use teloxide::prelude::*;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
@@ -56,6 +58,13 @@ async fn main() -> Result<()> {
         info!("Satellite Sub-Account #{} ({}): {:?}", sub.index, sub.derivation_path, sub.address);
     }
 
+    // Nonce cursors must be anchored before the first dispatch, or it goes out with nonce 0.
+    match tokio::time::timeout(Duration::from_secs(10), wallet_manager.sync_initial_nonces()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Initial nonce sync failed: {:#}. Cursors resync after the first failed broadcast.", e),
+        Err(_) => warn!("Initial nonce sync timed out. Cursors resync after the first failed broadcast."),
+    }
+
     // 4. Shared Positions State & Channels
     let positions = Arc::new(RwLock::new(Vec::<Position>::new()));
 
@@ -70,6 +79,7 @@ async fn main() -> Result<()> {
         fee_adjuster.clone(),
         report_tx,
     ));
+    let keep_warm = dispatcher.broadcaster().spawn_keep_warm(Duration::from_secs(20));
 
     let risk_manager = Arc::new(RiskManager::new(
         config.clone(),
@@ -92,6 +102,9 @@ async fn main() -> Result<()> {
 
     // 6. Initialize Telegram Bot Controller (if configured)
     let telegram_bot = if !bot_token.is_empty() && !bot_token.contains("Example") {
+        if authorized_chat_id == 0 {
+            warn!("TELEGRAM_AUTHORIZED_CHAT_ID is not set: the bot will ignore every chat.");
+        }
         Some(Arc::new(TelegramBot::new(
             bot_token.clone(),
             config.clone(),
@@ -109,35 +122,26 @@ async fn main() -> Result<()> {
     let dispatcher_clone = dispatcher.clone();
     let risk_clone = risk_manager.clone();
     let telegram_clone = telegram_bot.clone();
-    let config_clone = config.clone();
 
-    tokio::spawn(async move {
+    let signal_task = tokio::spawn(async move {
         while let Some(signal) = signal_rx.recv().await {
             info!("Received Signal for replication from {:?}", signal.monitored_account);
-
-            // Non-blocking alert enqueue to Telegram
+            // Dispatch first: the Telegram alert (string formatting + enqueue) is off the hot path.
+            let dispatch = dispatcher_clone.dispatch_signal(&signal).await;
             if let Some(ref bot_ctrl) = telegram_clone {
                 bot_ctrl.broadcast_signal_detected(authorized_chat_id, &signal).await;
             }
 
-            // Execute Pipelined Batch-Sequenced Dispatch (< 50 µs compute latency)
-            match dispatcher_clone.dispatch_signal(signal.clone()).await {
-                Ok(_report) => {
-                    let trade_eth = if signal.strategy_tag.as_deref() == Some("PrysmSeries") {
-                        *config_clone.prysm_size_eth.read().await
-                    } else {
-                        *config_clone.default_trade_eth.read().await
-                    };
-                    // Register position into Risk Manager for sub-second lifecycle monitoring
-                    risk_clone.register_entry(
-                        signal.target_token,
-                        signal.pool_or_router,
-                        trade_eth,
-                        signal.strategy_tag.clone(),
-                    ).await;
+            match dispatch {
+                Ok(report) => {
+                    // Size the position from what was actually sent, only after the master
+                    // entry was accepted by an endpoint.
+                    risk_clone
+                        .register_entry(signal.target_token, signal.pool_or_router, report.trade_eth, signal.strategy_tag)
+                        .await;
                 }
                 Err(e) => {
-                    error!("Error during signal dispatch: {}", e);
+                    error!("Error during signal dispatch: {:#}", e);
                 }
             }
         }
@@ -175,17 +179,21 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Task D: Sub-Second Risk Manager Lifecycle Monitor
+    // Task D: Sub-Second Risk Manager Lifecycle Monitor (restarted if it ever panics)
     let risk_monitor = risk_manager.clone();
-    tokio::spawn(async move {
-        risk_monitor.start_lifecycle_monitor().await;
+    let risk_task = supervise("risk-lifecycle-monitor", move || {
+        let risk_monitor = risk_monitor.clone();
+        async move { risk_monitor.start_lifecycle_monitor().await }
     });
 
-    // Task E: High-Frequency Sequencer Stream Listener Loop
+    // Task E: High-Frequency Sequencer Stream Listener Loop (restarted if it ever panics)
     let stream_runner = stream_listener.clone();
-    tokio::spawn(async move {
-        if let Err(e) = stream_runner.run().await {
-            error!("Stream listener loop terminated: {}", e);
+    let stream_task = supervise("sequencer-stream", move || {
+        let stream_runner = stream_runner.clone();
+        async move {
+            if let Err(e) = stream_runner.run().await {
+                error!("Stream listener loop terminated: {:#}", e);
+            }
         }
     });
 
@@ -229,8 +237,34 @@ async fn main() -> Result<()> {
     } else {
         info!("Running in headless server mode. Press Ctrl+C to terminate.");
         tokio::signal::ctrl_c().await?;
-        info!("Shutting down engine gracefully.");
+    }
+
+    info!("Shutting down engine gracefully.");
+    config.is_engine_active.store(false, std::sync::atomic::Ordering::SeqCst);
+    for task in [stream_task, signal_task, risk_task, keep_warm] {
+        task.abort();
     }
 
     Ok(())
+}
+
+/// Run `make()` forever, restarting it (after 1s) if it returns or panics.
+///
+/// A panic inside a plain `tokio::spawn` only kills that task: without supervision the engine
+/// would keep serving Telegram while being blind to the feed.
+fn supervise<F, Fut>(name: &'static str, make: F) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(make()).await {
+                Ok(()) => warn!("Task '{}' exited; restarting in 1s", name),
+                Err(e) if e.is_panic() => error!("Task '{}' panicked; restarting in 1s", name),
+                Err(_) => return, // cancelled during shutdown
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
 }

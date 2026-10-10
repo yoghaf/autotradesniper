@@ -10,11 +10,31 @@ use alloy::rpc::types::BlockTransactions;
 use anyhow::{Context, Result};
 use base64::Engine;
 use futures_util::StreamExt;
+use serde::Deserialize;
+use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::{self, Message};
 use tracing::{error, info, trace, warn};
+
+/// Nitro's broadcaster pings every ~5s; Nitro's own feed client gives up after 20s of silence.
+const FEED_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const MIN_RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// A feed session that stayed up this long counts as healthy and resets the backoff.
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+/// HTTP fallback never replays more than this many blocks after a stall (stale signals).
+const MAX_HTTP_CATCHUP_BLOCKS: u64 = 32;
+
+/// `arbostypes.L1MessageType_L2Message`: only these feed messages carry an L2 message payload.
+pub const L1_MESSAGE_TYPE_L2_MESSAGE: u8 = 3;
+const L2_KIND_BATCH: u8 = 3;
+const L2_KIND_SIGNED_TX: u8 = 4;
+/// Nitro rejects L2 batches nested deeper than this (`parseL2Message`, depth >= 16).
+pub const MAX_L2_BATCH_DEPTH: usize = 16;
 
 /// Pre-computed 4-byte DEX Swap Method Signatures as u32 integers
 /// Enables single CPU clock-cycle bitwise matching (Zero Heap Allocation)
@@ -53,6 +73,17 @@ pub mod fast_selectors {
                 | MULTICALL
                 | UNIVERSAL_ROUTER_EXECUTE
         )
+    }
+
+    /// Swaps that can be copied with our own `msg.value` and recipient: V2
+    /// `swapExactETHForTokens*(amountOutMin, path, to, deadline)`, where the ETH input is
+    /// `msg.value` and the recipient is a plain head word.
+    #[inline(always)]
+    pub fn is_copyable_eth_swap(calldata: &[u8]) -> bool {
+        match calldata.first_chunk::<4>() {
+            Some(sel) => matches!(u32::from_be_bytes(*sel), SWAP_EXACT_ETH | SWAP_EXACT_ETH_FEE),
+            None => false,
+        }
     }
 }
 
@@ -132,26 +163,77 @@ impl ZeroCopyTxParser {
     }
 }
 
-/// Recursive L2 message unpacker for Arbitrum Nitro sequencer feeds
+/// L2 message unpacker for Arbitrum Nitro sequencer feeds
 /// Kind 4 = Single signed tx; Kind 3 = Batch of (8-byte big-endian length + message)
+///
+/// The bytes are untrusted: delayed-inbox messages (`sendL2Message` on L1) are user supplied
+/// and reach the feed verbatim. Lengths are bounds-checked without arithmetic overflow, and a
+/// batch nested deeper than Nitro allows invalidates the whole message, exactly as Nitro does,
+/// so nothing is acted on that the chain would not execute.
 pub fn extract_l2_txs<'a>(bytes: &'a [u8], out: &mut Vec<&'a [u8]>) {
-    if bytes.is_empty() {
-        return;
+    let initial_len = out.len();
+    if !extract_l2_txs_at_depth(bytes, out, 0) {
+        out.truncate(initial_len);
     }
-    let kind = bytes[0];
-    if kind == 4 {
-        out.push(&bytes[1..]);
-    } else if kind == 3 {
-        let mut i = 1;
-        while i + 8 <= bytes.len() {
-            let n = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap_or_default()) as usize;
-            i += 8;
-            if i + n <= bytes.len() {
-                extract_l2_txs(&bytes[i..i + n], out);
+}
+
+/// Returns `false` when the message is invalid as a whole.
+fn extract_l2_txs_at_depth<'a>(bytes: &'a [u8], out: &mut Vec<&'a [u8]>, depth: usize) -> bool {
+    match bytes.split_first() {
+        Some((&L2_KIND_SIGNED_TX, tx)) => out.push(tx),
+        Some((&L2_KIND_BATCH, mut rest)) => {
+            if depth >= MAX_L2_BATCH_DEPTH {
+                return false;
             }
-            i += n;
+            while let Some((len_bytes, tail)) = rest.split_first_chunk::<8>() {
+                // Truncated or oversized segment: Nitro treats it as end-of-batch.
+                let Ok(n) = usize::try_from(u64::from_be_bytes(*len_bytes)) else { break };
+                let Some((segment, next)) = tail.split_at_checked(n) else { break };
+                if !extract_l2_txs_at_depth(segment, out, depth + 1) {
+                    return false;
+                }
+                rest = next;
+            }
         }
+        _ => {}
     }
+    true
+}
+
+/// Borrowed view of one broadcaster frame: `{"version":1,"messages":[...]}`.
+/// Deserializing into these structs avoids building a `serde_json::Value` tree per frame;
+/// `l2Msg` (base64, never JSON-escaped) is borrowed straight from the frame buffer.
+#[derive(Deserialize)]
+struct FeedFrame<'a> {
+    #[serde(borrow, default)]
+    messages: Vec<FeedMessage<'a>>,
+}
+
+#[derive(Deserialize)]
+struct FeedMessage<'a> {
+    #[serde(rename = "sequenceNumber")]
+    sequence_number: u64,
+    #[serde(borrow)]
+    message: FeedMessageWithMetadata<'a>,
+}
+
+#[derive(Deserialize)]
+struct FeedMessageWithMetadata<'a> {
+    #[serde(borrow)]
+    message: L1IncomingMessage<'a>,
+}
+
+#[derive(Deserialize)]
+struct L1IncomingMessage<'a> {
+    #[serde(default)]
+    header: Option<L1Header>,
+    #[serde(rename = "l2Msg", borrow, default)]
+    l2_msg: Cow<'a, str>,
+}
+
+#[derive(Deserialize)]
+struct L1Header {
+    kind: u8,
 }
 
 /// Real-Time Sequencer Feed & Signal Replication Stream Listener
@@ -160,6 +242,9 @@ pub struct StreamListener {
     fee_adjuster: Arc<DynamicFeeAdjuster>,
     prysm_engine: Arc<crate::models::PrysmEngine>,
     signal_tx: mpsc::Sender<TradeSignal>,
+    /// Highest feed sequence number processed + 1 (0 = none); drops duplicates after reconnects.
+    next_feed_seq: AtomicU64,
+    fee_refresher_started: AtomicBool,
 }
 
 impl StreamListener {
@@ -174,11 +259,17 @@ impl StreamListener {
             fee_adjuster,
             prysm_engine,
             signal_tx,
+            next_feed_seq: AtomicU64::new(0),
+            fee_refresher_started: AtomicBool::new(false),
         }
     }
 
     /// Background fee refresher to poll gas prices from RPC without adding latency to the sequencer feed
     fn spawn_fee_refresher(&self) {
+        // `run` may be restarted by a supervisor; never stack a second refresher.
+        if self.fee_refresher_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let fee_adjuster = self.fee_adjuster.clone();
         let rpc_http = self.config.rpc_http_url.clone();
         tokio::spawn(async move {
@@ -193,8 +284,10 @@ impl StreamListener {
                 "params": []
             });
 
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tick.tick().await;
                 if let Ok(resp) = client.post(&rpc_http).json(&payload).send().await {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         if let Some(res_str) = json.get("result").and_then(|r| r.as_str()) {
@@ -211,6 +304,10 @@ impl StreamListener {
     }
 
     /// Run the stream listener loop
+    ///
+    /// The WebSocket feed is always the primary source. While it is down, the HTTP poller
+    /// bridges the reconnect backoff window only, then the feed is retried, so one failed
+    /// handshake (HTTP 429, Cloudflare reset, DNS blip) never pins the engine to polling.
     pub async fn run(&self) -> Result<()> {
         info!(
             "Starting High-Frequency Sequencer Stream Listener for Chain ID: {} (Feed URL: {})",
@@ -222,7 +319,7 @@ impl StreamListener {
         let feed_url = self.config.feed_url.clone();
         let http_url = self.config.rpc_http_url.clone();
 
-        let mut backoff_secs = 1u64;
+        let mut backoff = MIN_RECONNECT_BACKOFF;
 
         loop {
             if !self.config.is_engine_running() {
@@ -230,87 +327,110 @@ impl StreamListener {
                 continue;
             }
 
-            match self.listen_sequencer_feed(&feed_url).await {
-                Ok(_) => {
-                    warn!("Sequencer WebSocket stream disconnected. Reconnecting in {}s...", backoff_secs);
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(30);
+            let session_start = Instant::now();
+            let outcome = self.listen_sequencer_feed(&feed_url).await;
+            if session_start.elapsed() >= HEALTHY_SESSION {
+                backoff = MIN_RECONNECT_BACKOFF;
+            }
+
+            let wait = match &outcome {
+                Ok(()) => backoff,
+                Err(e) => retry_after_hint(e).unwrap_or(backoff).min(Duration::from_secs(300)),
+            };
+            let wait = jitter(wait);
+            match &outcome {
+                Ok(()) => warn!("Sequencer feed closed. Reconnecting in {:?} (HTTP poller bridging)...", wait),
+                Err(e) => warn!("Sequencer feed error: {:#}. Reconnecting in {:?} (HTTP poller bridging)...", e, wait),
+            }
+
+            let bridge_start = Instant::now();
+            match tokio::time::timeout(wait, self.listen_http_poll(&http_url)).await {
+                Err(_) => {} // backoff window elapsed: retry the feed
+                Ok(Err(http_err)) => {
+                    error!("HTTP Sequencer poller error: {:#}", http_err);
+                    tokio::time::sleep(wait.saturating_sub(bridge_start.elapsed())).await;
                 }
-                Err(e) => {
-                    warn!(
-                        "Direct Sequencer Feed connection failed: {}. Falling back to HTTP poller...",
-                        e
-                    );
-                    if let Err(http_err) = self.listen_http_poll(&http_url).await {
-                        error!("HTTP Sequencer poller error: {}. Retrying in 2s...", http_err);
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(Ok(())) => {}
+            }
+            backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+        }
+    }
+
+    /// Real-time Arbitrum Nitro Sequencer Feed connection
+    ///
+    /// Returns `Ok(())` on an orderly close and `Err` on handshake failure, transport error
+    /// or a silent (half-open) connection.
+    async fn listen_sequencer_feed(&self, feed_url: &str) -> Result<()> {
+        let (mut ws_stream, _) = connect_async(feed_url)
+            .await
+            .context("Failed to connect to Arbitrum Sequencer Feed WebSocket")?;
+
+        info!("⚡ Successfully connected to Real-Time Sequencer Feed ({})", feed_url);
+        let mut b64_buf = Vec::with_capacity(64 * 1024);
+
+        loop {
+            // Without a deadline a half-open TCP connection would block here forever while
+            // the engine looks healthy. Server pings count as traffic.
+            let msg = match tokio::time::timeout(FEED_IDLE_TIMEOUT, ws_stream.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(e))) => return Err(e).context("Sequencer feed read error"),
+                Ok(None) => return Ok(()),
+                Err(_) => anyhow::bail!("Sequencer feed silent for {:?}", FEED_IDLE_TIMEOUT),
+            };
+
+            match msg {
+                Message::Text(text) => {
+                    if self.config.is_engine_running() {
+                        self.handle_feed_frame(text.as_bytes(), &mut b64_buf).await;
                     }
                 }
+                Message::Binary(bin) => {
+                    if self.config.is_engine_running() {
+                        self.handle_feed_frame(&bin, &mut b64_buf).await;
+                    }
+                }
+                Message::Close(frame) => {
+                    info!("Sequencer Feed received close frame from server: {:?}", frame);
+                    return Ok(());
+                }
+                // Ping: tungstenite queues the Pong and flushes it on the next read.
+                _ => {}
             }
         }
     }
 
-    /// Real-time Arbitrum Nitro Sequencer Feed connection (Zero-Allocation byte streamer)
-    async fn listen_sequencer_feed(&self, feed_url: &str) -> Result<()> {
-        let (ws_stream, _) = connect_async(feed_url).await
-            .context("Failed to connect to Arbitrum Sequencer Feed WebSocket")?;
+    /// Decode one broadcaster frame and process each contained message in order.
+    async fn handle_feed_frame(&self, frame: &[u8], b64_buf: &mut Vec<u8>) {
+        let parsed: FeedFrame<'_> = match serde_json::from_slice(frame) {
+            Ok(f) => f,
+            Err(e) => {
+                trace!("Ignoring unparseable feed frame: {}", e);
+                return;
+            }
+        };
 
-        info!("⚡ Successfully connected to Real-Time Sequencer Feed ({})", feed_url);
-        let (_, mut read) = ws_stream.split();
+        for m in parsed.messages {
+            let seq = m.sequence_number;
+            if self.next_feed_seq.fetch_max(seq.saturating_add(1), Ordering::Relaxed) > seq {
+                continue; // duplicate delivered after a reconnect
+            }
+            // Every feed message produces exactly one L2 block.
+            let block_number = self.config.feed_genesis_block.saturating_add(seq);
+            let incoming = m.message.message;
+            let carries_l2 = incoming.header.as_ref().is_none_or(|h| h.kind == L1_MESSAGE_TYPE_L2_MESSAGE);
 
-        while let Some(msg_result) = read.next().await {
-            let msg = match msg_result {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("Sequencer feed message error: {}", e);
-                    break;
-                }
+            b64_buf.clear();
+            let l2_bytes: &[u8] = if carries_l2
+                && base64::engine::general_purpose::STANDARD
+                    .decode_vec(incoming.l2_msg.as_bytes(), b64_buf)
+                    .is_ok()
+            {
+                b64_buf
+            } else {
+                &[]
             };
-
-            if !self.config.is_engine_running() {
-                continue;
-            }
-
-            match msg {
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-                            for m in messages {
-                                let seq = m.get("sequenceNumber").and_then(|s| s.as_u64()).unwrap_or(0);
-                                if let Some(b64_str) = m.pointer("/message/message/l2Msg").and_then(|s| s.as_str()) {
-                                    if let Ok(l2_bytes) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
-                                        self.process_l2_message(seq, &l2_bytes).await;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                tokio_tungstenite::tungstenite::Message::Binary(bin) => {
-                    if let Ok(text) = std::str::from_utf8(&bin) {
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
-                            if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
-                                for m in messages {
-                                    let seq = m.get("sequenceNumber").and_then(|s| s.as_u64()).unwrap_or(0);
-                                    if let Some(b64_str) = m.pointer("/message/message/l2Msg").and_then(|s| s.as_str()) {
-                                        if let Ok(l2_bytes) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
-                                            self.process_l2_message(seq, &l2_bytes).await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                tokio_tungstenite::tungstenite::Message::Close(_) => {
-                    info!("Sequencer Feed received close frame from server");
-                    break;
-                }
-                _ => {}
-            }
+            self.process_l2_message(block_number, l2_bytes).await;
         }
-
-        Ok(())
     }
 
     /// Process raw L2 sequencer bytes: release matured block queues & inspect transactions
@@ -320,42 +440,37 @@ impl StreamListener {
         // 1. Notify Prysm Series Strategy of block progression (releases matured +3 block orders)
         self.prysm_engine.process_new_block(block_number).await;
 
+        if l2_bytes.is_empty() {
+            return;
+        }
+
         // 2. Extract signed transactions from Arbitrum Nitro L2 payload
         let mut tx_slices = Vec::with_capacity(16);
         extract_l2_txs(l2_bytes, &mut tx_slices);
 
+        let prysm_enabled = self.config.is_prysm_enabled();
         for tx_raw in tx_slices {
-            let mut slice = tx_raw;
-            if let Ok(envelope) = TxEnvelope::decode_2718(&mut slice) {
-                if let Ok(from) = envelope.recover_signer() {
-                    let to = envelope.to();
-                    let value = envelope.value();
-                    let input = envelope.input();
-                    let tx_hash = *envelope.tx_hash();
+            // `_exact`: trailing bytes make Nitro reject the tx, so we must not act on it either.
+            let Ok(envelope) = TxEnvelope::decode_2718_exact(tx_raw) else { continue };
+            let input = envelope.input();
 
-                    // Pipeline 1: Watchlist Target Wallets
-                    self.inspect_transaction_fast(
-                        from,
-                        to,
-                        value,
-                        input,
-                        tx_hash,
-                        block_number,
-                        start,
-                    ).await;
-
-                    // Pipeline 2: Autonomous Prysm Pattern Evaluator
-                    self.prysm_engine.inspect_transaction(
-                        from,
-                        to,
-                        value,
-                        input,
-                        tx_hash,
-                        block_number,
-                        start,
-                    ).await;
-                }
+            // ecrecover costs tens of µs; skip it for txs no pipeline can act on.
+            if !prysm_enabled && !fast_selectors::is_copyable_eth_swap(input) {
+                continue;
             }
+            let Ok(from) = envelope.recover_signer() else { continue };
+            let to = envelope.to();
+            let value = envelope.value();
+            let tx_hash = *envelope.tx_hash();
+
+            // Pipeline 1: Watchlist Target Wallets
+            self.inspect_transaction_fast(from, to, value, input, tx_hash, block_number, start)
+                .await;
+
+            // Pipeline 2: Autonomous Prysm Pattern Evaluator
+            self.prysm_engine
+                .inspect_transaction(from, to, value, input, tx_hash, block_number, start)
+                .await;
         }
     }
 
@@ -366,63 +481,58 @@ impl StreamListener {
             .await
             .context("Failed to connect to HTTP RPC")?;
 
-        let mut last_block = provider.get_block_number().await.unwrap_or(0);
+        // Never fall back to block 0: that would replay the entire chain as fresh signals.
+        let mut last_block = provider
+            .get_block_number()
+            .await
+            .context("HTTP poller: initial eth_blockNumber failed")?;
         info!("Sequencer HTTP Poller active from block #{}", last_block);
 
         loop {
             if !self.config.is_engine_running() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
 
             match provider.get_block_number().await {
-                Ok(current_block) => {
-                    if current_block > last_block {
-                        for block_num in (last_block + 1)..=current_block {
-                            let start = Instant::now();
-                            self.prysm_engine.process_new_block(block_num).await;
+                Ok(current_block) if current_block > last_block => {
+                    let from_block = (last_block + 1)
+                        .max(current_block.saturating_sub(MAX_HTTP_CATCHUP_BLOCKS - 1));
+                    for block_num in from_block..=current_block {
+                        // `.full()`: the default request returns only tx hashes.
+                        let block = match provider.get_block_by_number(block_num.into()).full().await {
+                            Ok(Some(b)) => b,
+                            // Retry this block on the next tick instead of silently skipping it.
+                            Ok(None) | Err(_) => break,
+                        };
+                        let start = Instant::now();
+                        self.prysm_engine.process_new_block(block_num).await;
 
-                            if let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).await {
-                                if let BlockTransactions::Full(txs) = block.transactions {
-                                    for tx in txs {
-                                        let from = tx.inner.signer();
-                                        let to = tx.inner.to();
-                                        let value = tx.inner.value();
-                                        let input = tx.inner.input();
-                                        let tx_hash = *tx.inner.tx_hash();
+                        if let BlockTransactions::Full(txs) = block.transactions {
+                            for tx in txs {
+                                let from = tx.inner.signer();
+                                let to = tx.inner.to();
+                                let value = tx.inner.value();
+                                let input = tx.inner.input();
+                                let tx_hash = *tx.inner.tx_hash();
 
-                                        self.inspect_transaction_fast(
-                                            from,
-                                            to,
-                                            value,
-                                            input,
-                                            tx_hash,
-                                            block_num,
-                                            start,
-                                        ).await;
-
-                                        self.prysm_engine.inspect_transaction(
-                                            from,
-                                            to,
-                                            value,
-                                            input,
-                                            tx_hash,
-                                            block_num,
-                                            start,
-                                        ).await;
-                                    }
-                                }
+                                self.inspect_transaction_fast(from, to, value, input, tx_hash, block_num, start)
+                                    .await;
+                                self.prysm_engine
+                                    .inspect_transaction(from, to, value, input, tx_hash, block_num, start)
+                                    .await;
                             }
                         }
-                        last_block = current_block;
+                        last_block = block_num;
                     }
                 }
+                Ok(_) => {}
                 Err(e) => {
                     trace!("HTTP block poll tick: {}", e);
                 }
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -441,8 +551,9 @@ impl StreamListener {
         block_number: u64,
         start_time: Instant,
     ) {
-        // Step 1: Fast watchlist lookup (O(1) in HashSet)
-        if !self.config.is_in_watchlist(&from).await {
+        // Step 1: Only swaps we can replay for our own account. Plain ETH transfers from a
+        // watched wallet (CEX deposit, wallet shuffle) must never be "copied".
+        if !fast_selectors::is_copyable_eth_swap(input) {
             return;
         }
 
@@ -451,9 +562,8 @@ impl StreamListener {
             None => return, // Contract creation, not a swap
         };
 
-        // Step 2: Instant 1-cycle bitwise signature matching
-        let is_swap = fast_selectors::is_swap_selector(input);
-        if !is_swap && value == U256::ZERO {
+        // Step 2: Fast watchlist lookup (O(1) in HashSet)
+        if !self.config.is_in_watchlist(&from).await {
             return;
         }
 
@@ -463,7 +573,7 @@ impl StreamListener {
             elapsed, from, to_address, value
         );
 
-        // Step 3: Zero-copy parameter extraction
+        // Step 3: Zero-copy parameter extraction (last element of the V2 `path`)
         let target_token = ZeroCopyTxParser::extract_target_token_fast(input)
             .unwrap_or(to_address);
 
@@ -474,13 +584,56 @@ impl StreamListener {
             pool_or_router: to_address,
             entry_amount_wei: value,
             swap_calldata: input.to_vec(),
-            detected_at: Instant::now(),
+            detected_at: start_time,
             block_number,
             strategy_tag: None,
         };
 
-        if let Err(e) = self.signal_tx.send(signal).await {
-            error!("Failed to enqueue detected trade signal: {}", e);
+        // Never block the feed reader on a full queue: a backlog of 1000 signals is stale anyway.
+        if let Err(e) = self.signal_tx.try_send(signal) {
+            error!("Dropping trade signal (queue unavailable): {}", e);
         }
+    }
+}
+
+/// Server-requested delay from an HTTP 429/503 handshake response (`Retry-After` seconds).
+fn retry_after_hint(err: &anyhow::Error) -> Option<Duration> {
+    let tungstenite::Error::Http(resp) = err.downcast_ref::<tungstenite::Error>()? else {
+        return None;
+    };
+    let status = resp.status().as_u16();
+    if status != 429 && status != 503 {
+        return None;
+    }
+    let secs = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(10);
+    Some(Duration::from_secs(secs.max(1)))
+}
+
+/// ±20% jitter so many clients do not reconnect in lockstep after a feed restart.
+fn jitter(d: Duration) -> Duration {
+    d.mul_f64(0.8 + rand::random::<f64>() * 0.4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn feed_frame_decodes_with_borrowed_l2_msg() {
+        let frame = br#"{"version":1,"messages":[{"sequenceNumber":42,"message":{"message":{"header":{"kind":3,"sender":"0xa4b000000000000000000073657175656e636572","blockNumber":1,"timestamp":2,"requestId":null,"baseFeeL1":null},"l2Msg":"BAE="},"delayedMessagesRead":7},"signature":null}]}"#;
+        let parsed: FeedFrame<'_> = serde_json::from_slice(frame).unwrap();
+        let m = &parsed.messages[0];
+        assert_eq!(m.sequence_number, 42);
+        assert_eq!(m.message.message.header.as_ref().map(|h| h.kind), Some(L1_MESSAGE_TYPE_L2_MESSAGE));
+        assert!(matches!(m.message.message.l2_msg, Cow::Borrowed("BAE=")));
+
+        // Confirmation-only frames carry no messages.
+        let parsed: FeedFrame<'_> = serde_json::from_slice(br#"{"version":1,"confirmedSequenceNumberMessage":{"sequenceNumber":41}}"#).unwrap();
+        assert!(parsed.messages.is_empty());
     }
 }

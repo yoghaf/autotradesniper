@@ -12,14 +12,13 @@ impl EmergencyControls {
     pub async fn handle_panic(risk_manager: &Arc<RiskManager>) -> String {
         let liquidated_count = risk_manager.panic_sell_all().await;
         format!(
-            "🚨 <b>EMERGENCY PANIC SELL ACTIVATED!</b>\n\
+            "🚨 <b>EMERGENCY PANIC ACTIVATED!</b>\n\
              ═══════════════════════════\n\
              ⚡ <b>Status:</b> Engine intake PAUSED [🔴]\n\
-             🎯 <b>Posisi Dilikuidasi:</b> {} posisi aktif\n\
-             📦 <b>Payload:</b> Calldata standar ~164 byte (Zero padding)\n\
-             🛡️ <b>Slippage Darurat:</b> 50.0%\n\
+             🎯 <b>Posisi Ditandai Tutup:</b> {} posisi aktif\n\
+             ⚠️ <b>Eksekusi:</b> SIMULASI, belum ada transaksi jual on-chain\n\
              ═══════════════════════════\n\
-             <i>Seluruh posisi terbuka telah ditutup seketika. Intake sinyal dinonaktifkan.</i>",
+             <i>Intake sinyal dinonaktifkan. Token masih berada di dompet: jual manual sampai executor exit tersedia.</i>",
             liquidated_count
         )
     }
@@ -61,12 +60,12 @@ impl EmergencyControls {
         };
 
         format!(
-            "🧹 <b>EMERGENCY ASSET SWEEP EXECUTED!</b>\n\
+            "🧹 <b>EMERGENCY ASSET SWEEP (SIMULASI)</b>\n\
              ═══════════════════════════\n\
              💼 <b>Target:</b> Master & Deterministic Satellite Sub-Accounts\n\
-             🪙 <b>Token Dikonversi ke ETH:</b>\n{}\n\
+             🪙 <b>Posisi Tercatat (belum dijual):</b>\n{}\n\
              ═══════════════════════════\n\
-             <i>Saldo residual telah dilikuidasi kembali ke Native ETH.</i>",
+             <i>SIMULASI: sweep on-chain belum diimplementasikan, tidak ada token yang dijual.</i>",
             details
         )
     }

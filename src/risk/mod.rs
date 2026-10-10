@@ -7,7 +7,7 @@ pub mod types;
 pub mod watchdog;
 
 use crate::config::AppConfig;
-use crate::payload::CalldataPayloadBuilder;
+use crate::models::prysm::is_prysm_tag;
 use crate::risk::anomaly_sensor::AnomalySensor;
 use crate::risk::evaluator::RiskEvaluator;
 use crate::risk::flow_rules::FlowRules;
@@ -20,10 +20,24 @@ use crate::wallet::WalletManager;
 use alloy::primitives::Address;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tokio::time::MissedTickBehavior;
+use tracing::{error, info, warn};
+
+/// Closed positions kept in the public history (Telegram portfolio view).
+const MAX_CLOSED_POSITIONS: usize = 200;
+
+/// Aborts the wrapped task when dropped, so a cancelled or panicking supervisor cannot leak it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Comprehensive Multi-Layered Risk Management & Liquidation Engine
 pub struct RiskManager {
@@ -33,6 +47,9 @@ pub struct RiskManager {
     positions: Arc<RwLock<Vec<Position>>>,
     trackers: Arc<RwLock<HashMap<String, PositionTracker>>>,
     exit_alert_tx: mpsc::Sender<Position>,
+    /// Monotonic position ids (random u32 ids collide after ~65k positions and would
+    /// overwrite a live tracker).
+    next_position_id: Arc<AtomicU64>,
 }
 
 impl RiskManager {
@@ -49,6 +66,7 @@ impl RiskManager {
             positions,
             trackers: Arc::new(RwLock::new(HashMap::new())),
             exit_alert_tx,
+            next_position_id: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -75,14 +93,17 @@ impl RiskManager {
         let base_slippage = *self.config.slippage_percent.read().await;
         let adaptive_slip = self.calculate_adaptive_slippage(base_slippage, entry_eth);
 
-        let is_prysm = strategy_tag.as_ref().map(|s| s.contains("Prysm")).unwrap_or(false);
+        let is_prysm = is_prysm_tag(strategy_tag.as_deref());
+        if !(entry_eth > 0.0 && entry_eth.is_finite()) {
+            warn!("Registering position with invalid entry size {} ETH: price rules will stay inert", entry_eth);
+        }
         let prysm_exit_mode = if is_prysm {
             Some(*self.config.prysm_exit_mode.read().await)
         } else {
             None
         };
 
-        let pos_id = format!("POS-{:x}", rand::random::<u32>());
+        let pos_id = format!("POS-{}", self.next_position_id.fetch_add(1, Ordering::Relaxed));
         let pos = Position {
             id: pos_id.clone(),
             token_address: format!("{:?}", token_address),
@@ -157,28 +178,30 @@ impl RiskManager {
         }
     }
 
-    /// Execute instant liquidation using standard compact calldata (~164 bytes)
+    /// Close a position after an exit signal.
+    ///
+    /// No on-chain sell executor is wired yet (selling needs the token balance, an approval and
+    /// the launchpad/curve sell ABI). Until it is, the exit is recorded as SIMULATED with no tx
+    /// hash, instead of a fabricated one, so the operator knows the tokens are still held.
+    /// `CalldataPayloadBuilder::build_fast_exit_payload` is the ABI-correct building block.
     pub async fn execute_liquidation(&self, signal: ExitSignal) {
         warn!(
             "🚨 LIQUIDATION TRIGGERED: [{}] Position: {} -> {}",
             signal.reason, signal.position_id, signal.reason_description
         );
-
-        // Assemble standard zero-overhead liquidation payload (~164 bytes)
-        let _exit_payload = CalldataPayloadBuilder::build_fast_exit_payload(
-            &signal.token_address,
-            &signal.pool_address,
+        error!(
+            "No on-chain exit executor: position {} closed in memory only, tokens remain in the wallet",
+            signal.position_id
         );
-
-        let exit_tx_hash = format!("0xexit_{:x}", rand::random::<u64>());
+        let exit_reason = format!("[SIMULATED, no sell tx] {}", signal.reason);
 
         // Update in-memory tracker
         {
             let mut trackers = self.trackers.write().await;
             if let Some(tracker) = trackers.get_mut(&signal.position_id) {
                 tracker.position.is_open = false;
-                tracker.position.exit_reason = Some(signal.reason.to_string());
-                tracker.position.exit_tx_hash = Some(exit_tx_hash.clone());
+                tracker.position.exit_reason = Some(exit_reason.clone());
+                tracker.position.exit_tx_hash = None;
             }
         }
 
@@ -188,8 +211,8 @@ impl RiskManager {
             let mut positions_lock = self.positions.write().await;
             if let Some(pos) = positions_lock.iter_mut().find(|p| p.id == signal.position_id) {
                 pos.is_open = false;
-                pos.exit_reason = Some(signal.reason.to_string());
-                pos.exit_tx_hash = Some(exit_tx_hash);
+                pos.exit_reason = Some(exit_reason);
+                pos.exit_tx_hash = None;
                 closed_pos = Some(pos.clone());
             }
         }
@@ -209,8 +232,9 @@ impl RiskManager {
         let risk_config_watchdog = self.risk_config.clone();
         let this_manager_for_watchdog = self.clone_for_liquidation();
 
-        tokio::spawn(async move {
+        let _watchdog = AbortOnDrop(tokio::spawn(async move {
             let mut watchdog_interval = tokio::time::interval(Duration::from_secs(5));
+            watchdog_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 watchdog_interval.tick().await;
                 let now = Instant::now();
@@ -232,20 +256,39 @@ impl RiskManager {
                     this_manager_for_watchdog.execute_liquidation(signal).await;
                 }
             }
-        });
+        }));
 
         // Main Evaluation Loop for Lapis 1 (Price), Lapis 2 (Flow), and Lapis 3 (Migration)
         let mut interval = tokio::time::interval(Duration::from_millis(100));
+        // Burst catch-up after a stall would evaluate stale state several times back-to-back.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
             let now = Instant::now();
-            let config = self.risk_config.read().await.clone();
+            let mut config = self.risk_config.read().await.clone();
+            config.prysm_target_mcap_usd = *self.config.prysm_target_mcap_usd.read().await;
+            config.prysm_target_stop_loss_percent = *self.config.prysm_target_stop_loss_percent.read().await;
             let mut signals = Vec::new();
 
             {
                 let mut trackers = self.trackers.write().await;
                 let mut positions_lock = self.positions.write().await;
+
+                // Closed trackers are never re-evaluated: drop them instead of iterating forever.
+                trackers.retain(|_, t| t.position.is_open);
+                let closed = positions_lock.iter().filter(|p| !p.is_open).count();
+                if closed > MAX_CLOSED_POSITIONS {
+                    let mut excess = closed - MAX_CLOSED_POSITIONS;
+                    positions_lock.retain(|p| {
+                        if !p.is_open && excess > 0 {
+                            excess -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
 
                 for tracker in trackers.values_mut() {
                     if !tracker.position.is_open {
@@ -254,7 +297,9 @@ impl RiskManager {
 
                     let elapsed_f = tracker.entry_instant.elapsed().as_secs_f64();
 
-                    // Price momentum simulation / reserve quote
+                    // SIMULATED price feed (random walk + scripted decay). Every Layer 1-3 exit
+                    // decision below is driven by this placeholder until it is replaced with an
+                    // on-chain curve/pool quote; see the audit report.
                     let current_simulated_price = if elapsed_f <= 15.0 {
                         tracker.entry_price_eth * (1.0 + (rand::random::<f64>() * 0.40))
                     } else {
@@ -303,6 +348,7 @@ impl RiskManager {
             positions: self.positions.clone(),
             trackers: self.trackers.clone(),
             exit_alert_tx: self.exit_alert_tx.clone(),
+            next_position_id: self.next_position_id.clone(),
         }
     }
 
@@ -315,8 +361,9 @@ impl RiskManager {
     pub async fn panic_sell_all(&self) -> usize {
         warn!("🚨 OPERATOR TRIGGERED MANUAL PANIC SELL (/panic)! Liquidating ALL open positions!");
 
-        // Pause engine intake immediately
-        let _ = self.config.toggle_engine().await;
+        // Pause engine intake immediately (idempotent: toggling would *resume* an already
+        // paused engine in the middle of an emergency)
+        self.config.set_engine_running(false).await;
 
         let mut signals = Vec::new();
         {
@@ -354,7 +401,7 @@ impl RiskManager {
     pub async fn pause_engine(&self) -> bool {
         let is_running = self.config.is_engine_running();
         if is_running {
-            self.config.toggle_engine().await;
+            self.config.set_engine_running(false).await;
             info!("⏸ Operator Paused Engine: No new entries will be taken. Existing positions remain supervised.");
             false
         } else {
