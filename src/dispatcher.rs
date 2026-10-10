@@ -1,6 +1,8 @@
 use crate::config::AppConfig;
 use crate::models::prysm::is_prysm_tag;
-use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, EXECUTION_GAS_RESERVE};
+use crate::payload::{
+    CalldataPayloadBuilder, DynamicFeeAdjuster, EXECUTION_GAS_RESERVE, TARGET_CALLDATA_BUFFER_SIZE,
+};
 use crate::types::{DispatchReport, ExecutionMode, TradeSignal};
 use crate::wallet::WalletManager;
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
@@ -272,7 +274,6 @@ impl Dispatcher {
         let priority_fee_gwei = priority_fee_wei as f64 / 1e9;
 
         let value_wei = U256::from((trade_eth * 1e18) as u128);
-        let satellite_value_wei = U256::from(((trade_eth * 0.1).max(0.001) * 1e18) as u128);
 
         let accounts = self.wallet_manager.get_all_accounts_shared().await?;
         let account_count = match exec_mode {
@@ -284,28 +285,40 @@ impl Dispatcher {
         let mut calldata_len = 0;
         let mut gas_limit_used = configured_gas_limit;
         for acc in accounts.iter().take(account_count).cloned() {
-            let swap = if is_strategy {
-                if let Some(retargeted) = CalldataPayloadBuilder::retarget_pons_buy_recipient(&signal.swap_calldata, acc.address) {
-                    retargeted
+            let is_master = acc.index == 0;
+            let (target_dest, acc_value_wei, payload) = if is_master {
+                // Master account carries the real token purchase
+                let swap = if is_strategy {
+                    if let Some(retargeted) = CalldataPayloadBuilder::retarget_pons_buy_recipient(&signal.swap_calldata, acc.address) {
+                        retargeted
+                    } else {
+                        signal.swap_calldata.clone()
+                    }
                 } else {
-                    signal.swap_calldata.clone()
-                }
+                    CalldataPayloadBuilder::retarget_swap_recipient(&signal.swap_calldata, acc.address)
+                        .context("copy-trade re-targeting failed")?
+                };
+                let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
+                let p = CalldataPayloadBuilder::build_calibrated_payload(&swap, padding);
+                (signal.pool_or_router, value_wei, p)
             } else {
-                CalldataPayloadBuilder::retarget_swap_recipient(&signal.swap_calldata, acc.address)
-                    .context("copy-trade re-targeting failed")?
+                // Satellite child accounts act purely as carrier dispatchers carrying the 95 KB block-booking buffer:
+                // They do NOT buy tokens (value = 0 ETH), preserving 100% of token capital.
+                // Their only duty is transmitting the calibrated 94.5 KB buffer to reserve sequencer block capacity!
+                let carrier_size = if buffer_size > 0 { buffer_size } else { TARGET_CALLDATA_BUFFER_SIZE };
+                let padding = CalldataPayloadBuilder::clamp_padding(0, carrier_size);
+                let p = CalldataPayloadBuilder::build_calibrated_payload(&[], padding);
+                (acc.address, U256::ZERO, p)
             };
-            // Padding never pushes the signed tx over the sequencer's size cap.
-            let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
+
+            let gas_reserve = if is_master { EXECUTION_GAS_RESERVE } else { 21_000 };
             let gas_limit = configured_gas_limit
-                .max(CalldataPayloadBuilder::intrinsic_gas(&swap, padding) + EXECUTION_GAS_RESERVE);
-            let payload = CalldataPayloadBuilder::build_calibrated_payload(&swap, padding);
+                .max(CalldataPayloadBuilder::intrinsic_gas(&payload, 0) + gas_reserve);
             calldata_len = payload.len();
             gas_limit_used = gas_limit;
 
             let broadcaster = self.broadcaster.clone();
-            let target_router = signal.pool_or_router;
             let chain_id = self.config.chain_id;
-            let acc_value_wei = if acc.index == 0 { value_wei } else { satellite_value_wei };
 
             // Atomic in-memory nonce allocation (< 10 ns)
             let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst);
@@ -318,7 +331,7 @@ impl Dispatcher {
                     gas_limit,
                     max_fee_per_gas: max_fee_wei,
                     max_priority_fee_per_gas: priority_fee_wei,
-                    to: TxKind::Call(target_router),
+                    to: TxKind::Call(target_dest),
                     value: acc_value_wei,
                     input: Bytes::from(payload),
                     access_list: Default::default(),

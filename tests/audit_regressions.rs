@@ -502,3 +502,18 @@ fn lightweight_zero_buffer_calldata_size() {
     assert_eq!(calibrated.len(), 4 + 32 * 3); // exactly 100 bytes!
 }
 
+#[test]
+fn child_carrier_tx_is_zero_value_and_95kb() {
+    let carrier_size = 94_500;
+    let padding = CalldataPayloadBuilder::clamp_padding(0, carrier_size);
+    let payload = CalldataPayloadBuilder::build_calibrated_payload(&[], padding);
+
+    // Child carrier carries exactly ~94.5 KB buffer
+    assert!(payload.len() >= 94_000 && payload.len() <= autotradesniper::payload::MAX_SEQUENCER_TX_BYTES);
+
+    // Intrinsic gas covers data gas without running out of gas
+    let gas = CalldataPayloadBuilder::intrinsic_gas(&payload, 0) + 21_000;
+    assert!(gas > 390_000 && gas < 600_000);
+}
+
+
