@@ -92,6 +92,7 @@ async fn main() -> Result<()> {
             bot_token.clone(),
             config.clone(),
             wallet_manager.clone(),
+            risk_manager.clone(),
             positions.clone(),
         )))
     } else {

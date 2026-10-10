@@ -102,6 +102,50 @@ fn bench_atomic_nonce_cursor(c: &mut Criterion) {
     });
 }
 
+fn bench_risk_evaluator_latency(c: &mut Criterion) {
+    use autotradesniper::risk::evaluator::RiskEvaluator;
+    use autotradesniper::risk::types::{BlockEvent, PositionTracker, RiskConfig};
+    use autotradesniper::types::Position;
+    use std::time::Instant;
+
+    let config = RiskConfig::default();
+    let pos = Position {
+        id: "POS-BENCH-1".to_string(),
+        token_address: "0x1111111111111111111111111111111111111111".to_string(),
+        token_symbol: "TKN".to_string(),
+        entry_eth_amount: 1.0,
+        current_eth_value: 1.0,
+        entry_timestamp_secs: 1000,
+        pool_address: "0x2222222222222222222222222222222222222222".to_string(),
+        is_open: true,
+        pnl_percent: 0.0,
+        exit_reason: None,
+        exit_tx_hash: None,
+    };
+    let mut tracker = PositionTracker::new(pos, 1.0);
+    let block = BlockEvent {
+        block_number: 999999,
+        timestamp_secs: 1005,
+        spot_price_eth: 1.05,
+        curve_capacity_percent: 60.0,
+        token_address: Address::repeat_byte(0x11),
+    };
+    let now = Instant::now();
+
+    c.bench_function("risk_multi_layer_evaluator_block_decision", |b| {
+        b.iter(|| {
+            let signal = RiskEvaluator::evaluate_block_event(
+                black_box(&mut tracker),
+                black_box(&block),
+                black_box(Some(1.05)),
+                black_box(now),
+                black_box(&config),
+            );
+            black_box(signal);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_zero_copy_parsing,
@@ -109,6 +153,8 @@ criterion_group!(
     bench_calldata_buffer_assembly,
     bench_fast_exit_payload,
     bench_ema_fee_calculator,
-    bench_atomic_nonce_cursor
+    bench_atomic_nonce_cursor,
+    bench_risk_evaluator_latency
 );
 criterion_main!(benches);
+

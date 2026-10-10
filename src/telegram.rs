@@ -1,8 +1,12 @@
+pub mod emergency_controls;
+
 use crate::config::AppConfig;
+use crate::risk::RiskManager;
 use crate::types::{DispatchReport, ExecutionMode, Position, TradeSignal};
 use crate::wallet::WalletManager;
 use alloy::primitives::Address;
 use anyhow::Result;
+use emergency_controls::EmergencyControls;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,6 +36,7 @@ pub struct TelegramBot {
     bot: Bot,
     config: AppConfig,
     wallet_manager: WalletManager,
+    risk_manager: Arc<RiskManager>,
     positions: Arc<RwLock<Vec<Position>>>,
     user_states: Arc<RwLock<HashMap<i64, UserState>>>,
     alert_queue_tx: mpsc::Sender<QueuedTelegramAlert>,
@@ -42,6 +47,7 @@ impl TelegramBot {
         token: String,
         config: AppConfig,
         wallet_manager: WalletManager,
+        risk_manager: Arc<RiskManager>,
         positions: Arc<RwLock<Vec<Position>>>,
     ) -> Self {
         let bot = Bot::new(token);
@@ -58,6 +64,7 @@ impl TelegramBot {
             bot,
             config,
             wallet_manager,
+            risk_manager,
             positions,
             user_states: Arc::new(RwLock::new(HashMap::new())),
             alert_queue_tx,
@@ -104,6 +111,10 @@ impl TelegramBot {
             ],
             vec![
                 InlineKeyboardButton::callback("📈 Portfolio & Status", "menu_portfolio"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("🚨 Panic Sell All", "op_panic"),
+                InlineKeyboardButton::callback("🧹 Sweep Assets", "op_sweep"),
             ],
         ])
     }
@@ -211,6 +222,14 @@ impl TelegramBot {
              • *Entry Trade:* {:.4} ETH\n\
              • *Take Profit Target:* +{:.1}%\n\
              • *Time-Decay Exit:* {} detik\n\
+             \n\
+             🛡️ *6-Layer Risk Architecture:* ARMED 🟢\n\
+             • L1: Trailing Stop (+20% act, -15% peak) & Hard SL (-20%)\n\
+             • L2: Quiet Market (30s <0.1 ETH) & Inactivity Decay (25s)\n\
+             • L3: Pre-Graduation Guard (90%) & Secondary Pool Trail\n\
+             • L4: Mempool Approval Anomaly Sensor (≥3 Approvals)\n\
+             • L5: Watchdog Supervisor (5s interval, 600s max hold)\n\
+             • L6: Operator Emergency Controls (/panic, /pause, /sweep)\n\
              ═══════════════════════════\n\
              _Gunakan tombol menu di bawah untuk mengelola sistem._",
             status_emoji,
@@ -309,6 +328,33 @@ impl TelegramBot {
                 self.bot
                     .send_message(ChatId(chat_id), text)
                     .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+            }
+            "/panic" => {
+                let alert_text = EmergencyControls::handle_panic(&self.risk_manager).await;
+                let is_running = self.config.is_engine_running();
+                self.bot
+                    .send_message(ChatId(chat_id), alert_text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::main_menu_keyboard(is_running))
+                    .await?;
+            }
+            "/pause" => {
+                let alert_text = EmergencyControls::handle_pause(&self.risk_manager).await;
+                let is_running = self.config.is_engine_running();
+                self.bot
+                    .send_message(ChatId(chat_id), alert_text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::main_menu_keyboard(is_running))
+                    .await?;
+            }
+            "/sweep" => {
+                let alert_text = EmergencyControls::handle_sweep(&self.risk_manager).await;
+                let is_running = self.config.is_engine_running();
+                self.bot
+                    .send_message(ChatId(chat_id), alert_text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::main_menu_keyboard(is_running))
                     .await?;
             }
             _ => {
@@ -630,6 +676,22 @@ impl TelegramBot {
                     .reply_markup(InlineKeyboardMarkup::new(vec![vec![
                         InlineKeyboardButton::callback("🔙 Kembali ke Menu Utama", "menu_main"),
                     ]]))
+                    .await;
+            }
+            "op_panic" => {
+                let text = EmergencyControls::handle_panic(&self.risk_manager).await;
+                let is_running = self.config.is_engine_running();
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::main_menu_keyboard(is_running))
+                    .await;
+            }
+            "op_sweep" => {
+                let text = EmergencyControls::handle_sweep(&self.risk_manager).await;
+                let is_running = self.config.is_engine_running();
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::main_menu_keyboard(is_running))
                     .await;
             }
             _ => {}
