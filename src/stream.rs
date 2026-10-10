@@ -132,6 +132,7 @@ impl ZeroCopyTxParser {
 pub struct StreamListener {
     config: AppConfig,
     fee_adjuster: Arc<DynamicFeeAdjuster>,
+    prysm_engine: Arc<crate::models::PrysmEngine>,
     signal_tx: mpsc::Sender<TradeSignal>,
 }
 
@@ -139,11 +140,13 @@ impl StreamListener {
     pub fn new(
         config: AppConfig,
         fee_adjuster: Arc<DynamicFeeAdjuster>,
+        prysm_engine: Arc<crate::models::PrysmEngine>,
         signal_tx: mpsc::Sender<TradeSignal>,
     ) -> Self {
         Self {
             config,
             fee_adjuster,
+            prysm_engine,
             signal_tx,
         }
     }
@@ -209,6 +212,9 @@ impl StreamListener {
 
             trace!("Received Sequencer Block #{}", block_number);
 
+            // Notify Prysm Series Strategy of new block confirmation (releases matured +3 block orders)
+            self.prysm_engine.process_new_block(block_number).await;
+
             // Fetch block with full transactions for microsecond inspection
             if let Ok(Some(block)) = provider.get_block_by_number(block_number.into()).await {
                 if let BlockTransactions::Full(transactions) = block.transactions {
@@ -219,7 +225,19 @@ impl StreamListener {
                         let input = tx.inner.input();
                         let tx_hash = *tx.inner.tx_hash();
 
+                        // Pipeline 1: Watchlist Monitored Signals
                         self.inspect_transaction_fast(
+                            from,
+                            to,
+                            value,
+                            input,
+                            tx_hash,
+                            block_number,
+                            start,
+                        ).await;
+
+                        // Pipeline 2: Autonomous Prysm Series Strategy Evaluator
+                        self.prysm_engine.inspect_transaction(
                             from,
                             to,
                             value,
@@ -257,6 +275,8 @@ impl StreamListener {
                     if current_block > last_block {
                         for block_num in (last_block + 1)..=current_block {
                             let start = Instant::now();
+                            self.prysm_engine.process_new_block(block_num).await;
+
                             if let Ok(Some(block)) = provider.get_block_by_number(block_num.into()).await {
                                 if let BlockTransactions::Full(txs) = block.transactions {
                                     for tx in txs {
@@ -267,6 +287,16 @@ impl StreamListener {
                                         let tx_hash = *tx.inner.tx_hash();
 
                                         self.inspect_transaction_fast(
+                                            from,
+                                            to,
+                                            value,
+                                            input,
+                                            tx_hash,
+                                            block_num,
+                                            start,
+                                        ).await;
+
+                                        self.prysm_engine.inspect_transaction(
                                             from,
                                             to,
                                             value,
@@ -341,6 +371,7 @@ impl StreamListener {
             swap_calldata: input.to_vec(),
             detected_at: Instant::now(),
             block_number,
+            strategy_tag: None,
         };
 
         if let Err(e) = self.signal_tx.send(signal).await {

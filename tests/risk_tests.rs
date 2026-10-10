@@ -24,6 +24,10 @@ fn create_sample_tracker(entry_eth: f64) -> PositionTracker {
         pnl_percent: 0.0,
         exit_reason: None,
         exit_tx_hash: None,
+        strategy: None,
+        exit_mode: None,
+        entry_mcap_usd: None,
+        current_mcap_usd: None,
     };
     PositionTracker::new(pos, entry_eth)
 }

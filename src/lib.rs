@@ -1,5 +1,6 @@
 pub mod config;
 pub mod dispatcher;
+pub mod models;
 pub mod payload;
 pub mod risk;
 pub mod stream;

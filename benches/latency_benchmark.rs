@@ -121,6 +121,10 @@ fn bench_risk_evaluator_latency(c: &mut Criterion) {
         pnl_percent: 0.0,
         exit_reason: None,
         exit_tx_hash: None,
+        strategy: None,
+        exit_mode: None,
+        entry_mcap_usd: None,
+        current_mcap_usd: None,
     };
     let mut tracker = PositionTracker::new(pos, 1.0);
     let block = BlockEvent {
@@ -146,6 +150,70 @@ fn bench_risk_evaluator_latency(c: &mut Criterion) {
     });
 }
 
+fn bench_prysm_pattern_matching(c: &mut Criterion) {
+    use autotradesniper::models::prysm::{LaunchMetadata, PrysmEngine, COMPANION_ACCOUNTS};
+    use alloy::primitives::address;
+    use std::time::Instant;
+
+    let meta_a = LaunchMetadata {
+        token_address: address!("1111111111111111111111111111111111111111"),
+        pool_address: address!("2222222222222222222222222222222222222222"),
+        creator_address: address!("3333333333333333333333333333333333333333"),
+        image_url: Some("https://vercel-storage.com/prysmcloud/token-images/tok.png".to_string()),
+        website_url: None,
+        dev_buy_eth: 0.02,
+        creator_tax_bps: 200,
+        tax_exempt_wallets: vec![],
+        launch_block: 100,
+        launch_instant: Instant::now(),
+        market_cap_usd: 5000.0,
+    };
+
+    let meta_b = LaunchMetadata {
+        token_address: address!("1111111111111111111111111111111111111111"),
+        pool_address: address!("2222222222222222222222222222222222222222"),
+        creator_address: address!("3333333333333333333333333333333333333333"),
+        image_url: None,
+        website_url: Some("https://sol-swap.lat".to_string()),
+        dev_buy_eth: 0.021,
+        creator_tax_bps: 200,
+        tax_exempt_wallets: vec![],
+        launch_block: 100,
+        launch_instant: Instant::now(),
+        market_cap_usd: 5000.0,
+    };
+
+    c.bench_function("prysm_pattern_a_evaluation_latency", |b| {
+        b.iter(|| {
+            let res = PrysmEngine::evaluate_pattern_a(black_box(&meta_a));
+            black_box(res);
+        });
+    });
+
+    c.bench_function("prysm_pattern_b_evaluation_latency", |b| {
+        b.iter(|| {
+            let res = PrysmEngine::evaluate_pattern_b(black_box(&meta_b));
+            black_box(res);
+        });
+    });
+
+    let companion = COMPANION_ACCOUNTS[0];
+    let token = meta_a.token_address;
+    let now = Instant::now();
+
+    c.bench_function("prysm_pattern_c_evaluation_latency", |b| {
+        b.iter(|| {
+            let res = PrysmEngine::evaluate_pattern_c(
+                black_box(companion),
+                black_box(token),
+                black_box(Some(&meta_a)),
+                black_box(now),
+            );
+            black_box(res);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_zero_copy_parsing,
@@ -154,7 +222,8 @@ criterion_group!(
     bench_fast_exit_payload,
     bench_ema_fee_calculator,
     bench_atomic_nonce_cursor,
-    bench_risk_evaluator_latency
+    bench_risk_evaluator_latency,
+    bench_prysm_pattern_matching
 );
 criterion_main!(benches);
 

@@ -1,5 +1,6 @@
 use autotradesniper::config::AppConfig;
 use autotradesniper::dispatcher::Dispatcher as EngineDispatcher;
+use autotradesniper::models::PrysmEngine;
 use autotradesniper::payload::DynamicFeeAdjuster;
 use autotradesniper::risk::RiskManager;
 use autotradesniper::stream::StreamListener;
@@ -77,9 +78,12 @@ async fn main() -> Result<()> {
         exit_alert_tx,
     ));
 
+    let prysm_engine = Arc::new(PrysmEngine::new(config.clone(), signal_tx.clone()));
+
     let stream_listener = Arc::new(StreamListener::new(
         config.clone(),
         fee_adjuster.clone(),
+        prysm_engine.clone(),
         signal_tx,
     ));
 
@@ -93,6 +97,7 @@ async fn main() -> Result<()> {
             config.clone(),
             wallet_manager.clone(),
             risk_manager.clone(),
+            prysm_engine.clone(),
             positions.clone(),
         )))
     } else {
@@ -118,12 +123,17 @@ async fn main() -> Result<()> {
             // Execute Pipelined Batch-Sequenced Dispatch (< 50 µs compute latency)
             match dispatcher_clone.dispatch_signal(signal.clone()).await {
                 Ok(_report) => {
-                    let trade_eth = *config_clone.default_trade_eth.read().await;
+                    let trade_eth = if signal.strategy_tag.as_deref() == Some("PrysmSeries") {
+                        *config_clone.prysm_size_eth.read().await
+                    } else {
+                        *config_clone.default_trade_eth.read().await
+                    };
                     // Register position into Risk Manager for sub-second lifecycle monitoring
                     risk_clone.register_entry(
                         signal.target_token,
                         signal.pool_or_router,
                         trade_eth,
+                        signal.strategy_tag.clone(),
                     ).await;
                 }
                 Err(e) => {

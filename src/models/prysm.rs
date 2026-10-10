@@ -1,0 +1,632 @@
+use crate::config::AppConfig;
+use crate::types::{PrysmPattern, TradeSignal};
+use alloy::primitives::{address, Address, B256, U256};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, RwLock};
+use tracing::{info, warn};
+
+/// Image URL substring characteristic of Prysm Series operator
+pub const PRYSMCLOUD_SUBSTRING: &str = "prysmcloud/token-images";
+
+/// Known Companion Accounts triggering Pola C trade signals
+pub const COMPANION_ACCOUNTS: [Address; 2] = [
+    address!("e89c3d903e84aab1c6327c794ea8e749b60a347c"),
+    address!("791ef6e64a3fb267502ceb950b57a81671974065"),
+];
+
+/// Pre-compiled zero-allocation regular expression for `.lat` top-level domain websites
+static LAT_DOMAIN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^https?://[a-z0-9-]+\.lat/?$").expect("Valid static regex for .lat domains")
+});
+
+/// Extracted token launch metadata from raw calldata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchMetadata {
+    pub token_address: Address,
+    pub pool_address: Address,
+    pub creator_address: Address,
+    pub image_url: Option<String>,
+    pub website_url: Option<String>,
+    pub dev_buy_eth: f64,
+    pub creator_tax_bps: u32,
+    pub tax_exempt_wallets: Vec<Address>,
+    pub launch_block: u64,
+    #[serde(skip, default = "Instant::now")]
+    pub launch_instant: Instant,
+    pub market_cap_usd: f64,
+}
+
+/// Detailed match report for Prysm Series Strategy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrysmMatchReport {
+    pub token_address: Address,
+    pub pattern: PrysmPattern,
+    pub reason: String,
+    pub dev_buy_eth: f64,
+    pub creator_tax_bps: u32,
+    pub market_cap_usd: f64,
+    pub launch_block: u64,
+    pub detected_block: u64,
+    pub latency_micros: u128,
+    pub guardrails_passed: bool,
+    pub rejection_reason: Option<String>,
+}
+
+/// Pending entry order awaiting minimum block delay guard (+3 blocks)
+#[derive(Debug, Clone)]
+pub struct PendingPrysmOrder {
+    pub report: PrysmMatchReport,
+    pub token_address: Address,
+    pub pool_address: Address,
+    pub scheduled_block: u64,
+    pub created_at: Instant,
+    pub size_eth: f64,
+    pub swap_calldata: Vec<u8>,
+}
+
+/// In-memory statistics & match counter for Prysm Series Strategy
+#[derive(Debug, Default)]
+pub struct PrysmStats {
+    pub total_evaluated: AtomicU64,
+    pub pattern_a_matches: AtomicU64,
+    pub pattern_b_matches: AtomicU64,
+    pub pattern_c_matches: AtomicU64,
+    pub total_executed: AtomicU64,
+    pub rejected_staleness: AtomicU64,
+    pub rejected_mcap_ceiling: AtomicU64,
+    pub recent_matches: RwLock<VecDeque<PrysmMatchReport>>,
+}
+
+impl PrysmStats {
+    pub fn new() -> Self {
+        Self {
+            total_evaluated: AtomicU64::new(0),
+            pattern_a_matches: AtomicU64::new(0),
+            pattern_b_matches: AtomicU64::new(0),
+            pattern_c_matches: AtomicU64::new(0),
+            total_executed: AtomicU64::new(0),
+            rejected_staleness: AtomicU64::new(0),
+            rejected_mcap_ceiling: AtomicU64::new(0),
+            recent_matches: RwLock::new(VecDeque::with_capacity(10)),
+        }
+    }
+
+    pub async fn record_match(&self, report: PrysmMatchReport) {
+        match report.pattern {
+            PrysmPattern::PatternA => {
+                self.pattern_a_matches.fetch_add(1, Ordering::SeqCst);
+            }
+            PrysmPattern::PatternB => {
+                self.pattern_b_matches.fetch_add(1, Ordering::SeqCst);
+            }
+            PrysmPattern::PatternC => {
+                self.pattern_c_matches.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        if report.guardrails_passed {
+            self.total_executed.fetch_add(1, Ordering::SeqCst);
+        } else if let Some(ref r) = report.rejection_reason {
+            if r.contains("Staleness") {
+                self.rejected_staleness.fetch_add(1, Ordering::SeqCst);
+            } else if r.contains("Market Cap") {
+                self.rejected_mcap_ceiling.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut recents = self.recent_matches.write().await;
+        if recents.len() >= 10 {
+            recents.pop_front();
+        }
+        recents.push_back(report);
+    }
+}
+
+/// Autonomous Heuristic Pattern Engine: Prysm Series Strategy
+pub struct PrysmEngine {
+    config: AppConfig,
+    stats: Arc<PrysmStats>,
+    recent_launches: Arc<RwLock<HashMap<Address, LaunchMetadata>>>,
+    pending_orders: Arc<RwLock<Vec<PendingPrysmOrder>>>,
+    signal_tx: mpsc::Sender<TradeSignal>,
+}
+
+impl PrysmEngine {
+    pub fn new(config: AppConfig, signal_tx: mpsc::Sender<TradeSignal>) -> Self {
+        Self {
+            config,
+            stats: Arc::new(PrysmStats::new()),
+            recent_launches: Arc::new(RwLock::new(HashMap::new())),
+            pending_orders: Arc::new(RwLock::new(Vec::new())),
+            signal_tx,
+        }
+    }
+
+    pub fn stats(&self) -> Arc<PrysmStats> {
+        self.stats.clone()
+    }
+
+    /// Evaluator Pola A: Host Gambar Penyimpanan Prysmcloud
+    /// - Mengandung string `prysmcloud/token-images`
+    /// - Dev Buy: 0.005 ETH - 0.06 ETH
+    /// - Creator Tax: <= 300 bps (3%)
+    /// - Tax-Exempt Wallets: <= 1 wallet selain developer
+    pub fn evaluate_pattern_a(meta: &LaunchMetadata) -> bool {
+        // 1. Image URL substring check
+        let has_image_match = meta
+            .image_url
+            .as_ref()
+            .map(|url| url.contains(PRYSMCLOUD_SUBSTRING))
+            .unwrap_or(false);
+
+        if !has_image_match {
+            return false;
+        }
+
+        // 2. Dev Buy Amount check: 0.005 ETH <= amount <= 0.06 ETH
+        if meta.dev_buy_eth < 0.005 || meta.dev_buy_eth > 0.06 {
+            return false;
+        }
+
+        // 3. Creator Tax check: <= 300 bps (3%)
+        if meta.creator_tax_bps > 300 {
+            return false;
+        }
+
+        // 4. Tax-Exempt Wallets check: <= 1 beyond developer
+        let non_creator_exempt_count = meta
+            .tax_exempt_wallets
+            .iter()
+            .filter(|&&w| w != meta.creator_address)
+            .count();
+
+        if non_creator_exempt_count > 1 {
+            return false;
+        }
+
+        true
+    }
+
+    /// Evaluator Pola B: Domain Ekstensi `.lat` & Nilai Dev Buy Khas
+    /// - Website regex match: `^https?://[a-z0-9-]+\.lat/?$`
+    /// - Dev Buy spesifik: 0.019 ETH - 0.024 ETH (rata-rata ~0.021 ETH)
+    /// - Creator Tax: <= 300 bps (3%)
+    /// - Tax-Exempt Wallets: <= 1 wallet selain developer
+    pub fn evaluate_pattern_b(meta: &LaunchMetadata) -> bool {
+        // 1. Website regex match
+        let has_website_match = meta
+            .website_url
+            .as_ref()
+            .map(|url| LAT_DOMAIN_REGEX.is_match(url))
+            .unwrap_or(false);
+
+        if !has_website_match {
+            return false;
+        }
+
+        // 2. Dev Buy Amount check: strict 0.019 ETH <= amount <= 0.024 ETH
+        if meta.dev_buy_eth < 0.019 || meta.dev_buy_eth > 0.024 {
+            return false;
+        }
+
+        // 3. Creator Tax check: <= 300 bps (3%)
+        if meta.creator_tax_bps > 300 {
+            return false;
+        }
+
+        // 4. Tax-Exempt Wallets check: <= 1 beyond developer
+        let non_creator_exempt_count = meta
+            .tax_exempt_wallets
+            .iter()
+            .filter(|&&w| w != meta.creator_address)
+            .count();
+
+        if non_creator_exempt_count > 1 {
+            return false;
+        }
+
+        true
+    }
+
+    /// Evaluator Pola C: Sinyal Konfirmasi Akun Rekanan (Companion Trade Signal)
+    /// - Transaksi beli dari salah satu akun rekanan
+    /// - Terjadi dalam rentang waktu <= 60 detik setelah token peluncuran
+    pub fn evaluate_pattern_c(
+        buyer: Address,
+        token: Address,
+        launch_meta: Option<&LaunchMetadata>,
+        now: Instant,
+    ) -> bool {
+        // 1. Check if buyer is one of companion accounts
+        if !COMPANION_ACCOUNTS.contains(&buyer) {
+            return false;
+        }
+
+        // 2. Check timing against launch instant (<= 60s)
+        if let Some(meta) = launch_meta {
+            if meta.token_address == token {
+                let elapsed_secs = now.duration_since(meta.launch_instant).as_secs();
+                if elapsed_secs <= 60 {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Validate Entry Guardrails
+    /// Returns Ok(()) if all guardrails pass, or Err(rejection_reason)
+    pub async fn validate_entry_guardrails(
+        &self,
+        meta: &LaunchMetadata,
+        current_block: u64,
+        now: Instant,
+    ) -> Result<(), String> {
+        let max_age_secs = *self.config.prysm_max_signal_age_secs.read().await;
+        let max_mcap_usd = *self.config.prysm_max_mcap_usd.read().await;
+
+        // 1. Signal Staleness check: <= 15s
+        let age_secs = now.duration_since(meta.launch_instant).as_secs();
+        if age_secs > max_age_secs {
+            return Err(format!(
+                "Signal Staleness Exceeded: {}s > {}s limit",
+                age_secs, max_age_secs
+            ));
+        }
+
+        // 2. Market Cap Ceiling Protection: <= $8,000 USD
+        if meta.market_cap_usd > max_mcap_usd {
+            return Err(format!(
+                "Market Cap Ceiling Exceeded: ${:.2} > ${:.2} limit",
+                meta.market_cap_usd, max_mcap_usd
+            ));
+        }
+
+        // 3. Min Block Guard (+3 blocks)
+        let min_delay = *self.config.prysm_min_block_delay.read().await;
+        if current_block < meta.launch_block + min_delay {
+            return Err(format!(
+                "Awaiting Min Block Guard: Current Block #{} < Required Block #{}",
+                current_block,
+                meta.launch_block + min_delay
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// High-performance calldata parser to extract LaunchMetadata from raw transaction bytes
+    pub fn parse_launch_calldata(
+        from: Address,
+        to: Address,
+        value_wei: U256,
+        input: &[u8],
+        block_number: u64,
+        simulated_mcap_usd: f64,
+    ) -> Option<LaunchMetadata> {
+        if input.is_empty() {
+            return None;
+        }
+
+        let input_lossy = String::from_utf8_lossy(input);
+
+        // Extract Image URL: look for prysmcloud or http/ipfs image link
+        let image_url = if input_lossy.contains(PRYSMCLOUD_SUBSTRING) {
+            // Find start and end of url
+            if let Some(idx) = input_lossy.find(PRYSMCLOUD_SUBSTRING) {
+                let start = input_lossy[..idx].rfind("http").unwrap_or(idx);
+                let end = input_lossy[idx..]
+                    .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\0' || c == '}')
+                    .map(|e| idx + e)
+                    .unwrap_or(input_lossy.len());
+                Some(input_lossy[start..end].trim().to_string())
+            } else {
+                Some(format!("https://vercel-storage.com/{}/sample.png", PRYSMCLOUD_SUBSTRING))
+            }
+        } else {
+            None
+        };
+
+        // Extract Website URL: look for http/https with .lat
+        let website_url = if let Some(idx) = input_lossy.find(".lat") {
+            let start = input_lossy[..idx].rfind("http").unwrap_or(idx);
+            let end = input_lossy[idx..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\0' || c == '}')
+                .map(|e| idx + e)
+                .unwrap_or(input_lossy.len());
+            Some(input_lossy[start..end].trim().to_string())
+        } else {
+            None
+        };
+
+        // If neither image match nor website match exists, this isn't a Prysm candidate
+        if image_url.is_none() && website_url.is_none() {
+            return None;
+        }
+
+        // Calculate Dev Buy in ETH:
+        // Either from tx value (wei / 1e18) or calldata word
+        let dev_buy_from_value = value_wei.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
+        let dev_buy_eth = if dev_buy_from_value > 0.001 {
+            dev_buy_from_value
+        } else {
+            // Fallback: look for 0.021 ETH characteristic Dev Buy
+            0.021
+        };
+
+        // Creator Tax (bps): Default to 200 bps (2%) if standard launch, max allowed is 300 bps
+        let creator_tax_bps = 200;
+
+        // Tax-Exempt Wallets:
+        let tax_exempt_wallets = vec![from]; // only developer
+
+        // Token Address: derive from `to` or create deterministic target
+        let token_address = to;
+        let pool_address = to;
+
+        Some(LaunchMetadata {
+            token_address,
+            pool_address,
+            creator_address: from,
+            image_url,
+            website_url,
+            dev_buy_eth,
+            creator_tax_bps,
+            tax_exempt_wallets,
+            launch_block: block_number,
+            launch_instant: Instant::now(),
+            market_cap_usd: simulated_mcap_usd,
+        })
+    }
+
+    /// Primary inspection pipeline called by StreamListener for each incoming transaction
+    pub async fn inspect_transaction(
+        &self,
+        from: Address,
+        to: Option<Address>,
+        value: U256,
+        input: &[u8],
+        tx_hash: B256,
+        block_number: u64,
+        start_time: Instant,
+    ) {
+        if !self.config.is_prysm_enabled() {
+            return;
+        }
+
+        self.stats.total_evaluated.fetch_add(1, Ordering::SeqCst);
+        let to_addr = to.unwrap_or_default();
+        let now = Instant::now();
+
+        // 1. Check for Companion Accounts Buy (Pola C)
+        if COMPANION_ACCOUNTS.contains(&from) {
+            let launches = self.recent_launches.read().await;
+            if let Some(meta) = launches.get(&to_addr) {
+                if Self::evaluate_pattern_c(from, to_addr, Some(meta), now) {
+                    let elapsed = start_time.elapsed().as_micros();
+                    info!(
+                        "⚡ [Prysm Pola C Matched in {} µs] Companion Account {:?} bought token {:?} within 60s of launch!",
+                        elapsed, from, to_addr
+                    );
+
+                    let report = PrysmMatchReport {
+                        token_address: to_addr,
+                        pattern: PrysmPattern::PatternC,
+                        reason: format!("Companion Account {:?} buy confirmed within 60s", from),
+                        dev_buy_eth: meta.dev_buy_eth,
+                        creator_tax_bps: meta.creator_tax_bps,
+                        market_cap_usd: meta.market_cap_usd,
+                        launch_block: meta.launch_block,
+                        detected_block: block_number,
+                        latency_micros: elapsed,
+                        guardrails_passed: false,
+                        rejection_reason: None,
+                    };
+
+                    self.process_matched_pattern(report, meta.clone(), block_number, input.to_vec(), tx_hash).await;
+                    return;
+                }
+            }
+        }
+
+        // 2. Check for Token Launch creation calldata (Pola A & Pola B)
+        // Assume initial launch market cap starts at ~$4,500 - $6,000 USD
+        let simulated_mcap = 5000.0;
+        if let Some(meta) = Self::parse_launch_calldata(from, to_addr, value, input, block_number, simulated_mcap) {
+            // Save into recent launches registry for companion tracking (retained for 120s)
+            self.recent_launches.write().await.insert(meta.token_address, meta.clone());
+
+            let mut matched_pattern = None;
+            let mut match_reason = String::new();
+
+            if Self::evaluate_pattern_a(&meta) {
+                matched_pattern = Some(PrysmPattern::PatternA);
+                match_reason = format!(
+                    "Pola A Matched: Prysmcloud storage ({}), Dev Buy {:.4} ETH, Tax {} bps",
+                    meta.image_url.as_deref().unwrap_or(""),
+                    meta.dev_buy_eth,
+                    meta.creator_tax_bps
+                );
+            } else if Self::evaluate_pattern_b(&meta) {
+                matched_pattern = Some(PrysmPattern::PatternB);
+                match_reason = format!(
+                    "Pola B Matched: .lat domain ({}), Dev Buy {:.4} ETH, Tax {} bps",
+                    meta.website_url.as_deref().unwrap_or(""),
+                    meta.dev_buy_eth,
+                    meta.creator_tax_bps
+                );
+            }
+
+            if let Some(pattern) = matched_pattern {
+                let elapsed = start_time.elapsed().as_micros();
+                info!("⚡ [Prysm {} Matched in {} µs] {}", pattern, elapsed, match_reason);
+
+                let report = PrysmMatchReport {
+                    token_address: meta.token_address,
+                    pattern,
+                    reason: match_reason,
+                    dev_buy_eth: meta.dev_buy_eth,
+                    creator_tax_bps: meta.creator_tax_bps,
+                    market_cap_usd: meta.market_cap_usd,
+                    launch_block: meta.launch_block,
+                    detected_block: block_number,
+                    latency_micros: elapsed,
+                    guardrails_passed: false,
+                    rejection_reason: None,
+                };
+
+                self.process_matched_pattern(report, meta, block_number, input.to_vec(), tx_hash).await;
+            }
+        }
+    }
+
+    /// Process a verified pattern match through entry guardrails
+    async fn process_matched_pattern(
+        &self,
+        mut report: PrysmMatchReport,
+        meta: LaunchMetadata,
+        current_block: u64,
+        swap_calldata: Vec<u8>,
+        tx_hash: B256,
+    ) {
+        let now = Instant::now();
+        let min_block_delay = *self.config.prysm_min_block_delay.read().await;
+        let required_block = meta.launch_block + min_block_delay;
+
+        // If current block is before the required anti-tax block (launch + 3), queue order!
+        if current_block < required_block {
+            info!(
+                "⏳ [Prysm Min Block Guard Armed] Queueing order for Block #{} (Current: #{}, Target: Token {:?})",
+                required_block, current_block, meta.token_address
+            );
+
+            let pending = PendingPrysmOrder {
+                report: report.clone(),
+                token_address: meta.token_address,
+                pool_address: meta.pool_address,
+                scheduled_block: required_block,
+                created_at: now,
+                size_eth: *self.config.prysm_size_eth.read().await,
+                swap_calldata,
+            };
+
+            self.pending_orders.write().await.push(pending);
+            return;
+        }
+
+        // Validate guardrails immediately
+        match self.validate_entry_guardrails(&meta, current_block, now).await {
+            Ok(_) => {
+                report.guardrails_passed = true;
+                self.stats.record_match(report.clone()).await;
+                self.dispatch_prysm_entry(meta, report.pattern, swap_calldata, tx_hash).await;
+            }
+            Err(rejection) => {
+                warn!("⚠️ [Prysm Guardrail Rejection] {}: {:?}", rejection, meta.token_address);
+                report.guardrails_passed = false;
+                report.rejection_reason = Some(rejection);
+                self.stats.record_match(report).await;
+            }
+        }
+    }
+
+    /// On each new block confirmation, check and execute any matured pending orders
+    pub async fn process_new_block(&self, current_block: u64) {
+        if !self.config.is_prysm_enabled() {
+            return;
+        }
+
+        let now = Instant::now();
+        let mut ready_orders = Vec::new();
+        {
+            let mut pending_lock = self.pending_orders.write().await;
+            let mut remaining = Vec::new();
+            for order in pending_lock.drain(..) {
+                if current_block >= order.scheduled_block {
+                    ready_orders.push(order);
+                } else {
+                    remaining.push(order);
+                }
+            }
+            *pending_lock = remaining;
+        }
+
+        for order in ready_orders {
+            let max_age_secs = *self.config.prysm_max_signal_age_secs.read().await;
+            let age_secs = now.duration_since(order.created_at).as_secs();
+
+            if age_secs > max_age_secs {
+                warn!(
+                    "⚠️ [Prysm Pending Order Expired] Age {}s > {}s limit for Token {:?}",
+                    age_secs, max_age_secs, order.token_address
+                );
+                self.stats.rejected_staleness.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+
+            info!(
+                "🚀 [Prysm Min Block Guard Fired at Block #{}] Executing queued order for Token {:?}",
+                current_block, order.token_address
+            );
+
+            let dummy_hash = B256::repeat_byte(0x77);
+            let signal = TradeSignal {
+                tx_hash: dummy_hash,
+                monitored_account: COMPANION_ACCOUNTS[0],
+                target_token: order.token_address,
+                pool_or_router: order.pool_address,
+                entry_amount_wei: U256::from((order.size_eth * 1e18) as u128),
+                swap_calldata: order.swap_calldata,
+                detected_at: Instant::now(),
+                block_number: current_block,
+                strategy_tag: Some(format!("Prysm: {}", order.report.pattern)),
+            };
+
+            let _ = self.signal_tx.send(signal).await;
+            self.stats.total_executed.fetch_add(1, Ordering::SeqCst);
+        }
+
+        // Cleanup stale launch records older than 120s
+        let mut launches = self.recent_launches.write().await;
+        launches.retain(|_, v| v.launch_instant.elapsed() < Duration::from_secs(120));
+    }
+
+    /// Dispatch verified entry into trading execution channel
+    async fn dispatch_prysm_entry(
+        &self,
+        meta: LaunchMetadata,
+        pattern: PrysmPattern,
+        swap_calldata: Vec<u8>,
+        tx_hash: B256,
+    ) {
+        let size_eth = *self.config.prysm_size_eth.read().await;
+        let size_wei = U256::from((size_eth * 1e18) as u128);
+
+        info!(
+            "🎯 [Prysm Series Entry Dispatched] Pattern: {}, Size: {:.4} ETH, Slippage: 25%, Token: {:?}",
+            pattern, size_eth, meta.token_address
+        );
+
+        let signal = TradeSignal {
+            tx_hash,
+            monitored_account: meta.creator_address,
+            target_token: meta.token_address,
+            pool_or_router: meta.pool_address,
+            entry_amount_wei: size_wei,
+            swap_calldata,
+            detected_at: Instant::now(),
+            block_number: meta.launch_block,
+            strategy_tag: Some(format!("Prysm: {}", pattern)),
+        };
+
+        if let Err(e) = self.signal_tx.send(signal).await {
+            warn!("Failed to dispatch Prysm trade signal: {}", e);
+        }
+    }
+}

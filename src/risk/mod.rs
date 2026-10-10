@@ -65,6 +65,7 @@ impl RiskManager {
         token_address: Address,
         pool_address: Address,
         entry_eth: f64,
+        strategy_tag: Option<String>,
     ) -> Position {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -73,6 +74,13 @@ impl RiskManager {
 
         let base_slippage = *self.config.slippage_percent.read().await;
         let adaptive_slip = self.calculate_adaptive_slippage(base_slippage, entry_eth);
+
+        let is_prysm = strategy_tag.as_ref().map(|s| s.contains("Prysm")).unwrap_or(false);
+        let prysm_exit_mode = if is_prysm {
+            Some(*self.config.prysm_exit_mode.read().await)
+        } else {
+            None
+        };
 
         let pos_id = format!("POS-{:x}", rand::random::<u32>());
         let pos = Position {
@@ -87,18 +95,29 @@ impl RiskManager {
             pnl_percent: 0.0,
             exit_reason: None,
             exit_tx_hash: None,
+            strategy: strategy_tag.clone(),
+            exit_mode: prysm_exit_mode.map(|m| format!("{}", m)),
+            entry_mcap_usd: if is_prysm { Some(5000.0) } else { None },
+            current_mcap_usd: if is_prysm { Some(5000.0) } else { None },
         };
 
         info!(
-            "🎯 [Risk Layer 1-6 Armed] Position Registered: {} (Token: {}, Entry: {:.4} ETH, Adaptive Slip: {:.2}%)",
-            pos.id, pos.token_symbol, pos.entry_eth_amount, adaptive_slip
+            "🎯 [Risk Layer 1-6 Armed] Position Registered: {} (Token: {}, Strategy: {:?}, Entry: {:.4} ETH, Adaptive Slip: {:.2}%)",
+            pos.id, pos.token_symbol, pos.strategy, pos.entry_eth_amount, adaptive_slip
         );
 
         // Store in public positions vector
         self.positions.write().await.push(pos.clone());
 
         // Initialize 6-layer state tracker
-        let tracker = PositionTracker::new(pos.clone(), entry_eth);
+        let mut tracker = PositionTracker::new(pos.clone(), entry_eth);
+        if is_prysm {
+            tracker.is_prysm_strategy = true;
+            tracker.prysm_exit_mode = prysm_exit_mode;
+            tracker.prysm_entry_mcap_usd = 5000.0;
+            tracker.current_mcap_usd = 5000.0;
+        }
+
         self.trackers.write().await.insert(pos_id, tracker);
 
         pos

@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+fn default_prysm_enabled() -> bool { false }
+fn default_prysm_size_eth() -> f64 { 0.01 }
+fn default_prysm_exit_mode() -> crate::types::PrysmExitMode { crate::types::PrysmExitMode::System }
+fn default_prysm_max_mcap_usd() -> f64 { 8000.0 }
+
 /// Persistent runtime state stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeState {
@@ -25,6 +30,15 @@ pub struct RuntimeState {
     pub execution_mode: ExecutionMode,
     pub sub_account_count: usize,
     pub is_engine_active: bool,
+
+    #[serde(default = "default_prysm_enabled")]
+    pub prysm_enabled: bool,
+    #[serde(default = "default_prysm_size_eth")]
+    pub prysm_size_eth: f64,
+    #[serde(default = "default_prysm_exit_mode")]
+    pub prysm_exit_mode: crate::types::PrysmExitMode,
+    #[serde(default = "default_prysm_max_mcap_usd")]
+    pub prysm_max_mcap_usd: f64,
 }
 
 /// Global shared application configuration
@@ -51,6 +65,17 @@ pub struct AppConfig {
     pub min_sub_account_eth: Arc<RwLock<f64>>,
     pub rebalance_target_eth: Arc<RwLock<f64>>,
     pub is_engine_active: Arc<AtomicBool>,
+
+    // Prysm Series Strategy Dedicated Configuration
+    pub prysm_enabled: Arc<AtomicBool>,
+    pub prysm_size_eth: Arc<RwLock<f64>>,
+    pub prysm_exit_mode: Arc<RwLock<crate::types::PrysmExitMode>>,
+    pub prysm_max_mcap_usd: Arc<RwLock<f64>>,
+    pub prysm_min_block_delay: Arc<RwLock<u64>>,
+    pub prysm_max_signal_age_secs: Arc<RwLock<u64>>,
+    pub prysm_slippage_percent: Arc<RwLock<f64>>,
+    pub prysm_target_mcap_usd: Arc<RwLock<f64>>,
+    pub prysm_target_stop_loss_percent: Arc<RwLock<f64>>,
 
     state_path: String,
 }
@@ -174,6 +199,18 @@ impl AppConfig {
             min_sub_account_eth: Arc::new(RwLock::new(min_sub_account_eth)),
             rebalance_target_eth: Arc::new(RwLock::new(rebalance_target_eth)),
             is_engine_active: Arc::new(AtomicBool::new(true)),
+
+            // Prysm Strategy defaults
+            prysm_enabled: Arc::new(AtomicBool::new(false)),
+            prysm_size_eth: Arc::new(RwLock::new(0.01)),
+            prysm_exit_mode: Arc::new(RwLock::new(crate::types::PrysmExitMode::System)),
+            prysm_max_mcap_usd: Arc::new(RwLock::new(8000.0)),
+            prysm_min_block_delay: Arc::new(RwLock::new(3)),
+            prysm_max_signal_age_secs: Arc::new(RwLock::new(15)),
+            prysm_slippage_percent: Arc::new(RwLock::new(25.0)),
+            prysm_target_mcap_usd: Arc::new(RwLock::new(10000.0)),
+            prysm_target_stop_loss_percent: Arc::new(RwLock::new(30.0)),
+
             state_path,
         };
 
@@ -182,6 +219,15 @@ impl AppConfig {
 
         Ok(config)
     }
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self::load_from_env().expect("Default AppConfig should always load")
+    }
+}
+
+impl AppConfig {
 
     /// Load persisted state from JSON file
     pub fn load_persisted_state(&self) -> Result<()> {
@@ -241,6 +287,18 @@ impl AppConfig {
         }
         self.is_engine_active.store(state.is_engine_active, Ordering::SeqCst);
 
+        // Restore Prysm Series Strategy configuration
+        self.prysm_enabled.store(state.prysm_enabled, Ordering::SeqCst);
+        if let Ok(mut lock) = self.prysm_size_eth.try_write() {
+            *lock = state.prysm_size_eth;
+        }
+        if let Ok(mut lock) = self.prysm_exit_mode.try_write() {
+            *lock = state.prysm_exit_mode;
+        }
+        if let Ok(mut lock) = self.prysm_max_mcap_usd.try_write() {
+            *lock = state.prysm_max_mcap_usd;
+        }
+
         Ok(())
     }
 
@@ -268,6 +326,11 @@ impl AppConfig {
             execution_mode: *self.execution_mode.read().await,
             sub_account_count: *self.sub_account_count.read().await,
             is_engine_active: self.is_engine_active.load(Ordering::SeqCst),
+
+            prysm_enabled: self.prysm_enabled.load(Ordering::SeqCst),
+            prysm_size_eth: *self.prysm_size_eth.read().await,
+            prysm_exit_mode: *self.prysm_exit_mode.read().await,
+            prysm_max_mcap_usd: *self.prysm_max_mcap_usd.read().await,
         };
 
         let json = serde_json::to_string_pretty(&state)?;
@@ -305,5 +368,47 @@ impl AppConfig {
         self.is_engine_active.store(new_state, Ordering::SeqCst);
         let _ = self.save_persisted_state().await;
         new_state
+    }
+
+    // =========================================================================
+    // PRYSM SERIES STRATEGY ACCESSORS
+    // =========================================================================
+
+    pub fn is_prysm_enabled(&self) -> bool {
+        self.prysm_enabled.load(Ordering::SeqCst)
+    }
+
+    pub async fn toggle_prysm_strategy(&self) -> bool {
+        let current = self.prysm_enabled.load(Ordering::SeqCst);
+        let new_state = !current;
+        self.prysm_enabled.store(new_state, Ordering::SeqCst);
+        let _ = self.save_persisted_state().await;
+        new_state
+    }
+
+    pub async fn set_prysm_size_eth(&self, size: f64) {
+        let mut lock = self.prysm_size_eth.write().await;
+        *lock = size.max(0.001);
+        drop(lock);
+        let _ = self.save_persisted_state().await;
+    }
+
+    pub async fn toggle_prysm_exit_mode(&self) -> crate::types::PrysmExitMode {
+        let mut lock = self.prysm_exit_mode.write().await;
+        let next = match *lock {
+            crate::types::PrysmExitMode::System => crate::types::PrysmExitMode::Target,
+            crate::types::PrysmExitMode::Target => crate::types::PrysmExitMode::System,
+        };
+        *lock = next;
+        drop(lock);
+        let _ = self.save_persisted_state().await;
+        next
+    }
+
+    pub async fn set_prysm_max_mcap_usd(&self, mcap: f64) {
+        let mut lock = self.prysm_max_mcap_usd.write().await;
+        *lock = mcap.max(100.0);
+        drop(lock);
+        let _ = self.save_persisted_state().await;
     }
 }

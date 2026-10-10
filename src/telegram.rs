@@ -9,6 +9,7 @@ use anyhow::Result;
 use emergency_controls::EmergencyControls;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -22,6 +23,7 @@ pub enum UserState {
     Idle,
     AwaitingAddAddress,
     AwaitingMnemonic,
+    AwaitingPrysmSize,
 }
 
 /// Outgoing telemetry alert message payload for rate-limited async dispatch
@@ -37,6 +39,7 @@ pub struct TelegramBot {
     config: AppConfig,
     wallet_manager: WalletManager,
     risk_manager: Arc<RiskManager>,
+    prysm_engine: Arc<crate::models::PrysmEngine>,
     positions: Arc<RwLock<Vec<Position>>>,
     user_states: Arc<RwLock<HashMap<i64, UserState>>>,
     alert_queue_tx: mpsc::Sender<QueuedTelegramAlert>,
@@ -48,6 +51,7 @@ impl TelegramBot {
         config: AppConfig,
         wallet_manager: WalletManager,
         risk_manager: Arc<RiskManager>,
+        prysm_engine: Arc<crate::models::PrysmEngine>,
         positions: Arc<RwLock<Vec<Position>>>,
     ) -> Self {
         let bot = Bot::new(token);
@@ -65,6 +69,7 @@ impl TelegramBot {
             config,
             wallet_manager,
             risk_manager,
+            prysm_engine,
             positions,
             user_states: Arc::new(RwLock::new(HashMap::new())),
             alert_queue_tx,
@@ -111,12 +116,124 @@ impl TelegramBot {
             ],
             vec![
                 InlineKeyboardButton::callback("📈 Portfolio & Status", "menu_portfolio"),
+                InlineKeyboardButton::callback("🔬 Model Strategi", "menu_models"),
             ],
             vec![
                 InlineKeyboardButton::callback("🚨 Panic Sell All", "op_panic"),
                 InlineKeyboardButton::callback("🧹 Sweep Assets", "op_sweep"),
             ],
         ])
+    }
+
+    /// Build Strategy Models Sub-Menu Keyboard
+    pub fn models_keyboard() -> InlineKeyboardMarkup {
+        InlineKeyboardMarkup::new(vec![
+            vec![
+                InlineKeyboardButton::callback("⚡ Seri Prysm (Fast-Path Pattern)", "menu_prysm"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("🔙 Kembali ke Menu Utama", "menu_main"),
+            ],
+        ])
+    }
+
+    /// Build Prysm Series Dedicated Sub-Menu Keyboard
+    pub fn prysm_keyboard(is_enabled: bool) -> InlineKeyboardMarkup {
+        let toggle_text = if is_enabled {
+            "🔴 NONAKTIFKAN MODEL"
+        } else {
+            "🟢 AKTIFKAN MODEL"
+        };
+
+        InlineKeyboardMarkup::new(vec![
+            vec![
+                InlineKeyboardButton::callback(toggle_text, "prysm_toggle"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("✏️ Ubah Modal (ETH)", "prysm_set_size"),
+                InlineKeyboardButton::callback("🔄 Ganti Mode Exit", "prysm_toggle_exit"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("📊 Statistik & Riwayat Match", "prysm_stats"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("🔙 Kembali ke Menu Utama", "menu_main"),
+            ],
+        ])
+    }
+
+    /// Format Prysm Strategy Dashboard Summary Text
+    pub async fn get_prysm_dashboard_text(&self) -> String {
+        let is_enabled = self.config.is_prysm_enabled();
+        let status_str = if is_enabled { "AKTIF 🟢" } else { "NONAKTIF 🔴" };
+        let size_eth = *self.config.prysm_size_eth.read().await;
+        let exit_mode = *self.config.prysm_exit_mode.read().await;
+        let max_mcap = *self.config.prysm_max_mcap_usd.read().await;
+
+        format!(
+            "🔬 *STRATEGI: SERI PRYSM (FAST\\-PATH PATTERN)*\n\
+             ═══════════════════════════\n\
+             • *Status Model*   : [{}]\n\
+             • *Modal Entri*    : `{:.4} ETH`\n\
+             • *Mode Exit*      : {}\n\
+             • *Pola Aktif*     : Pola A (Prysmcloud), Pola B (.lat), Pola C (Companion)\n\
+             • *Max MCap Entri* : `${:.0} USD`\n\
+             • *Min Block Guard*: `+3 Blok` (Anti\\-Launch Tax Protection)\n\
+             • *Max Usia Sinyal*: `15 Detik`\n\
+             • *Toleransi Slip* : `25.0%`\n\
+             ═══════════════════════════\n\
+             _Sistem mengevaluasi metadata calldata peluncuran token secara mandiri\\._",
+            status_str,
+            size_eth,
+            exit_mode,
+            max_mcap
+        )
+    }
+
+    /// Format Prysm Match Statistics & History Text
+    pub async fn get_prysm_stats_text(&self) -> String {
+        let stats = self.prysm_engine.stats();
+        let evaluated = stats.total_evaluated.load(Ordering::SeqCst);
+        let a = stats.pattern_a_matches.load(Ordering::SeqCst);
+        let b = stats.pattern_b_matches.load(Ordering::SeqCst);
+        let c = stats.pattern_c_matches.load(Ordering::SeqCst);
+        let executed = stats.total_executed.load(Ordering::SeqCst);
+        let rej_stale = stats.rejected_staleness.load(Ordering::SeqCst);
+        let rej_mcap = stats.rejected_mcap_ceiling.load(Ordering::SeqCst);
+
+        let recents = stats.recent_matches.read().await;
+        let mut recent_str = String::new();
+        for (i, r) in recents.iter().enumerate() {
+            let status = if r.guardrails_passed { "✅ Eksekusi" } else { "❌ Ditolak" };
+            recent_str.push_str(&format!(
+                "{}\\. *{}* \\- `{}` \\({}\\)\n   _{}_\n",
+                i + 1,
+                r.pattern,
+                format!("{:?}", r.token_address),
+                status,
+                r.reason.replace('-', "\\-").replace('_', "\\_")
+            ));
+        }
+        if recent_str.is_empty() {
+            recent_str = "_Belum ada riwayat kecocokan pola\\._".to_string();
+        }
+
+        format!(
+            "📊 *STATISTIK & RIWAYAT MATCH SERI PRYSM*\n\
+             ═══════════════════════════\n\
+             🔍 *Total Transaksi Dipindai:* {}\n\
+             🎯 *Pola A (Prysmcloud Storage):* {} match\n\
+             🌐 *Pola B (Domain .lat / 0.021 ETH):* {} match\n\
+             👥 *Pola C (Companion Trade Signals):* {} match\n\n\
+             🚀 *Total Order Tereksekusi:* {}\n\
+             ⏱️ *Ditolak (Signal Staleness > 15s):* {}\n\
+             📈 *Ditolak (Market Cap > $8k USD):* {}\n\
+             ═══════════════════════════\n\
+             *Riwayat Kecocokan Terakhir:*\n\
+             {}\n\
+             ═══════════════════════════",
+            evaluated, a, b, c, executed, rej_stale, rej_mcap, recent_str
+        )
     }
 
     /// Build Signal Accounts Sub-Menu Keyboard
@@ -310,6 +427,30 @@ impl TelegramBot {
                 }
                 return Ok(());
             }
+            UserState::AwaitingPrysmSize => {
+                if let Ok(size) = text.parse::<f64>() {
+                    if size > 0.0 {
+                        self.config.set_prysm_size_eth(size).await;
+                        self.user_states.write().await.insert(chat_id, UserState::Idle);
+
+                        let p_text = self.get_prysm_dashboard_text().await;
+                        let is_enabled = self.config.is_prysm_enabled();
+                        self.bot
+                            .send_message(
+                                ChatId(chat_id),
+                                format!("✅ Modal entri Seri Prysm diubah menjadi `{:.4} ETH`!\n\n{}", size, p_text),
+                            )
+                            .parse_mode(ParseMode::MarkdownV2)
+                            .reply_markup(Self::prysm_keyboard(is_enabled))
+                            .await?;
+                    } else {
+                        self.bot.send_message(ChatId(chat_id), "❌ Nilai modal harus lebih besar dari 0 ETH:").await?;
+                    }
+                } else {
+                    self.bot.send_message(ChatId(chat_id), "❌ Format angka tidak valid! Masukkan angka desimal (misal: `0.02`):").await?;
+                }
+                return Ok(());
+            }
             UserState::Idle => {}
         }
 
@@ -321,6 +462,15 @@ impl TelegramBot {
                     .send_message(ChatId(chat_id), dashboard_text)
                     .parse_mode(ParseMode::MarkdownV2)
                     .reply_markup(Self::main_menu_keyboard(is_running))
+                    .await?;
+            }
+            "/prysm" => {
+                let text = self.get_prysm_dashboard_text().await;
+                let is_enabled = self.config.is_prysm_enabled();
+                self.bot
+                    .send_message(ChatId(chat_id), text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::prysm_keyboard(is_enabled))
                     .await?;
             }
             "/status" => {
@@ -692,6 +842,58 @@ impl TelegramBot {
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
                     .parse_mode(ParseMode::MarkdownV2)
                     .reply_markup(Self::main_menu_keyboard(is_running))
+                    .await;
+            }
+            "menu_models" => {
+                let text = "🔬 *MODEL STRATEGI TRADING*\n\
+                            ═══════════════════════════\n\
+                            Pilih modul strategi mandiri di bawah untuk melihat konfigurasi, \
+                            status metrik, dan riwayat pola:";
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::models_keyboard())
+                    .await;
+            }
+            "menu_prysm" => {
+                let text = self.get_prysm_dashboard_text().await;
+                let is_enabled = self.config.is_prysm_enabled();
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::prysm_keyboard(is_enabled))
+                    .await;
+            }
+            "prysm_toggle" => {
+                let is_now_enabled = self.config.toggle_prysm_strategy().await;
+                let text = self.get_prysm_dashboard_text().await;
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::prysm_keyboard(is_now_enabled))
+                    .await;
+            }
+            "prysm_set_size" => {
+                self.user_states.write().await.insert(chat_id, UserState::AwaitingPrysmSize);
+                let text = "✏️ *UBAH MODAL ENTRI SERI PRYSM*\n\n\
+                            Kirimkan jumlah ETH untuk setiap eksekusi Seri Prysm \\(misal: `0.01` atau `0.025`\\):";
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await;
+            }
+            "prysm_toggle_exit" => {
+                let _ = self.config.toggle_prysm_exit_mode().await;
+                let text = self.get_prysm_dashboard_text().await;
+                let is_enabled = self.config.is_prysm_enabled();
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(Self::prysm_keyboard(is_enabled))
+                    .await;
+            }
+            "prysm_stats" => {
+                let text = self.get_prysm_stats_text().await;
+                let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(InlineKeyboardMarkup::new(vec![vec![
+                        InlineKeyboardButton::callback("🔙 Kembali ke Seri Prysm", "menu_prysm"),
+                    ]]))
                     .await;
             }
             _ => {}

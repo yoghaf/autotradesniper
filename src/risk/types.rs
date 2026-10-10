@@ -31,6 +31,10 @@ pub enum ExitReason {
     ManualPanic,
     /// Layer 6: Operator Emergency Asset Sweep (/sweep)
     EmergencySweep,
+    /// Prysm Strategy Target Exit: Take-Profit Market Cap (>= $10,000 USD)
+    PrysmTargetMcap,
+    /// Prysm Strategy Target Exit: Strict Stop-Loss (-30%)
+    PrysmTargetStopLoss,
 }
 
 impl std::fmt::Display for ExitReason {
@@ -48,6 +52,8 @@ impl std::fmt::Display for ExitReason {
             ExitReason::PoolQuoteTimeout => write!(f, "L5: Watchdog Pool Quote Timeout (30s unavailable)"),
             ExitReason::ManualPanic => write!(f, "L6: Operator Manual Panic Sell (/panic)"),
             ExitReason::EmergencySweep => write!(f, "L6: Operator Emergency Asset Sweep (/sweep)"),
+            ExitReason::PrysmTargetMcap => write!(f, "Prysm Target: Take-Profit Target Reached ($10k MCap)"),
+            ExitReason::PrysmTargetStopLoss => write!(f, "Prysm Target: Strict Stop-Loss (-30% Deficit)"),
         }
     }
 }
@@ -136,6 +142,12 @@ pub struct PositionTracker {
 
     // Lapis 4 Anomaly tracking
     pub approval_accounts: HashSet<Address>,
+
+    // Prysm Series Strategy tracking
+    pub is_prysm_strategy: bool,
+    pub prysm_exit_mode: Option<crate::types::PrysmExitMode>,
+    pub prysm_entry_mcap_usd: f64,
+    pub current_mcap_usd: f64,
 }
 
 impl PositionTracker {
@@ -158,6 +170,11 @@ impl PositionTracker {
             last_pool_quote_instant: now,
 
             approval_accounts: HashSet::new(),
+
+            is_prysm_strategy: false,
+            prysm_exit_mode: None,
+            prysm_entry_mcap_usd: 0.0,
+            current_mcap_usd: 0.0,
         }
     }
 }

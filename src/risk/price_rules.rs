@@ -28,6 +28,48 @@ impl PriceRules {
         let token_addr = Address::from_str(&tracker.position.token_address).ok()?;
         let pool_addr = Address::from_str(&tracker.position.pool_address).ok()?;
 
+        // Prysm Series Strategy Dedicated Target Exit Mode Evaluation
+        if tracker.is_prysm_strategy && tracker.prysm_exit_mode == Some(crate::types::PrysmExitMode::Target) {
+            // Update current market cap based on price change
+            if tracker.prysm_entry_mcap_usd > 0.0 {
+                tracker.current_mcap_usd = tracker.prysm_entry_mcap_usd * (1.0 + (pnl_pct / 100.0)).max(0.0);
+            }
+
+            // Target Exit Rule 1: Take-Profit at Market Cap >= $10,000 USD
+            if tracker.current_mcap_usd >= 10000.0 {
+                return Some(ExitSignal {
+                    position_id: tracker.position.id.clone(),
+                    token_address: token_addr,
+                    pool_address: pool_addr,
+                    reason: ExitReason::PrysmTargetMcap,
+                    reason_description: format!(
+                        "Prysm Target Take-Profit Reached: Market Cap ${:.2} >= $10,000.00 USD (PnL: +{:.2}%)",
+                        tracker.current_mcap_usd, pnl_pct
+                    ),
+                    is_emergency: false,
+                    slippage_percent: 5.0,
+                });
+            }
+
+            // Target Exit Rule 2: Strict Stop-Loss at -30% Deficit
+            if pnl_pct <= -30.0 {
+                return Some(ExitSignal {
+                    position_id: tracker.position.id.clone(),
+                    token_address: token_addr,
+                    pool_address: pool_addr,
+                    reason: ExitReason::PrysmTargetStopLoss,
+                    reason_description: format!(
+                        "Prysm Target Strict Stop-Loss Hit: {:.2}% <= -30.00% Deficit Threshold",
+                        pnl_pct
+                    ),
+                    is_emergency: false,
+                    slippage_percent: 5.0,
+                });
+            }
+
+            return None;
+        }
+
         // 1. Hard Stop-Loss Rule (-20% from entry)
         if pnl_pct <= -config.stop_loss_percent {
             return Some(ExitSignal {
