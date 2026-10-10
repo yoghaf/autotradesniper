@@ -126,6 +126,75 @@ impl BroadcasterPool {
             None => Err(format!("HTTP {}: response without result", status)),
         }
     }
+
+    /// Query JSON-RPC method across endpoints with automatic fallback
+    pub async fn call_rpc(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+        if self.send_rpcs.is_empty() {
+            return Err("no RPC endpoints configured".to_string());
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        }))
+        .map(bytes::Bytes::from)
+        .map_err(|e| e.to_string())?;
+
+        let mut last_err = String::new();
+        for rpc in self.send_rpcs.iter() {
+            match self.client.post(rpc.as_str())
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(res) => {
+                    let status = res.status();
+                    if let Ok(json) = res.json::<serde_json::Value>().await {
+                        if let Some(err) = json.get("error") {
+                            last_err = err.to_string();
+                            continue;
+                        }
+                        if let Some(result) = json.get("result") {
+                            return Ok(result.clone());
+                        }
+                    } else {
+                        last_err = format!("HTTP {}: non-JSON response", status);
+                    }
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+        Err(if last_err.is_empty() { "all RPC queries failed".to_string() } else { last_err })
+    }
+
+    /// Perform eth_call on a target contract
+    pub async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>, String> {
+        let params = serde_json::json!([
+            {
+                "to": format!("{:?}", to),
+                "data": alloy::hex::encode_prefixed(data)
+            },
+            "latest"
+        ]);
+        let res = self.call_rpc("eth_call", params).await?;
+        let hex_str = res.as_str().ok_or_else(|| "eth_call result not a string".to_string())?;
+        alloy::hex::decode(hex_str.trim_start_matches("0x")).map_err(|e| e.to_string())
+    }
+
+    /// Query eth_getTransactionReceipt for a given transaction hash
+    pub async fn get_transaction_receipt(&self, tx_hash: alloy::primitives::B256) -> Result<Option<serde_json::Value>, String> {
+        let params = serde_json::json!([format!("{:?}", tx_hash)]);
+        let res = self.call_rpc("eth_getTransactionReceipt", params).await?;
+        if res.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(res))
+        }
+    }
 }
 
 /// High-Frequency Calldata Buffer Formatting & Concurrent Dispatcher Engine
@@ -216,7 +285,11 @@ impl Dispatcher {
         let mut gas_limit_used = configured_gas_limit;
         for acc in accounts.iter().take(account_count).cloned() {
             let swap = if is_strategy {
-                signal.swap_calldata.clone()
+                if let Some(retargeted) = CalldataPayloadBuilder::retarget_pons_buy_recipient(&signal.swap_calldata, acc.address) {
+                    retargeted
+                } else {
+                    signal.swap_calldata.clone()
+                }
             } else {
                 CalldataPayloadBuilder::retarget_swap_recipient(&signal.swap_calldata, acc.address)
                     .context("copy-trade re-targeting failed")?

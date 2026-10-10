@@ -283,3 +283,73 @@ fn prysm_target_mode_is_not_cut_by_flow_rules() {
 fn telegram_html_escape() {
     assert_eq!(html_escape("L2: Quiet (< 0.1 ETH) & >= 90%"), "L2: Quiet (&lt; 0.1 ETH) &amp; &gt;= 90%");
 }
+
+// ── Pons Curve & ERC-20 Encoders ──────────────────────────────────────────
+
+#[test]
+fn pons_buy_payload_matches_curve_abi() {
+    let eth_in = U256::from(50_000_000_000_000_000u64); // 0.05 ETH
+    let min_tokens_out = U256::from(1_000_000);
+    let recipient = address!("1111111111111111111111111111111111111111");
+
+    let payload = CalldataPayloadBuilder::build_pons_buy_payload(eth_in, min_tokens_out, recipient);
+    assert_eq!(&payload[..4], &autotradesniper::payload::PONS_BUY_SELECTOR);
+    assert_eq!(&payload[..4], &[0x59, 0xa8, 0x7b, 0xc1]);
+    assert_eq!(payload.len(), 4 + 32 * 3);
+
+    // Retarget recipient
+    let other_recipient = address!("2222222222222222222222222222222222222222");
+    let retargeted = CalldataPayloadBuilder::retarget_pons_buy_recipient(&payload, other_recipient);
+    assert!(retargeted.is_some());
+    let retargeted = retargeted.unwrap();
+    assert_eq!(&retargeted[4 + 32 * 2 + 12..], other_recipient.as_slice());
+}
+
+#[test]
+fn pons_sell_payload_matches_curve_abi() {
+    let tokens_in = U256::from(500_000_000);
+    let min_eth_out = U256::from(10_000_000_000_000_000u64); // 0.01 ETH
+    let recipient = address!("3333333333333333333333333333333333333333");
+
+    let payload = CalldataPayloadBuilder::build_pons_sell_payload(tokens_in, min_eth_out, recipient);
+    assert_eq!(&payload[..4], &autotradesniper::payload::PONS_SELL_SELECTOR);
+    assert_eq!(&payload[..4], &[0xd0, 0x4c, 0x69, 0x83]);
+    assert_eq!(payload.len(), 4 + 32 * 3);
+}
+
+#[test]
+fn erc20_approve_and_balance_payloads() {
+    let spender = address!("4444444444444444444444444444444444444444");
+    let approve_payload = CalldataPayloadBuilder::build_erc20_approve_payload(spender, U256::MAX);
+    assert_eq!(&approve_payload[..4], &autotradesniper::payload::ERC20_APPROVE_SELECTOR);
+    assert_eq!(&approve_payload[..4], &[0x09, 0x5e, 0xa7, 0xb3]);
+    assert_eq!(approve_payload.len(), 4 + 32 * 2);
+
+    let balance_payload = CalldataPayloadBuilder::build_erc20_balance_of_payload(spender);
+    assert_eq!(&balance_payload[..4], &autotradesniper::payload::ERC20_BALANCE_OF_SELECTOR);
+    assert_eq!(&balance_payload[..4], &[0x70, 0xa0, 0x82, 0x31]);
+    assert_eq!(balance_payload.len(), 4 + 32);
+}
+
+#[test]
+fn topic_address_parsing_and_reserve_math() {
+    let topic_hex = "0x00000000000000000000000016d69c46f20965157584371788cdf557dfde2c53";
+    let addr = autotradesniper::models::prysm::parse_address_from_topic(topic_hex);
+    assert_eq!(addr, Some(address!("16d69c46f20965157584371788cdf557dfde2c53")));
+
+    // Curve reserves decode test
+    let mut raw = vec![0u8; 64];
+    // 1.7584 ETH = 1758400000000000000 wei
+    let eth_res = U256::from(1758400000000000000u64);
+    // 1,000,000,000 tokens
+    let tok_res = U256::from(1_000_000_000u64);
+    raw[..32].copy_from_slice(&eth_res.to_be_bytes::<32>());
+    raw[32..64].copy_from_slice(&tok_res.to_be_bytes::<32>());
+
+    let decoded = CalldataPayloadBuilder::decode_get_reserves_output(&raw);
+    assert_eq!(decoded, Some((eth_res, tok_res)));
+
+    // Net ETH calculation for selling 10,000,000 tokens
+    let eth_out = CalldataPayloadBuilder::calculate_pons_eth_out(eth_res, tok_res, U256::from(10_000_000), 100, 200);
+    assert!(eth_out > U256::ZERO);
+}

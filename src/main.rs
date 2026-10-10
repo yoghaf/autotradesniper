@@ -79,16 +79,26 @@ async fn main() -> Result<()> {
         fee_adjuster.clone(),
         report_tx,
     ));
-    let keep_warm = dispatcher.broadcaster().spawn_keep_warm(Duration::from_secs(20));
+    let broadcaster = dispatcher.broadcaster();
+    let keep_warm = broadcaster.spawn_keep_warm(Duration::from_secs(20));
 
-    let risk_manager = Arc::new(RiskManager::new(
-        config.clone(),
-        wallet_manager.clone(),
-        positions.clone(),
-        exit_alert_tx,
-    ));
+    let risk_manager = Arc::new(
+        RiskManager::new(
+            config.clone(),
+            wallet_manager.clone(),
+            positions.clone(),
+            exit_alert_tx,
+        )
+        .with_execution(broadcaster.clone(), fee_adjuster.clone()),
+    );
 
-    let prysm_engine = Arc::new(PrysmEngine::new(config.clone(), signal_tx.clone()));
+    let prysm_engine = Arc::new(
+        PrysmEngine::new(config.clone(), signal_tx.clone())
+            .with_broadcaster(broadcaster.clone()),
+    );
+    if let Ok(master_acc) = wallet_manager.derive_account(0).await {
+        prysm_engine.set_master_address(master_acc.address).await;
+    }
 
     let stream_listener = Arc::new(StreamListener::new(
         config.clone(),

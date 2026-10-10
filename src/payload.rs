@@ -18,6 +18,22 @@ pub const FAST_EXIT_CALLDATA_SIZE: usize = 4 + 32 * 5 + 32 + 32 * 2;
 /// swapExactTokensForETH(uint256,uint256,address[],address,uint256)
 pub const SWAP_EXACT_TOKENS_FOR_ETH_SELECTOR: [u8; 4] = [0x18, 0xcb, 0xaf, 0xe5];
 
+// Pons Bonding Curve & ERC-20 Function Selectors
+/// buy(uint256,uint256,address) on Pons bonding curve (payable)
+pub const PONS_BUY_SELECTOR: [u8; 4] = [0x59, 0xa8, 0x7b, 0xc1];
+/// sell(uint256,uint256,address) on Pons bonding curve
+pub const PONS_SELL_SELECTOR: [u8; 4] = [0xd0, 0x4c, 0x69, 0x83];
+/// approve(address,uint256) on ERC-20
+pub const ERC20_APPROVE_SELECTOR: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
+/// balanceOf(address) on ERC-20
+pub const ERC20_BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+/// allowance(address,address) on ERC-20
+pub const ERC20_ALLOWANCE_SELECTOR: [u8; 4] = [0xdd, 0x62, 0xed, 0x3e];
+/// getReserves() on Pons bonding curve
+pub const PONS_GET_RESERVES_SELECTOR: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
+/// PonsV2LaunchFactory Launched event topic hash
+pub const PONS_LAUNCH_TOPIC_HEX: &str = "0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607";
+
 /// Low-level optimized calldata payload assembler
 pub struct CalldataPayloadBuilder;
 
@@ -98,6 +114,128 @@ impl CalldataPayloadBuilder {
             payload.extend_from_slice(hop.as_slice());
         }
         payload
+    }
+
+    /// ABI-encode `buy(uint256 ethIn, uint256 minTokensOut, address recipient)` for Pons bonding curve (payable)
+    pub fn build_pons_buy_payload(eth_in: U256, min_tokens_out: U256, recipient: Address) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32 * 3);
+        payload.extend_from_slice(&PONS_BUY_SELECTOR);
+        payload.extend_from_slice(&eth_in.to_be_bytes::<32>());
+        payload.extend_from_slice(&min_tokens_out.to_be_bytes::<32>());
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(recipient.as_slice());
+        payload
+    }
+
+    /// Rewrite recipient of Pons curve buy calldata if selector matches PONS_BUY_SELECTOR
+    pub fn retarget_pons_buy_recipient(calldata: &[u8], recipient: Address) -> Option<Vec<u8>> {
+        if calldata.len() < 4 + 32 * 3 || calldata[..4] != PONS_BUY_SELECTOR {
+            return None;
+        }
+        let mut out = calldata.to_vec();
+        out[4 + 32 * 2..4 + 32 * 2 + 12].fill(0);
+        out[4 + 32 * 2 + 12..4 + 32 * 3].copy_from_slice(recipient.as_slice());
+        Some(out)
+    }
+
+    /// ABI-encode `sell(uint256 tokensIn, uint256 minEthOut, address recipient)` for Pons bonding curve
+    pub fn build_pons_sell_payload(tokens_in: U256, min_eth_out: U256, recipient: Address) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32 * 3);
+        payload.extend_from_slice(&PONS_SELL_SELECTOR);
+        payload.extend_from_slice(&tokens_in.to_be_bytes::<32>());
+        payload.extend_from_slice(&min_eth_out.to_be_bytes::<32>());
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(recipient.as_slice());
+        payload
+    }
+
+    /// ABI-encode `approve(address spender, uint256 amount)` for ERC-20
+    pub fn build_erc20_approve_payload(spender: Address, amount: U256) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32 * 2);
+        payload.extend_from_slice(&ERC20_APPROVE_SELECTOR);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(spender.as_slice());
+        payload.extend_from_slice(&amount.to_be_bytes::<32>());
+        payload
+    }
+
+    /// ABI-encode `balanceOf(address account)` for ERC-20
+    pub fn build_erc20_balance_of_payload(account: Address) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32);
+        payload.extend_from_slice(&ERC20_BALANCE_OF_SELECTOR);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(account.as_slice());
+        payload
+    }
+
+    /// ABI-encode `allowance(address owner, address spender)` for ERC-20
+    pub fn build_erc20_allowance_payload(owner: Address, spender: Address) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(4 + 32 * 2);
+        payload.extend_from_slice(&ERC20_ALLOWANCE_SELECTOR);
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(owner.as_slice());
+        payload.extend_from_slice(&[0u8; 12]);
+        payload.extend_from_slice(spender.as_slice());
+        payload
+    }
+
+    /// ABI-encode `getReserves()` for Pons bonding curve
+    pub fn build_pons_get_reserves_payload() -> Vec<u8> {
+        PONS_GET_RESERVES_SELECTOR.to_vec()
+    }
+
+    /// Decode single U256 output from `balanceOf`, `allowance`, etc.
+    pub fn decode_u256_output(data: &[u8]) -> Option<U256> {
+        if data.len() < 32 {
+            return None;
+        }
+        Some(U256::from_be_slice(&data[..32]))
+    }
+
+    /// Decode `(uint256 ethReserve, uint256 tokenReserve)` from Pons `getReserves()`
+    pub fn decode_get_reserves_output(data: &[u8]) -> Option<(U256, U256)> {
+        if data.len() < 64 {
+            return None;
+        }
+        let eth_reserve = U256::from_be_slice(&data[..32]);
+        let token_reserve = U256::from_be_slice(&data[32..64]);
+        Some((eth_reserve, token_reserve))
+    }
+
+    /// Pons curve output for buying tokens with `eth_in`
+    pub fn calculate_pons_tokens_out(
+        eth_reserve: U256,
+        token_reserve: U256,
+        eth_in: U256,
+        fee_bps: u32,
+        ctax_bps: u32,
+    ) -> U256 {
+        let total_tax_bps = U256::from((fee_bps + ctax_bps) as u128);
+        let tax = eth_in * total_tax_bps / U256::from(10_000);
+        let e = eth_in.saturating_sub(tax);
+        let denom = eth_reserve + e;
+        if denom.is_zero() {
+            return U256::ZERO;
+        }
+        token_reserve * e / denom
+    }
+
+    /// Pons curve net ETH out for selling `tokens_in`
+    pub fn calculate_pons_eth_out(
+        eth_reserve: U256,
+        token_reserve: U256,
+        tokens_in: U256,
+        fee_bps: u32,
+        ctax_bps: u32,
+    ) -> U256 {
+        let denom = token_reserve + tokens_in;
+        if denom.is_zero() {
+            return U256::ZERO;
+        }
+        let gross_eth = eth_reserve * tokens_in / denom;
+        let total_tax_bps = U256::from((fee_bps + ctax_bps) as u128);
+        let tax = gross_eth * total_tax_bps / U256::from(10_000);
+        gross_eth.saturating_sub(tax)
     }
 }
 

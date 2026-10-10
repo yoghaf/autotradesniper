@@ -94,6 +94,7 @@ pub struct PendingPrysmOrder {
     pub report: PrysmMatchReport,
     pub token_address: Address,
     pub pool_address: Address,
+    pub launch_tx_hash: B256,
     pub scheduled_block: u64,
     pub created_at: Instant,
     pub size_eth: f64,
@@ -158,6 +159,16 @@ impl PrysmStats {
     }
 }
 
+/// Helper function to parse 20-byte Address from a 32-byte log topic hex string
+pub fn parse_address_from_topic(topic_str: &str) -> Option<Address> {
+    let clean = topic_str.trim_start_matches("0x");
+    if clean.len() < 40 {
+        return None;
+    }
+    let addr_part = &clean[clean.len() - 40..];
+    std::str::FromStr::from_str(addr_part).ok()
+}
+
 /// Autonomous Heuristic Pattern Engine: Prysm Series Strategy
 pub struct PrysmEngine {
     config: AppConfig,
@@ -168,6 +179,8 @@ pub struct PrysmEngine {
     /// Entries already queued/dispatched (sync mutex: never held across an await).
     entered_tokens: Mutex<HashMap<EntryKey, Instant>>,
     warned_no_launchpads: AtomicBool,
+    broadcaster: Option<Arc<crate::dispatcher::BroadcasterPool>>,
+    master_address: Arc<RwLock<Option<Address>>>,
 }
 
 impl PrysmEngine {
@@ -180,7 +193,18 @@ impl PrysmEngine {
             signal_tx,
             entered_tokens: Mutex::new(HashMap::new()),
             warned_no_launchpads: AtomicBool::new(false),
+            broadcaster: None,
+            master_address: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn with_broadcaster(mut self, broadcaster: Arc<crate::dispatcher::BroadcasterPool>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
+    }
+
+    pub async fn set_master_address(&self, addr: Address) {
+        *self.master_address.write().await = Some(addr);
     }
 
     /// Claim the single entry slot for `key`; false if it was claimed within the window.
@@ -582,6 +606,7 @@ impl PrysmEngine {
                 report: report.clone(),
                 token_address: meta.token_address,
                 pool_address: meta.pool_address,
+                launch_tx_hash: tx_hash,
                 scheduled_block: required_block,
                 created_at: now,
                 size_eth: *self.config.prysm_size_eth.read().await,
@@ -656,19 +681,88 @@ impl PrysmEngine {
                 continue;
             }
 
+            // If token address is not resolved yet (e.g. token == pool == launchpad/factory),
+            // resolve token and curve addresses from the on-chain launch receipt!
+            if order.token_address == order.pool_address && order.launch_tx_hash != B256::ZERO {
+                if let Some(ref broadcaster) = self.broadcaster {
+                    match broadcaster.get_transaction_receipt(order.launch_tx_hash).await {
+                        Ok(Some(receipt)) => {
+                            if let Some(logs) = receipt.get("logs").and_then(|l| l.as_array()) {
+                                let mut resolved = false;
+                                for log in logs {
+                                    if let Some(topics) = log.get("topics").and_then(|t| t.as_array()) {
+                                        if topics.len() >= 3 {
+                                            let t0 = topics[0].as_str().unwrap_or_default();
+                                            if t0.eq_ignore_ascii_case(crate::payload::PONS_LAUNCH_TOPIC_HEX) {
+                                                if let (Some(t1), Some(t2)) = (topics[1].as_str(), topics[2].as_str()) {
+                                                    if let (Some(token_addr), Some(curve_addr)) = (
+                                                        parse_address_from_topic(t1),
+                                                        parse_address_from_topic(t2),
+                                                    ) {
+                                                        info!(
+                                                            "🎉 [Prysm Receipt Resolved] Token: {:?}, Curve: {:?}",
+                                                            token_addr, curve_addr
+                                                        );
+                                                        order.token_address = token_addr;
+                                                        order.pool_address = curve_addr;
+                                                        resolved = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !resolved {
+                                    warn!("Receipt for {:?} found but T_LAUNCH log not found yet, retrying next block...", order.launch_tx_hash);
+                                    if age <= max_age {
+                                        self.pending_orders.write().await.push(order);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Node has not indexed receipt yet, wait for next block
+                            if age <= max_age {
+                                info!("Receipt for {:?} not indexed yet, retrying next block...", order.launch_tx_hash);
+                                self.pending_orders.write().await.push(order);
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Receipt query error for {:?}: {}", order.launch_tx_hash, e);
+                        }
+                    }
+                }
+            }
+
+            // If token and pool are resolved to the curve, construct real buy calldata!
+            let (target_token, target_pool, swap_data) = if order.token_address != order.pool_address {
+                let size_wei = U256::from((order.size_eth * 1e18) as u128);
+                let recipient = self.master_address.read().await.unwrap_or(Address::ZERO);
+                let buy_payload = crate::payload::CalldataPayloadBuilder::build_pons_buy_payload(
+                    size_wei,
+                    U256::from(1),
+                    recipient,
+                );
+                (order.token_address, order.pool_address, buy_payload)
+            } else {
+                (order.token_address, order.pool_address, order.swap_calldata)
+            };
+
             info!(
-                "🚀 [Prysm Min Block Guard Fired at Block #{}] Executing queued order for Token {:?}",
-                current_block, order.token_address
+                "🚀 [Prysm Min Block Guard Fired at Block #{}] Executing queued order for Token {:?} on Curve {:?}",
+                current_block, target_token, target_pool
             );
 
-            let dummy_hash = B256::repeat_byte(0x77);
             let signal = TradeSignal {
-                tx_hash: dummy_hash,
+                tx_hash: order.launch_tx_hash,
                 monitored_account: COMPANION_ACCOUNTS[0],
-                target_token: order.token_address,
-                pool_or_router: order.pool_address,
+                target_token,
+                pool_or_router: target_pool,
                 entry_amount_wei: U256::from((order.size_eth * 1e18) as u128),
-                swap_calldata: order.swap_calldata,
+                swap_calldata: swap_data,
                 detected_at: Instant::now(),
                 block_number: current_block,
                 strategy_tag: Some(format!("{}: {}", PRYSM_STRATEGY_TAG_PREFIX, order.report.pattern)),
