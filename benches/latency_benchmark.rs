@@ -1,29 +1,132 @@
+use autotradesniper::addr_set::AddressSet;
+use autotradesniper::config::Watchlist;
 use autotradesniper::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
-use autotradesniper::stream::{fast_selectors, ZeroCopyTxParser};
+use autotradesniper::stream::feed::ClaimRing;
+use autotradesniper::stream::{fast_selectors, L2Txs, RawTxView, l2_message_is_valid};
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use alloy::primitives::Address;
+use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy::eips::eip2718::{Decodable2718, Encodable2718};
+use alloy::primitives::{Address, Bytes, TxKind, U256};
+use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::SignerSync;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-fn bench_zero_copy_parsing(c: &mut Criterion) {
-    let raw_sample_json = br#"{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{"hash":"0x88df0147ff268f886da7171e1b669d145d910f138800b0b868b6a030f8d9cdf6","from":"0x742d35cc6634c0532925a3b844bc454e4438f44e","to":"0x1b44f3514812d835eb1bdb0acb32253ddb043d42","input":"0x7ff36ab50000000000000000000000000000000000000000000000000de0b6b3a7640000","value":"0x112210f47de98115"}}}"#;
+/// A signed EIP-1559 tx, as it appears (RLP, no sender) inside an L2 feed message.
+fn raw_tx(to: Address, input: Vec<u8>) -> Vec<u8> {
+    let signer = PrivateKeySigner::random();
+    let tx = TxEip1559 {
+        chain_id: 4663,
+        nonce: 7,
+        gas_limit: 300_000,
+        max_fee_per_gas: 100_000_000,
+        max_priority_fee_per_gas: 1_000_000,
+        to: TxKind::Call(to),
+        value: U256::from(10u64).pow(U256::from(16u64)),
+        input: Bytes::from(input),
+        access_list: Default::default(),
+    };
+    let sig = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+    TxEnvelope::Eip1559(tx.into_signed(sig)).encoded_2718()
+}
 
-    c.bench_function("zero_copy_from_address_extraction", |b| {
+fn bench_zero_copy_parsing(c: &mut Criterion) {
+    // Pons-style buy (selector + a few words) and an unrelated ERC-20 transfer.
+    let mut buy = vec![0x59, 0xa8, 0x7b, 0xc1];
+    buy.extend_from_slice(&[0x11; 96]);
+    let mut transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
+    transfer.extend_from_slice(&[0x22; 64]);
+    let relevant = raw_tx(Address::repeat_byte(0x42), buy);
+    let irrelevant = raw_tx(Address::repeat_byte(0x43), transfer);
+
+    // What every tx of every block used to pay: a full decode (copies calldata, builds Vecs).
+    c.bench_function("tx_full_decode_2718_exact_irrelevant", |b| {
+        b.iter(|| black_box(TxEnvelope::decode_2718_exact(black_box(irrelevant.as_slice()))).is_ok());
+    });
+    // What it costs now: RLP headers walked in place, calldata borrowed, nothing allocated.
+    c.bench_function("tx_zero_copy_peek_irrelevant", |b| {
         b.iter(|| {
-            let slice = ZeroCopyTxParser::find_field_hex_slice(black_box(raw_sample_json), b"\"from\"");
-            if let Some(s) = slice {
-                let addr = ZeroCopyTxParser::parse_address_from_hex(s);
-                black_box(addr);
-            }
+            let v = RawTxView::parse(black_box(irrelevant.as_slice())).unwrap();
+            black_box(fast_selectors::is_copyable_eth_swap(v.input))
+        });
+    });
+    c.bench_function("tx_zero_copy_peek_relevant", |b| {
+        b.iter(|| {
+            let v = RawTxView::parse(black_box(relevant.as_slice())).unwrap();
+            black_box((v.to.is_some(), fast_selectors::is_copyable_eth_swap(v.input)))
         });
     });
 
-    c.bench_function("zero_copy_to_address_extraction", |b| {
+    // Sender recovery is not in the payload: this is the cost every *candidate* tx still pays.
+    // To compare backends, add the "secp256k1" feature to the alloy dependency (libsecp256k1).
+    {
+        use alloy::consensus::transaction::SignerRecoverable;
+        let envelope = TxEnvelope::decode_2718_exact(relevant.as_slice()).unwrap();
+        c.bench_function("tx_ecrecover_sender", |b| {
+            b.iter(|| black_box(black_box(&envelope).recover_signer().unwrap()));
+        });
+    }
+
+    // A block message: batch of 50 txs, 2 of them relevant.
+    let mut batch = vec![3u8];
+    for i in 0..50 {
+        let tx = if i % 25 == 0 { &relevant } else { &irrelevant };
+        batch.extend_from_slice(&((tx.len() + 1) as u64).to_be_bytes());
+        batch.push(4);
+        batch.extend_from_slice(tx);
+    }
+    c.bench_function("l2_batch_50tx_validate_and_prefilter", |b| {
         b.iter(|| {
-            let slice = ZeroCopyTxParser::find_field_hex_slice(black_box(raw_sample_json), b"\"to\"");
-            if let Some(s) = slice {
-                let addr = ZeroCopyTxParser::parse_address_from_hex(s);
-                black_box(addr);
+            let msg = black_box(batch.as_slice());
+            assert!(l2_message_is_valid(msg));
+            let mut candidates = 0u32;
+            for raw in L2Txs::new(msg) {
+                if let Some(v) = RawTxView::parse(raw) {
+                    candidates += fast_selectors::is_copyable_eth_swap(v.input) as u32;
+                }
             }
+            black_box(candidates)
+        });
+    });
+}
+
+fn bench_address_matching(c: &mut Criterion) {
+    let watched: Vec<Address> = (1u8..=8).map(Address::repeat_byte).collect();
+    let hash_set: HashSet<Address> = watched.iter().copied().collect();
+    let set = AddressSet::new(watched.iter());
+    let watchlist = Watchlist::new(hash_set.clone());
+    let hit = Address::repeat_byte(5);
+    let miss = Address::repeat_byte(0xee);
+
+    c.bench_function("watch_hashset_contains_miss", |b| b.iter(|| hash_set.contains(black_box(&miss))));
+    c.bench_function("watch_address_set_contains_miss", |b| b.iter(|| set.contains(black_box(&miss))));
+    c.bench_function("watch_address_set_contains_hit", |b| b.iter(|| set.contains(black_box(&hit))));
+    c.bench_function("watch_watchlist_snapshot_miss", |b| b.iter(|| watchlist.contains(black_box(&miss))));
+
+    // The previous hot-path lookup: async tokio::RwLock read + SipHash probe of a HashSet.
+    let old_path = tokio::sync::RwLock::new(hash_set.clone());
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    c.bench_function("watch_OLD_tokio_rwlock_hashset_miss", |b| {
+        // One block_on around the whole timed loop, so only `read().await` + probe is measured.
+        b.iter_custom(|iters| {
+            rt.block_on(async {
+                let t = std::time::Instant::now();
+                for _ in 0..iters {
+                    black_box(old_path.read().await.contains(black_box(&miss)));
+                }
+                t.elapsed()
+            })
+        })
+    });
+
+    let ring = ClaimRing::default();
+    let mut block = 0u64;
+    c.bench_function("feed_claim_ring_win_then_duplicate", |b| {
+        b.iter(|| {
+            block += 1;
+            let won = ring.try_claim(black_box(block));
+            let dup = ring.try_claim(black_box(block));
+            black_box((won, dup))
         });
     });
 }
@@ -224,6 +327,7 @@ fn bench_prysm_pattern_matching(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_zero_copy_parsing,
+    bench_address_matching,
     bench_fast_method_signatures,
     bench_calldata_buffer_assembly,
     bench_fast_exit_payload,

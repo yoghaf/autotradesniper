@@ -1,3 +1,4 @@
+use crate::addr_set::AddressSet;
 use crate::types::ExecutionMode;
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -45,12 +46,81 @@ pub struct RuntimeState {
     pub prysm_min_block_delay: u64,
 }
 
+/// The watched-wallet set.
+///
+/// `read`/`write` keep the async `HashSet` API used by Telegram and persistence. Every write
+/// republishes an [`AddressSet`] snapshot, which the sequencer-feed hot path queries through
+/// [`Watchlist::contains`]: a synchronous bitwise lookup that never awaits and never hashes.
+pub struct Watchlist {
+    set: RwLock<HashSet<Address>>,
+    index: std::sync::RwLock<AddressSet>,
+}
+
+impl Watchlist {
+    pub fn new(set: HashSet<Address>) -> Self {
+        let index = AddressSet::new(set.iter());
+        Self { set: RwLock::new(set), index: std::sync::RwLock::new(index) }
+    }
+
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, HashSet<Address>> {
+        self.set.read().await
+    }
+
+    pub async fn write(&self) -> WatchlistWriteGuard<'_> {
+        WatchlistWriteGuard { guard: self.set.write().await, index: &self.index }
+    }
+
+    pub fn try_write(&self) -> Result<WatchlistWriteGuard<'_>, tokio::sync::TryLockError> {
+        Ok(WatchlistWriteGuard { guard: self.set.try_write()?, index: &self.index })
+    }
+
+    /// Hot-path membership test (see type docs).
+    #[inline]
+    pub fn contains(&self, address: &Address) -> bool {
+        self.index.read().unwrap_or_else(|e| e.into_inner()).contains(address)
+    }
+}
+
+/// Write access to the watchlist; the lookup index is rebuilt while the lock is still held,
+/// so readers of [`Watchlist::contains`] never see a state older than the last released write.
+pub struct WatchlistWriteGuard<'a> {
+    guard: tokio::sync::RwLockWriteGuard<'a, HashSet<Address>>,
+    index: &'a std::sync::RwLock<AddressSet>,
+}
+
+impl std::ops::Deref for WatchlistWriteGuard<'_> {
+    type Target = HashSet<Address>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for WatchlistWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for WatchlistWriteGuard<'_> {
+    fn drop(&mut self) {
+        let rebuilt = AddressSet::new(self.guard.iter());
+        *self.index.write().unwrap_or_else(|e| e.into_inner()) = rebuilt;
+    }
+}
+
 /// Global shared application configuration
 #[derive(Clone)]
 pub struct AppConfig {
     pub rpc_http_url: String,
     pub rpc_ws_url: String,
+    /// Primary sequencer feed (`FEED_URL`); always the first entry of `feed_urls`.
     pub feed_url: String,
+    /// Every feed the stream listener races (`FEED_URL` + `FEED_URLS`). A URL listed twice
+    /// opens two connections, which can land on different edge servers.
+    pub feed_urls: Vec<String>,
+    /// Reconnect when no feed *message* (pings do not count) arrived for this long; 0 = off.
+    /// Leave off on chains that can be legitimately idle.
+    pub feed_data_timeout_secs: u64,
     pub send_rpcs: Vec<String>,
     pub chain_id: u64,
     /// L2 block number of feed message #0 (`FEED_GENESIS_BLOCK`, 0 for fresh Orbit chains).
@@ -60,7 +130,7 @@ pub struct AppConfig {
     pub telegram_authorized_chat_id: i64,
 
     pub mnemonic_phrase: Arc<RwLock<String>>,
-    pub watchlist_accounts: Arc<RwLock<HashSet<Address>>>,
+    pub watchlist_accounts: Arc<Watchlist>,
     pub buffer_size: Arc<RwLock<usize>>,
     pub gas_limit: Arc<RwLock<u64>>,
     pub max_priority_fee_gwei: Arc<RwLock<f64>>,
@@ -101,6 +171,19 @@ impl AppConfig {
         let feed_url = std::env::var("FEED_URL")
             .or_else(|_| std::env::var("RPC_WS_URL"))
             .unwrap_or_else(|_| "wss://feed.mainnet.chain.robinhood.com".to_string());
+        let mut feed_urls = vec![feed_url.clone()];
+        feed_urls.extend(
+            std::env::var("FEED_URLS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        );
+        let feed_data_timeout_secs = std::env::var("FEED_DATA_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         let rpc_http_url = std::env::var("RPC_HTTP_URL")
             .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_string());
         let rpc_ws_url = std::env::var("RPC_WS_URL")
@@ -225,13 +308,15 @@ impl AppConfig {
             rpc_http_url,
             rpc_ws_url,
             feed_url,
+            feed_urls,
+            feed_data_timeout_secs,
             send_rpcs,
             chain_id,
             feed_genesis_block,
             telegram_bot_token,
             telegram_authorized_chat_id,
             mnemonic_phrase: Arc::new(RwLock::new(env_mnemonic)),
-            watchlist_accounts: Arc::new(RwLock::new(watchlist_set)),
+            watchlist_accounts: Arc::new(Watchlist::new(watchlist_set)),
             buffer_size: Arc::new(RwLock::new(buffer_size)),
             gas_limit: Arc::new(RwLock::new(gas_limit)),
             max_priority_fee_gwei: Arc::new(RwLock::new(max_priority_fee_gwei)),
@@ -420,7 +505,13 @@ impl AppConfig {
     }
 
     pub async fn is_in_watchlist(&self, address: &Address) -> bool {
-        self.watchlist_accounts.read().await.contains(address)
+        self.is_watched(address)
+    }
+
+    /// Synchronous, lock-free-for-readers form of [`Self::is_in_watchlist`] for the hot path.
+    #[inline]
+    pub fn is_watched(&self, address: &Address) -> bool {
+        self.watchlist_accounts.contains(address)
     }
 
     pub fn is_engine_running(&self) -> bool {

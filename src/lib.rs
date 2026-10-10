@@ -1,3 +1,4 @@
+pub mod addr_set;
 pub mod config;
 pub mod dispatcher;
 pub mod models;

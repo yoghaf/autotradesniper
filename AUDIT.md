@@ -496,3 +496,74 @@ impl CurveMirror {
 ```
 
 Lainnya: *nonce lane* per akun (mutex async per akun untuk alokasi + broadcast, menghapus kasus resync vs in-flight); health-check sequencer (lag feed = `now - header.timestamp`, histogram RTT `eth_sendRawTransaction` per endpoint, urutkan ulang endpoint otomatis); prediksi alamat token CREATE2 dari calldata launch (butuh source factory) agar Blok +1 tidak bergantung pada indexer; Timeboost express lane bila chain mengaktifkannya.
+
+---
+
+## 9. Audit Putaran 3: `stream.rs` (jalur data feed, zero-copy, multi-feed)
+
+**Cakupan:** `src/stream.rs` dan kaitannya dengan pemicu di `src/models/prysm.rs` / `src/config.rs`.
+**Metode:** baca baris per baris, benchmark `--release` (Criterion, container ini, 4 vCPU), allocator penghitung di test, *mutation check* (tiap perilaku kunci dirusak sengaja dan test yang relevan harus gagal), 6× ulang suite balapan untuk mencari flake.
+**Status:** 100 test lulus (`cargo test`, debug dan `--release`; sebelumnya 62), semua target ter-compile, tidak ada warning clippy baru.
+
+### 9.1 Temuan
+
+| ID | Temuan | Lokasi (baseline) | Bukti | Status |
+|---|---|---|---|---|
+| **S1** | `from` **tidak ada** di payload feed (hanya tanda tangan), jadi "baca `from` zero-copy" tidak mungkin; harus `ecrecover`. Itu biaya dominan di jalur panas. | `stream.rs` `process_l2_message` | `tx_ecrecover_sender`: **229 µs** (k256) vs 47 µs (libsecp256k1) | ⚠️ Dikurangi (S2), backend C tetap opt-in (§9.4) |
+| **S2** | `TxEnvelope::decode_2718_exact` dijalankan untuk **setiap** tx sebelum diketahui relevan: menyalin calldata ke `Bytes` baru dan membangun `Vec` access/authorization list. | `stream.rs:584` | 232,6 ns + ≥1 alokasi per tx (test: ≥50 alokasi untuk 50 tx) | ✅ Prefilter `RawTxView`: **36,7 ns**, 0 alokasi, `to`/`value`/calldata dipinjam dari byte kawat |
+| **S3** | `ZeroCopyTxParser` memindai JSON `"from":"0x…"` yang **tidak pernah ada** di jalur produksi (feed = base64 → pesan L2 → RLP). Benchmark "312 ns" di README mengukur kode mati; `extract_target_token_fast` juga mati dan salah untuk selain V2 (L10). | `stream.rs:99-173`, `benches/`, `README.md:171` | grep: hanya dipakai bench | ✅ Dihapus; bench dan README diganti pengukuran jalur nyata |
+| **S4** | Lookup watchlist = `tokio::RwLock` async + SipHash `HashSet` per tx kandidat. Perbandingan alamat sendiri sudah bitwise; yang mahal adalah hash + kunci. | `config.rs` `is_in_watchlist` | 60 ns (kunci+hash); `HashSet` saja 21,7 ns | ✅ `AddressSet` (probe `[u8; 20]`, **5,2 ns** miss / 2,6 ns hit) di balik snapshot sinkron: **24 ns** total, tanpa `await` |
+| **S5** | `Vec<&[u8]>` dialokasikan per pesan L2. | `stream.rs:578` | alokasi 256 B per pesan | ✅ Iterator `L2Txs` (tumpukan tetap 16 level); setara dengan versi rekursif lama, diuji diferensial pada 30.000 input acak dan berantai-dalam |
+| **S6** | `connect_async` tanpa `TCP_NODELAY` dan **tanpa timeout connect**: SYN yang di-blackhole menggantung selama default OS (menit); record DNS mati (AAAA) menahan connect. | `stream.rs:467` | analisis; test `…abandoned_at_the_deadline` | ✅ Connect sendiri: `TCP_NODELAY` sebelum byte pertama, balapan hingga 4 alamat, deadline 10 dtk |
+| **S7** | Backoff ±20% bisa mengirim ulang **lebih cepat dari `Retry-After`** (0,8×) dan ditolak lagi. | `stream.rs:443` | test `retry_after_is_honoured_and_never_undercut` | ✅ Hint + 0-20%, tidak pernah di bawahnya; backoff "equal jitter" `[ceil/2, ceil]` |
+| **S8** | Reconnect tanpa petunjuk resume: broadcaster mengirim **seluruh cache backlog** (hingga puluhan ribu pesan) yang lalu di-parse dan dibuang. | `stream.rs:467` | dari perilaku protokol Nitro yang saya ketahui (cache backlog dikirim bila tak ada hint); **belum saya verifikasi terhadap feed Robinhood Anda** | ✅ Header `Arbitrum-Requested-Sequence-Number` = sequence berikutnya (diuji: header terkirim dan dipakai server uji) |
+| **S9** | Deteksi macet hanya "tidak ada frame 20 dtk". Feed yang masih menjawab ping tetapi upstream-nya beku tidak pernah terdeteksi. Idle diperiksa dengan timer baru **per frame**. | `stream.rs:491` | test `…keeps_answering_pings_but_delivers_nothing_is_recycled` | ✅ Heartbeat 5 dtk (ping aktif, RTT diukur), idle 20 dtk, deteksi *laggard* antar-feed, opsional `FEED_DATA_TIMEOUT_SECS`; nol timer per frame |
+| **S10** | Satu `l2Msg: null` (Go memarshal `[]byte` kosong sebagai `null`) membuat serde menolak **seluruh frame**; semua pesan lain di frame itu hilang diam-diam, hanya `trace!`. *Latent: belum saya buktikan Nitro mengirim `null` di produksi.* | `stream.rs:239,521` | test `null_l2_msg_does_not_poison_the_frame` | ✅ `null` dibaca sebagai "tanpa payload"; frame yang tak terbaca dihitung dan di-warn |
+| **S11** | Satu feed saja. Putusnya feed = jendela buta sampai reconnect; failover hanya lewat poller HTTP. | `stream.rs:414` | – | ✅ Multi-feed racing (§9.2) |
+| **S12** | `claim_block` berbasis *high-water mark* (`fetch_max`) akan **menghilangkan pesan** bila dipakai paralel: feed B yang mengirim blok 103 membuat blok 101-102 dari feed A dianggap duplikat; dan dua task bisa saling mendahului di antara dua operasi atomik. | `stream.rs:323` | test `a_gap_left_by_one_feed_is_filled_by_the_other` (mutasi ke high-water: gagal) | ✅ `ClaimRing`: klaim eksak per blok, lock-free |
+
+### 9.2 Arsitektur Multi-Feed Racing
+
+```
+FEED_URL + FEED_URLS ──►  task per feed (socket, backoff, heartbeat sendiri)
+                            │ parse frame → ClaimRing.try_claim(block)   ← 1 operasi atomik
+                            │      ├─ menang  → base64 → L2Txs → RawTxView → (kandidat) decode + ecrecover → sinyal
+                            │      └─ kalah   → dup++ , catat ketertinggalan (µs) terhadap pemenang
+                            ▼
+                      live_feeds (watch) ──► jembatan HTTP aktif HANYA bila semua feed mati > 1 dtk
+```
+
+* **First-packet wins:** blok diproses oleh feed yang pertama men-*claim*-nya; `received_at` (dasar semua metrik latensi) adalah waktu tiba paket pemenang. Latensi efektif = minimum dari semua feed.
+* **Cincin klaim** (4096 slot `AtomicU64`, kunci = nomor blok) eksak, bukan high-water: celah di satu feed diisi feed lain (`gap_stats()` melaporkan `(dilompati, dipulihkan)`). Poller HTTP memakai cincin yang sama, jadi blok yang dilihat dua sumber tidak di-trade dua kali.
+* **Ketahanan:** setiap task di-*supervise* (restart 1 dtk bila keluar/panic); `LiveGuard` menjaga hitungan feed hidup tetap benar walau sesi berakhir lewat panic.
+* **Observabilitas:** `feed_stats()` dan log tiap menit per feed: menang, duplikat, ketertinggalan rata-rata terhadap pemenang, RTT ping, jumlah sesi, frame rusak. URL dalam log **disamarkan** (`scheme://host`), karena URL feed sering memuat API key.
+
+### 9.3 Angka (Criterion, `--release`, container ini)
+
+| Operasi | Sebelum | Sesudah |
+|---|---|---|
+| Prefilter satu tx (irrelevan) | 232,6 ns + alokasi (decode penuh) | **36,7 ns**, 0 alokasi |
+| Cocokkan alamat vs watchlist | 60 ns (`tokio::RwLock` + `HashSet`) | **24 ns** (snapshot); inti `AddressSet` 5,2 ns |
+| Validasi + prefilter blok 50 tx (2 kandidat) | ≈ 11,6 µs + 50 alokasi (dihitung: 50 × 232,6 ns, bukan diukur utuh) | **2,2 µs** (diukur), 0 alokasi |
+| Klaim blok (menang + duplikat) | – | 23 ns |
+| `ecrecover` per tx kandidat | 229 µs | tidak berubah (47 µs bila libsecp256k1, §9.4) |
+
+Test `scanning_a_block_for_candidate_txs_allocates_nothing` mengunci "nol alokasi" dengan allocator penghitung (jalur validasi + iterasi + prefilter), dan membandingkannya dengan decoder penuh (≥ 50 alokasi untuk 50 tx) agar pengukuran tidak kosong.
+
+### 9.4 Yang sengaja tidak dilakukan, dan batasannya
+
+1. **libsecp256k1 tidak diaktifkan.** Terukur 229 → 47 µs (4,8×) dan lulus seluruh suite saat saya coba, tetapi menambah build C (Anda menunda ini di putaran 1-2 karena MinGW) dan mengubah `Cargo.lock` sebanyak ±180 baris dependensi inert (`yubihsm`, dst.). Aktifkan dengan menambah `"secp256k1"` ke `features` dependensi `alloy`. Ini perbaikan latensi terbesar yang tersisa, jauh di atas semua yang ada di putaran ini.
+2. `swap_calldata: input.to_vec()` (satu salinan ±100-300 B) tetap ada di `TradeSignal`: terjadi sekali per sinyal yang cocok, bukan per tx, jadi bukan jalur panas.
+3. Frame yang kalah balapan tetap di-parse JSON-nya (±2 µs di task feed yang kalah, paralel dengan pemenang), tidak menambah latensi pemenang. Pra-parse `sequenceNumber` hanya menghemat CPU, dan frame hidup ±4/dtk.
+4. Pemenang yang di-*cancel/panic* setelah klaim tetapi sebelum selesai memproses akan menghilangkan blok itu (inheren pada "klaim dulu"; alternatifnya memproses ganda). Task di-supervise sehingga hanya blok itu yang terdampak.
+5. Rekomendasi operasional: tambahkan feed cadangan di **region/penyedia berbeda** lewat `FEED_URLS`. Dua koneksi ke host yang sama hanya berguna jika DNS round-robin menempatkannya di edge berbeda; ukur dengan log statistik (feed yang `wins=0` dan `behind-winner` besar tidak ada gunanya).
+6. `Arbitrum-Requested-Sequence-Number` dihormati oleh Nitro; relay/penyedia lain bisa mengabaikannya (aman: dedup tetap menangani backlog, hanya lebih boros).
+
+### 9.5 Konfigurasi baru
+
+| Variabel | Keterangan |
+|---|---|
+| `FEED_URLS` | Feed tambahan yang dibalap bersama `FEED_URL` (dipisah koma). URL yang ditulis dua kali membuka dua koneksi. |
+| `FEED_DATA_TIMEOUT_SECS` | Reconnect feed yang tidak mengirim **pesan** (ping tidak dihitung) selama N detik. 0 = mati (default); jangan dinyalakan di chain yang bisa legit sepi. |
+
+`AppConfig.watchlist_accounts` kini bertipe `Arc<Watchlist>` (API `read()/write()/try_write()` tetap sama; tulis menerbitkan ulang indeks saat guard dilepas). `StreamListener::run` kini menerima `self: Arc<Self>`; `main.rs` tidak perlu diubah.

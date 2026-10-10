@@ -168,7 +168,10 @@ Pengujian micro-benchmark nyata dilakukan menggunakan harness **Criterion**:
 | **Pola A Evaluation** | `src/models/prysm.rs` | Zero-Allocation Substring Match | **10.08 ns** (0.010 µs) |
 | **Pola B Evaluation** | `src/models/prysm.rs` | Pre-compiled Static Regex Matching | **39.27 ns** (0.039 µs) |
 | **Pola C Evaluation** | `src/models/prysm.rs` | Fast Address Lookups & Temporal Delta | **8.05 ns** (0.008 µs) |
-| **Ingesti JSON Feed** | `src/stream.rs` | Zero-Copy Byte Slice Scan (`ZeroCopyTxParser`) | **312.47 ns** (0.312 µs) |
+| **Prefilter Tx Feed** | `src/stream/raw_tx.rs` | RLP dibaca di tempat, `to`/`value`/calldata dipinjam (`RawTxView`), 0 alokasi | **36.7 ns** (vs 232.6 ns decode penuh) |
+| **Pencocokan Alamat** | `src/addr_set.rs` | Probe `[u8; 20]` bitwise, tanpa hash/lock (`AddressSet`) | **5.2 ns** miss / **2.6 ns** hit (vs 21.7 ns `HashSet`) |
+| **Lookup Watchlist** | `src/config.rs` | Snapshot `AddressSet` tanpa `await` (`Watchlist::contains`) | **24 ns** (vs 60 ns `tokio::RwLock` + `HashSet`) |
+| **Klaim "first-packet wins"** | `src/stream/feed.rs` | Cincin atomik lock-free (`ClaimRing`) | **23 ns** (menang + duplikat) |
 | **Signature Matching** | `src/stream.rs` | 1-Cycle Integer Bitwise Match (`fast_selectors`) | **832.22 ps** (0.0008 µs) |
 | **Nonce Allocation** | `src/wallet.rs` | Lock-Free In-Memory Atomic Nonce (`AtomicU64`) | **1.52 ns** (0.0015 µs) |
 | **Calldata Buffer Assembly** | `src/payload.rs` | Vectorized `std::ptr::write_bytes` Zero-Fill (94.5 KB) | **1.27 µs** (1.270 µs) |
@@ -178,6 +181,8 @@ Pengujian micro-benchmark nyata dilakukan menggunakan harness **Criterion**:
 | **Total Internal Compute Latency** | **Pipeline Lengkap** | **Zero-Copy & Pre-computed End-to-End** | **~1.7 mikrodetik (µs)** |
 
 > Seluruh evaluator pola Seri Prysm dieksekusi dalam **8 hingga 39 nanodetik**, jauh melampaui standar latensi tinggi.
+
+> **Catatan jujur tentang "total compute".** Angka ~1,7 µs di atas **tidak** menyertakan pemulihan alamat pengirim. `from` tidak ada di payload feed (hanya tanda tangan), sehingga setiap tx kandidat (swap yang bisa di-copy / panggilan ke launchpad) masih membayar `ecrecover`: **~229 µs** dengan backend `k256` bawaan, **~47 µs** dengan libsecp256k1 (ukur dengan benchmark `tx_ecrecover_sender`; aktifkan dengan menambah feature `"secp256k1"` pada dependensi `alloy` di `Cargo.toml`, butuh toolchain C). Prefilter `RawTxView` memastikan hanya tx kandidat yang membayarnya.
 
 ---
 
@@ -256,7 +261,9 @@ flowchart LR
 1. **Direct Sequencer Feed Streaming (`src/stream.rs`)**:
    - Terhubung langsung ke feed sequencer resmi Arbitrum Nitro (`wss://feed.mainnet.chain.robinhood.com`).
    - Menerima blok dan transaksi mentah seketika pada saat sequencer memprosesnya (~1.5 ms dari AWS Ohio), tanpa menunggu polling block header atau panggilan RPC sekunder `eth_getBlockByNumber`.
-   - Mengurai pesan L2 batch (`kind 3`) dan transaksi tunggal (`kind 4`) secara zero-allocation dan merekonstruksi `TxEnvelope` dengan penelusuran alamat penandatangan (`recover_signer`).
+   - Mengurai pesan L2 batch (`kind 3`) dan transaksi tunggal (`kind 4`) tanpa alokasi heap (iterator `L2Txs` dengan tumpukan tetap), lalu menyaring tiap tx lewat `RawTxView` (RLP dibaca di tempat) **sebelum** decode penuh dan `recover_signer`.
+   - **Multi-Feed Racing:** `FEED_URL` + `FEED_URLS` dibuka paralel (satu task, socket, dan jadwal reconnect per endpoint). Blok yang tiba lebih dulu diproses; salinan dari feed lain dibuang dengan satu operasi atomik (`ClaimRing`), sehingga latensi = minimum dari semua feed dan satu feed yang mati tidak berdampak. Poller HTTP hanya menjembatani saat **semua** feed mati. Statistik per feed (menang, duplikat, ketertinggalan rata-rata, RTT ping) dilaporkan tiap menit.
+   - **Koneksi:** `TCP_NODELAY` sebelum byte pertama, semua alamat DNS dibalap, timeout connect 10 dtk, heartbeat ping 5 dtk, deteksi koneksi half-open / feed macet, reconnect dengan backoff eksponensial + jitter yang menghormati `Retry-After`, dan resume dari sequence terakhir (`Arbitrum-Requested-Sequence-Number`).
 
 2. **Direct Sequencer + Multi-Endpoint Broadcaster Pool (`src/dispatcher.rs`)**:
    - Transaksi EIP-1559 ditandatangani secara lokal di memori (< 15 µs).
