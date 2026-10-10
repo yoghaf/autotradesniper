@@ -265,12 +265,13 @@ impl Dispatcher {
         };
         anyhow::ensure!(trade_eth.is_finite() && trade_eth > 0.0, "Invalid trade size {} ETH", trade_eth);
 
-        // Adaptive fee (EMA), capped by MAX_FEE_GWEI. The priority fee never exceeds max fee
-        // (invalid tx otherwise); note Arbitrum ignores tips for ordering.
+        // Adaptive fee (EMA), with user-configured priority fee floor, capped by MAX_FEE_GWEI.
         let (ema_priority_wei, ema_max_fee_wei) = self.fee_adjuster.calculate_optimal_fees();
         let cap_wei = (max_fee_cap_gwei.max(0.0) * 1e9) as u128;
         let max_fee_wei = if cap_wei > 0 { ema_max_fee_wei.min(cap_wei) } else { ema_max_fee_wei };
-        let priority_fee_wei = ema_priority_wei.min(max_fee_wei);
+        let configured_prio_gwei = *self.config.max_priority_fee_gwei.read().await;
+        let configured_prio_wei = (configured_prio_gwei.max(0.0) * 1e9) as u128;
+        let priority_fee_wei = ema_priority_wei.max(configured_prio_wei).min(max_fee_wei);
         let priority_fee_gwei = priority_fee_wei as f64 / 1e9;
 
         let value_wei = U256::from((trade_eth * 1e18) as u128);

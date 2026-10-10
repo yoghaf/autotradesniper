@@ -516,4 +516,44 @@ fn child_carrier_tx_is_zero_value_and_95kb() {
     assert!(gas > 390_000 && gas < 600_000);
 }
 
+#[test]
+fn telegram_settings_keyboard_layout_and_fee_presets() {
+    use teloxide::types::InlineKeyboardButtonKind;
+
+    let kb = autotradesniper::telegram::TelegramBot::settings_keyboard(
+        autotradesniper::types::ExecutionMode::MultiAccount,
+        3,
+        2.5,
+        94_500,
+    );
+
+    // Flatten all buttons to check callback data and labels
+    let buttons: Vec<_> = kb.inline_keyboard.into_iter().flatten().collect();
+
+    let has_cb = |b: &teloxide::types::InlineKeyboardButton, expected: &str| {
+        matches!(&b.kind, InlineKeyboardButtonKind::CallbackData(data) if data == expected)
+    };
+
+    // Verify sub-account buttons exist with checkmark on active (3 Anak)
+    let sub3 = buttons.iter().find(|b| has_cb(b, "cfg_sub:3")).expect("cfg_sub:3 button");
+    assert!(sub3.text.contains("✅"), "Active sub-account count must display checkmark");
+    let sub1 = buttons.iter().find(|b| has_cb(b, "cfg_sub:1")).expect("cfg_sub:1 button");
+    assert!(!sub1.text.contains("✅"));
+
+    // Verify pre-calculated fee presets exist with checkmark on active (2.5G Optimal)
+    let fee_opt = buttons.iter().find(|b| has_cb(b, "cfg_fee:2.5:10.0")).expect("cfg_fee:2.5:10.0 button");
+    assert!(fee_opt.text.contains("✅"), "Active optimal fee preset must display checkmark");
+    let fee_norm = buttons.iter().find(|b| has_cb(b, "cfg_fee:1.0:5.0")).expect("cfg_fee:1.0:5.0 button");
+    assert!(!fee_norm.text.contains("✅"));
+    let fee_race = buttons.iter().find(|b| has_cb(b, "cfg_fee:5.0:20.0")).expect("cfg_fee:5.0:20.0 button");
+    assert!(!fee_race.text.contains("✅"));
+
+    // Verify 95 KB buffer toggle carries checkmark
+    let buf95 = buttons.iter().find(|b| has_cb(b, "cfg_buffer:94500")).expect("cfg_buffer:94500 button");
+    assert!(buf95.text.contains("✅"), "Active 95 KB buffer must display checkmark");
+    let buf0 = buttons.iter().find(|b| has_cb(b, "cfg_buffer:0")).expect("cfg_buffer:0 button");
+    assert!(!buf0.text.contains("✅"));
+}
+
+
 
