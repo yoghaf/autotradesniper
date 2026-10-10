@@ -279,9 +279,10 @@ impl TelegramBot {
                 InlineKeyboardButton::callback("📥 Impor Frasa Mnemonic", "tr_import_wallet"),
             ],
             vec![
-                InlineKeyboardButton::callback("👥 Atur 1 Sub-Akun", "tr_sub:1"),
-                InlineKeyboardButton::callback("👥 Atur 2 Sub-Akun", "tr_sub:2"),
-                InlineKeyboardButton::callback("👥 Atur 3 Sub-Akun", "tr_sub:3"),
+                InlineKeyboardButton::callback("👥 1 Anak", "tr_sub:1"),
+                InlineKeyboardButton::callback("👥 2 Anak", "tr_sub:2"),
+                InlineKeyboardButton::callback("👥 3 Anak", "tr_sub:3"),
+                InlineKeyboardButton::callback("👥 5 Anak", "tr_sub:5"),
             ],
             vec![
                 InlineKeyboardButton::callback("⛽ Rebalance Saldo Operasional", "tr_rebalance"),
@@ -292,34 +293,116 @@ impl TelegramBot {
         ])
     }
 
-    /// Build Execution Settings Sub-Menu Keyboard
-    pub fn settings_keyboard(mode: ExecutionMode) -> InlineKeyboardMarkup {
+    /// Build Execution Settings Sub-Menu Keyboard with real-time selection markers
+    pub fn settings_keyboard(
+        mode: ExecutionMode,
+        sub_count: usize,
+        prio_fee: f64,
+        buffer_size: usize,
+    ) -> InlineKeyboardMarkup {
         let mode_btn_text = match mode {
-            ExecutionMode::Single => "🔄 Mode: Single [Switch to Multi]",
-            ExecutionMode::MultiAccount => "🔄 Mode: Multi [Switch to Single]",
+            ExecutionMode::Single => "🔄 Mode: Single [Ganti ke Multi]",
+            ExecutionMode::MultiAccount => "🔄 Mode: Multi [Ganti ke Single]",
         };
+
+        // Sub-account carrier buttons
+        let sub_1_label = if sub_count == 1 { "👥 1 Anak ✅" } else { "👥 1 Anak" };
+        let sub_2_label = if sub_count == 2 { "👥 2 Anak ✅" } else { "👥 2 Anak" };
+        let sub_3_label = if sub_count == 3 { "👥 3 Anak ✅" } else { "👥 3 Anak" };
+        let sub_5_label = if sub_count == 5 { "👥 5 Anak ✅" } else { "👥 5 Anak" };
+
+        // Pre-calculated optimal fee preset buttons (secukupnya dan efisien)
+        let fee_norm_label = if (prio_fee - 1.0).abs() < 0.2 { "⚡ Normal 1.0G ✅" } else { "⚡ Normal 1.0G" };
+        let fee_opt_label = if (prio_fee - 2.5).abs() < 0.2 { "🚀 Optimal 2.5G ✅" } else { "🚀 Optimal 2.5G" };
+        let fee_race_label = if (prio_fee - 5.0).abs() < 0.2 { "🔥 Balap 5.0G ✅" } else { "🔥 Balap 5.0G" };
+
+        // Calldata buffer size toggle buttons
+        let buf_95_label = if buffer_size >= 90000 { "📦 Buffer 95 KB ✅" } else { "📦 Buffer 95 KB" };
+        let buf_0_label = if buffer_size == 0 { "📦 Buffer 0 KB ✅" } else { "📦 Buffer 0 KB" };
 
         InlineKeyboardMarkup::new(vec![
             vec![
                 InlineKeyboardButton::callback(mode_btn_text, "cfg_toggle_mode"),
             ],
             vec![
-                InlineKeyboardButton::callback("🎯 Target Profit: +25%", "cfg_tp:25.0"),
-                InlineKeyboardButton::callback("🎯 Target Profit: +35%", "cfg_tp:35.0"),
-                InlineKeyboardButton::callback("🎯 Target Profit: +50%", "cfg_tp:50.0"),
+                InlineKeyboardButton::callback(sub_1_label, "cfg_sub:1"),
+                InlineKeyboardButton::callback(sub_2_label, "cfg_sub:2"),
+                InlineKeyboardButton::callback(sub_3_label, "cfg_sub:3"),
+                InlineKeyboardButton::callback(sub_5_label, "cfg_sub:5"),
             ],
             vec![
-                InlineKeyboardButton::callback("⏱ Exit Decay: 30s", "cfg_exit:30"),
-                InlineKeyboardButton::callback("⏱ Exit Decay: 45s", "cfg_exit:45"),
-                InlineKeyboardButton::callback("⏱ Exit Decay: 60s", "cfg_exit:60"),
+                InlineKeyboardButton::callback(fee_norm_label, "cfg_fee:1.0:5.0"),
+                InlineKeyboardButton::callback(fee_opt_label, "cfg_fee:2.5:10.0"),
+                InlineKeyboardButton::callback(fee_race_label, "cfg_fee:5.0:20.0"),
             ],
             vec![
-                InlineKeyboardButton::callback("📦 Calldata Buffer: 94.500b", "cfg_buffer_default"),
+                InlineKeyboardButton::callback(buf_95_label, "cfg_buffer:94500"),
+                InlineKeyboardButton::callback(buf_0_label, "cfg_buffer:0"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("🎯 TP: +25%", "cfg_tp:25.0"),
+                InlineKeyboardButton::callback("🎯 TP: +35%", "cfg_tp:35.0"),
+                InlineKeyboardButton::callback("🎯 TP: +50%", "cfg_tp:50.0"),
+            ],
+            vec![
+                InlineKeyboardButton::callback("⏱ Exit: 30s", "cfg_exit:30"),
+                InlineKeyboardButton::callback("⏱ Exit: 45s", "cfg_exit:45"),
+                InlineKeyboardButton::callback("⏱ Exit: 60s", "cfg_exit:60"),
             ],
             vec![
                 InlineKeyboardButton::callback("🔙 Kembali ke Menu Utama", "menu_main"),
             ],
         ])
+    }
+
+    /// Build Execution Settings keyboard from current config state
+    pub async fn get_settings_keyboard(&self) -> InlineKeyboardMarkup {
+        let mode = *self.config.execution_mode.read().await;
+        let sub_count = *self.config.sub_account_count.read().await;
+        let prio_fee = *self.config.max_priority_fee_gwei.read().await;
+        let buffer_size = *self.config.buffer_size.read().await;
+        Self::settings_keyboard(mode, sub_count, prio_fee, buffer_size)
+    }
+
+    /// Format Execution & Block-Booking Settings Summary Text
+    pub async fn get_settings_text(&self) -> String {
+        let mode = *self.config.execution_mode.read().await;
+        let sub_count = *self.config.sub_account_count.read().await;
+        let prio_fee = *self.config.max_priority_fee_gwei.read().await;
+        let max_fee = *self.config.max_fee_gwei.read().await;
+        let buffer_size = *self.config.buffer_size.read().await;
+        let tp = *self.config.target_profit_percent.read().await;
+        let exit_secs = *self.config.time_decay_exit_seconds.read().await;
+
+        let fee_tier_label = if (prio_fee - 1.0).abs() < 0.2 {
+            format!("Normal (1.0G Tip / {:.1}G Max)", max_fee)
+        } else if (prio_fee - 2.5).abs() < 0.2 {
+            format!("Optimal (2.5G Tip / {:.1}G Max) 🚀", max_fee)
+        } else if (prio_fee - 5.0).abs() < 0.2 {
+            format!("Balap (5.0G Tip / {:.1}G Max) 🔥", max_fee)
+        } else {
+            format!("Kustom ({:.1}G Tip / {:.1}G Max)", prio_fee, max_fee)
+        };
+
+        format!(
+            "⚙️ <b>EXECUTION & BLOCK-BOOKING SETTINGS</b>\n\
+             ═══════════════════════════\n\
+             • <b>Mode Eksekusi:</b> {}\n\
+             • <b>Carrier Anak (95 KB):</b> {} Akun Satelit\n\
+             • <b>Batch Buffer:</b> {} bytes (~{:.1} KB)\n\
+             • <b>Kalkulasi Fee:</b> {}\n\
+             • <b>Target Profit:</b> +{:.1}%\n\
+             • <b>Time-Decay Exit:</b> {} detik\n\
+             ═══════════════════════════\n\
+             <i>Gunakan tombol di bawah untuk mengubah setelan:</i>",
+            mode,
+            sub_count,
+            buffer_size,
+            buffer_size as f64 / 1024.0,
+            fee_tier_label,
+            tp,
+            exit_secs
+        )
     }
 
     /// Format Main Dashboard Summary Text (Clean HTML Format)
@@ -329,6 +412,8 @@ impl TelegramBot {
         let mode = *self.config.execution_mode.read().await;
         let buffer_size = *self.config.buffer_size.read().await;
         let gas_limit = *self.config.gas_limit.read().await;
+        let prio_fee = *self.config.max_priority_fee_gwei.read().await;
+        let max_fee = *self.config.max_fee_gwei.read().await;
         let trade_eth = *self.config.default_trade_eth.read().await;
         let tp = *self.config.target_profit_percent.read().await;
         let exit_secs = *self.config.time_decay_exit_seconds.read().await;
@@ -354,6 +439,7 @@ impl TelegramBot {
              ⚙️ <b>Execution Parameters:</b>\n\
              • <b>Mode:</b> {}\n\
              • <b>Batch Calldata Buffer:</b> {} bytes (~{:.1} KB)\n\
+             • <b>Priority Fee Floor:</b> {:.1} Gwei (Max: {:.1} Gwei)\n\
              • <b>Static Gas Limit:</b> {} gas\n\
              • <b>Entry Trade:</b> {:.4} ETH\n\
              • <b>Take Profit Target:</b> +{:.1}%\n\
@@ -376,6 +462,8 @@ impl TelegramBot {
             mode,
             buffer_size,
             buffer_size as f64 / 1024.0,
+            prio_fee,
+            max_fee,
             gas_limit,
             trade_eth,
             tp,
@@ -754,13 +842,11 @@ impl TelegramBot {
                     .await;
             }
             "menu_settings" => {
-                let mode = *self.config.execution_mode.read().await;
-                let text = "⚙️ <b>EXECUTION SETTINGS</b>\n\
-                            ═══════════════════════════\n\
-                            Sesuaikan parameter eksekusi, target profit, dan stop-loss waktu di bawah:";
+                let text = self.get_settings_text().await;
+                let markup = self.get_settings_keyboard().await;
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
                     .parse_mode(ParseMode::Html)
-                    .reply_markup(Self::settings_keyboard(mode))
+                    .reply_markup(markup)
                     .await;
             }
             "cfg_toggle_mode" => {
@@ -769,26 +855,75 @@ impl TelegramBot {
                     ExecutionMode::Single => ExecutionMode::MultiAccount,
                     ExecutionMode::MultiAccount => ExecutionMode::Single,
                 };
-                let new_mode = *mode_lock;
                 drop(mode_lock);
                 let _ = self.config.save_persisted_state().await;
 
-                let text = format!("🔄 Mode eksekusi diubah menjadi <b>{}</b>", new_mode);
+                let text = self.get_settings_text().await;
+                let markup = self.get_settings_keyboard().await;
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
                     .parse_mode(ParseMode::Html)
-                    .reply_markup(Self::settings_keyboard(new_mode))
+                    .reply_markup(markup)
                     .await;
+            }
+            s if s.starts_with("cfg_sub:") => {
+                let count_str = &s["cfg_sub:".len()..];
+                if let Some(count) = count_str.parse::<usize>().ok().filter(|c| (1..=MAX_SUB_ACCOUNTS).contains(c)) {
+                    *self.config.sub_account_count.write().await = count;
+                    *self.config.execution_mode.write().await = ExecutionMode::MultiAccount;
+                    let _ = self.config.save_persisted_state().await;
+
+                    let text = self.get_settings_text().await;
+                    let markup = self.get_settings_keyboard().await;
+                    let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(markup)
+                        .await;
+                }
+            }
+            s if s.starts_with("cfg_fee:") => {
+                let parts: Vec<&str> = s["cfg_fee:".len()..].split(':').collect();
+                if parts.len() == 2 {
+                    if let (Ok(prio), Ok(max)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                        if prio.is_finite() && max.is_finite() && prio > 0.0 && max >= prio {
+                            *self.config.max_priority_fee_gwei.write().await = prio;
+                            *self.config.max_fee_gwei.write().await = max;
+                            let _ = self.config.save_persisted_state().await;
+
+                            let text = self.get_settings_text().await;
+                            let markup = self.get_settings_keyboard().await;
+                            let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                                .parse_mode(ParseMode::Html)
+                                .reply_markup(markup)
+                                .await;
+                        }
+                    }
+                }
+            }
+            s if s.starts_with("cfg_buffer:") => {
+                let size_str = &s["cfg_buffer:".len()..];
+                if let Ok(size) = size_str.parse::<usize>() {
+                    *self.config.buffer_size.write().await = size;
+                    let _ = self.config.save_persisted_state().await;
+
+                    let text = self.get_settings_text().await;
+                    let markup = self.get_settings_keyboard().await;
+                    let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(markup)
+                        .await;
+                }
             }
             s if s.starts_with("cfg_tp:") => {
                 let tp_str = &s["cfg_tp:".len()..];
                 if let Some(tp) = tp_str.parse::<f64>().ok().filter(|tp| tp.is_finite() && *tp > 0.0 && *tp <= 1000.0) {
                     *self.config.target_profit_percent.write().await = tp;
                     let _ = self.config.save_persisted_state().await;
-                    let mode = *self.config.execution_mode.read().await;
-                    let text = format!("🎯 Target Profit diatur ke <b>+{}%</b>", tp);
+
+                    let text = self.get_settings_text().await;
+                    let markup = self.get_settings_keyboard().await;
                     let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
                         .parse_mode(ParseMode::Html)
-                        .reply_markup(Self::settings_keyboard(mode))
+                        .reply_markup(markup)
                         .await;
                 }
             }
@@ -797,22 +932,24 @@ impl TelegramBot {
                 if let Some(exit_secs) = exit_str.parse::<u64>().ok().filter(|s| (1..=3600).contains(s)) {
                     *self.config.time_decay_exit_seconds.write().await = exit_secs;
                     let _ = self.config.save_persisted_state().await;
-                    let mode = *self.config.execution_mode.read().await;
-                    let text = format!("⏱ Time-Decay Exit limit diatur ke <b>{} detik</b>", exit_secs);
+
+                    let text = self.get_settings_text().await;
+                    let markup = self.get_settings_keyboard().await;
                     let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
                         .parse_mode(ParseMode::Html)
-                        .reply_markup(Self::settings_keyboard(mode))
+                        .reply_markup(markup)
                         .await;
                 }
             }
             "cfg_buffer_default" => {
                 *self.config.buffer_size.write().await = 94500;
                 let _ = self.config.save_persisted_state().await;
-                let mode = *self.config.execution_mode.read().await;
-                let text = "📦 Calldata buffer dikalibrasi ke <b>94.500 bytes</b> (~94.5 KB) sesuai kuota batch L2.";
+
+                let text = self.get_settings_text().await;
+                let markup = self.get_settings_keyboard().await;
                 let _ = self.bot.edit_message_text(ChatId(chat_id), message_id, text)
                     .parse_mode(ParseMode::Html)
-                    .reply_markup(Self::settings_keyboard(mode))
+                    .reply_markup(markup)
                     .await;
             }
             "menu_portfolio" => {

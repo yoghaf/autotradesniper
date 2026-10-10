@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::models::prysm::is_prysm_tag;
-use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster};
+use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
 use crate::types::{DispatchReport, ExecutionMode, TradeSignal};
 use crate::wallet::WalletManager;
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
@@ -355,8 +355,6 @@ impl Dispatcher {
         };
         anyhow::ensure!(!value_wei.is_zero(), "Invalid trade size 0 wei");
         let trade_eth = f64::from(value_wei) / 1e18;
-        // Satellites: 10% of the master size, at least 0.001 ETH.
-        let satellite_value_wei = (value_wei / U256::from(10)).max(U256::from(1_000_000_000_000_000u64));
         // What the source calldata was quoted for: the watched wallet's msg.value for a
         // copy-trade, our own size for a strategy entry.
         let reference_value = signal.entry_amount_wei;
@@ -366,8 +364,12 @@ impl Dispatcher {
             anyhow::bail!("Refusing signal: calldata cannot be re-targeted to our recipient and size");
         }
 
-        // Arbitrum ignores tips for ordering; the cap keeps max fee x gas within balance.
-        let (priority_fee_wei, max_fee_wei) = self.fee_adjuster.capped_fees(max_fee_cap_gwei);
+        // Adaptive fee (EMA), with the user-configured priority fee floor, capped by MAX_FEE_GWEI.
+        // The priority fee never exceeds max fee (invalid tx otherwise).
+        let (ema_priority_wei, max_fee_wei) = self.fee_adjuster.capped_fees(max_fee_cap_gwei);
+        let configured_prio_gwei = *self.config.max_priority_fee_gwei.read().await;
+        let configured_prio_wei = if configured_prio_gwei.is_finite() { (configured_prio_gwei.max(0.0) * 1e9) as u128 } else { 0 };
+        let priority_fee_wei = ema_priority_wei.max(configured_prio_wei).min(max_fee_wei);
         let priority_fee_gwei = priority_fee_wei as f64 / 1e9;
         let l1_component_gas = self.fee_adjuster.l1_component_gas();
 
@@ -381,20 +383,34 @@ impl Dispatcher {
         let mut calldata_len = 0;
         let mut gas_limit_used = configured_gas_limit;
         for acc in accounts.iter().take(account_count).cloned() {
-            let acc_value_wei = if acc.index == 0 { value_wei } else { satellite_value_wei };
-            // Recipient, `ethIn` and minimum output follow this account's own size: replaying
-            // the master's amounts with a satellite's 10% `msg.value` reverts on-chain.
-            let swap = CalldataPayloadBuilder::adapt_buy_calldata(&signal.swap_calldata, acc.address, acc_value_wei, reference_value)
-                .context("calldata re-targeting failed")?;
-            // Padding never pushes the signed tx over the sequencer's size cap.
-            let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
-            let gas_limit = CalldataPayloadBuilder::gas_limit(&swap, padding, configured_gas_limit, l1_component_gas);
-            let payload = CalldataPayloadBuilder::with_padding(swap, padding);
+            let is_master = acc.index == 0;
+            let (target_dest, acc_value_wei, payload, gas_limit) = if is_master {
+                // Master account carries the real token purchase. Recipient, `ethIn` and the
+                // minimum output follow our own size (a copied trade was quoted for theirs).
+                let swap = CalldataPayloadBuilder::adapt_buy_calldata(&signal.swap_calldata, acc.address, value_wei, reference_value)
+                    .context("calldata re-targeting failed")?;
+                // Padding never pushes the signed tx over the sequencer's size cap.
+                let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
+                let gas_limit = CalldataPayloadBuilder::gas_limit(&swap, padding, configured_gas_limit, l1_component_gas);
+                (signal.pool_or_router, value_wei, CalldataPayloadBuilder::with_padding(swap, padding), gas_limit)
+            } else {
+                // Satellite child accounts act purely as carrier dispatchers carrying the 95 KB block-booking buffer:
+                // They do NOT buy tokens (value = 0 ETH), preserving 100% of token capital.
+                // Their only duty is transmitting the calibrated 94.5 KB buffer to reserve sequencer block capacity!
+                let carrier_size = if buffer_size > 0 { buffer_size } else { TARGET_CALLDATA_BUFFER_SIZE };
+                let padding = CalldataPayloadBuilder::clamp_padding(0, carrier_size);
+                // Intrinsic (incl. 21k base) + 21k reserve + the L1 poster component.
+                let gas_limit = configured_gas_limit.max(
+                    CalldataPayloadBuilder::intrinsic_gas(&[], padding)
+                        .saturating_add(21_000)
+                        .saturating_add(l1_component_gas.saturating_add(l1_component_gas / 2)),
+                );
+                (acc.address, U256::ZERO, CalldataPayloadBuilder::with_padding(Vec::new(), padding), gas_limit)
+            };
             calldata_len = payload.len();
             gas_limit_used = gas_limit;
 
             let broadcaster = self.broadcaster.clone();
-            let target_router = signal.pool_or_router;
             let chain_id = self.config.chain_id;
 
             // Atomic in-memory nonce allocation (< 10 ns)
@@ -408,7 +424,7 @@ impl Dispatcher {
                     gas_limit,
                     max_fee_per_gas: max_fee_wei,
                     max_priority_fee_per_gas: priority_fee_wei,
-                    to: TxKind::Call(target_router),
+                    to: TxKind::Call(target_dest),
                     value: acc_value_wei,
                     input: Bytes::from(payload),
                     access_list: Default::default(),

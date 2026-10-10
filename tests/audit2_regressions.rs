@@ -144,7 +144,7 @@ async fn test_config(rpc: &str) -> AppConfig {
 // ── Dispatcher: exact value, per-account calldata ───────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dispatcher_sends_exact_value_and_per_account_pons_amounts() {
+async fn dispatcher_sends_exact_master_value_and_zero_value_carriers() {
     let chain = Arc::new(Mutex::new(MockChain { accept_txs: true, ..Default::default() }));
     let url = mock_node(chain.clone()).await;
     let config = test_config(&url).await;
@@ -155,6 +155,7 @@ async fn dispatcher_sends_exact_value_and_per_account_pons_amounts() {
     let dispatcher = Dispatcher::new(config, wm.clone(), fee, report_tx);
 
     // 0.0021 ETH: the old wei -> f64 -> wei round trip sent msg.value = ethIn - 1 wei.
+    // Satellites: zero-value carriers (main 0a90c4e).
     let size = U256::from(2_100_000_000_000_000u64);
     let min_out = U256::from(1_000_000_000_000_000_000_000u128);
     let signal = TradeSignal {
@@ -178,19 +179,21 @@ async fn dispatcher_sends_exact_value_and_per_account_pons_amounts() {
         let tx = TxEnvelope::decode_2718_exact(&raw[..]).unwrap();
         let from = tx.recover_signer().unwrap();
         let input = tx.input();
-        let eth_in = U256::from_be_slice(&input[4..36]);
-        let min = U256::from_be_slice(&input[36..68]);
-        let recipient = Address::from_slice(&input[80..100]);
-        assert_eq!(tx.value(), eth_in, "msg.value must equal ethIn exactly");
-        assert_eq!(recipient, from, "tokens go to the sending account");
         assert!(tx.gas_limit() >= 1_500_000, "gas limit covers the L1 component (+50%)");
         if from == accounts[0].address {
-            assert_eq!(tx.value(), size);
+            let eth_in = U256::from_be_slice(&input[4..36]);
+            let min = U256::from_be_slice(&input[36..68]);
+            let recipient = Address::from_slice(&input[80..100]);
+            assert_eq!(tx.value(), size, "msg.value must equal ethIn exactly");
+            assert_eq!(eth_in, size);
             assert_eq!(min, min_out);
+            assert_eq!(recipient, from, "tokens go to the master");
+            assert_eq!(tx.to(), Some(CURVE));
         } else {
-            // Satellites: 10% of size, floored at 0.001 ETH; minimum scaled with the size.
-            assert_eq!(tx.value(), U256::from(1_000_000_000_000_000u64));
-            assert_eq!(min, min_out * tx.value() / size);
+            // Satellites are zero-value carriers of the zero-filled buffer, sent to themselves.
+            assert_eq!(tx.value(), U256::ZERO);
+            assert_eq!(tx.to(), Some(from));
+            assert!(input.len() >= 94_000 && input.iter().all(|&b| b == 0));
         }
     }
 }
