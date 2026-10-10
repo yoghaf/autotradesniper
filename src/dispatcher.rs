@@ -2,22 +2,107 @@ use crate::config::AppConfig;
 use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, STATIC_GAS_LIMIT};
 use crate::types::{DispatchReport, ExecutionMode, TradeSignal};
 use crate::wallet::WalletManager;
-use alloy::network::{EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Bytes, U256};
-use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::TransactionRequest;
+use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+use alloy::eips::eip2718::Encodable2718;
+use alloy::primitives::{Bytes, TxKind, U256};
+use alloy::signers::Signer;
 use anyhow::Result;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+
+/// Pre-warmed Persistent Connection Multi-Endpoint RPC & Direct Sequencer Broadcaster Pool
+#[derive(Clone)]
+pub struct BroadcasterPool {
+    client: reqwest::Client,
+    send_rpcs: Vec<String>,
+}
+
+impl BroadcasterPool {
+    pub fn new(send_rpcs: Vec<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Some(Duration::from_secs(90)))
+            .pool_max_idle_per_host(10)
+            .timeout(Duration::from_millis(2500))
+            .build()
+            .unwrap_or_default();
+        Self { client, send_rpcs }
+    }
+
+    /// Broadcast raw signed transaction concurrently across all endpoints.
+    /// The instant ANY endpoint accepts (or reports 'already known'), returns immediately!
+    pub async fn broadcast_raw_tx(&self, raw_hex: &str, expected_hash: &str) -> Result<String, String> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_sendRawTransaction",
+            "params": [raw_hex]
+        });
+
+        let mut futures = FuturesUnordered::new();
+        for rpc in &self.send_rpcs {
+            let rpc = rpc.clone();
+            let client = self.client.clone();
+            let payload = payload.clone();
+            let hash_clone = expected_hash.to_string();
+
+            futures.push(async move {
+                let resp = client.post(&rpc)
+                    .json(&payload)
+                    .send()
+                    .await;
+
+                match resp {
+                    Ok(res) => {
+                        if let Ok(json) = res.json::<serde_json::Value>().await {
+                            if let Some(err) = json.get("error") {
+                                let err_msg = err.to_string().to_lowercase();
+                                if err_msg.contains("already known") || err_msg.contains("known transaction") {
+                                    return Ok((rpc, hash_clone));
+                                }
+                                return Err((rpc, err_msg));
+                            }
+                            if let Some(res_val) = json.get("result") {
+                                if let Some(h) = res_val.as_str() {
+                                    return Ok((rpc, h.to_string()));
+                                }
+                                return Ok((rpc, hash_clone));
+                            }
+                        }
+                        Err((rpc, "Invalid JSON response".to_string()))
+                    }
+                    Err(e) => Err((rpc, e.to_string())),
+                }
+            });
+        }
+
+        let mut all_errors = Vec::new();
+        while let Some(res) = futures.next().await {
+            match res {
+                Ok((rpc, hash)) => {
+                    info!("🚀 Direct Sequencer/RPC Broadcast Accepted by [{}] -> {}", rpc, hash);
+                    return Ok(hash);
+                }
+                Err((rpc, err)) => {
+                    all_errors.push(format!("{}: {}", rpc, err));
+                }
+            }
+        }
+
+        Err(all_errors.join(" | "))
+    }
+}
 
 /// High-Frequency Calldata Buffer Formatting & Concurrent Dispatcher Engine
 pub struct Dispatcher {
     config: AppConfig,
     wallet_manager: WalletManager,
     fee_adjuster: Arc<DynamicFeeAdjuster>,
+    broadcaster: Arc<BroadcasterPool>,
     report_tx: mpsc::Sender<DispatchReport>,
 }
 
@@ -28,16 +113,18 @@ impl Dispatcher {
         fee_adjuster: Arc<DynamicFeeAdjuster>,
         report_tx: mpsc::Sender<DispatchReport>,
     ) -> Self {
+        let broadcaster = Arc::new(BroadcasterPool::new(config.send_rpcs.clone()));
         Self {
             config,
             wallet_manager,
             fee_adjuster,
+            broadcaster,
             report_tx,
         }
     }
 
     /// Dispatch transactions with In-Memory Nonce Caching, EMA Fee Calibration,
-    /// and Pipelined Parallel Signing.
+    /// and Pipelined Parallel Signing directly to the Sequencer.
     ///
     /// Internal compute latency: < 50 microseconds.
     pub async fn dispatch_signal(&self, signal: TradeSignal) -> Result<DispatchReport> {
@@ -64,7 +151,6 @@ impl Dispatcher {
         );
 
         let value_wei = U256::from((trade_eth * 1e18) as u128);
-        let rpc_http = self.config.rpc_http_url.clone();
 
         let mut tx_hashes = Vec::new();
         let mut account_roles = Vec::new();
@@ -76,40 +162,34 @@ impl Dispatcher {
                 // In-memory atomic nonce retrieval: 0ms RPC roundtrip latency!
                 let nonce = master.nonce_cursor.fetch_add(1, Ordering::SeqCst);
 
-                let master_wallet = EthereumWallet::from(master.signer.clone());
-                let provider_res = ProviderBuilder::new()
-                    .wallet(master_wallet)
-                    .connect(&rpc_http)
-                    .await;
+                let tx = TxEip1559 {
+                    chain_id: self.config.chain_id,
+                    nonce,
+                    gas_limit: STATIC_GAS_LIMIT,
+                    max_fee_per_gas: max_fee_wei,
+                    max_priority_fee_per_gas: priority_fee_wei,
+                    to: TxKind::Call(signal.pool_or_router),
+                    value: value_wei,
+                    input: Bytes::from(buffered_calldata),
+                    access_list: Default::default(),
+                };
 
-                let tx_req = TransactionRequest::default()
-                    .with_to(signal.pool_or_router)
-                    .with_value(value_wei)
-                    .with_input(Bytes::from(buffered_calldata))
-                    .with_nonce(nonce)
-                    .with_gas_limit(STATIC_GAS_LIMIT)
-                    .with_max_priority_fee_per_gas(priority_fee_wei)
-                    .with_max_fee_per_gas(max_fee_wei);
+                let sig = master.signer.sign_hash(&tx.signature_hash()).await.map_err(|e| anyhow::anyhow!(e))?;
+                let signed_tx = tx.into_signed(sig);
+                let envelope = TxEnvelope::Eip1559(signed_tx);
+                let hash = format!("{:?}", envelope.tx_hash());
+                let mut raw_bytes = Vec::new();
+                envelope.encode_2718(&mut raw_bytes);
+                let raw_hex = format!("0x{}", hex::encode(&raw_bytes));
 
-                match provider_res {
-                    Ok(provider) => {
-                        match provider.send_transaction(tx_req).await {
-                            Ok(pending) => {
-                                let hash = format!("{:?}", pending.tx_hash());
-                                info!("✅ [Master Account] TX Broadcast: {} (Nonce: {})", hash, nonce);
-                                tx_hashes.push(hash);
-                                account_roles.push("Master Account".to_string());
-                            }
-                            Err(e) => {
-                                warn!("Master Account broadcast attempt: {}", e);
-                                let sim_hash = format!("0xsim_{:x}", rand::random::<u64>());
-                                tx_hashes.push(sim_hash);
-                                account_roles.push("Master Account (Simulated)".to_string());
-                            }
-                        }
+                match self.broadcaster.broadcast_raw_tx(&raw_hex, &hash).await {
+                    Ok(confirmed_hash) => {
+                        info!("✅ [Master Account] TX Broadcast: {} (Nonce: {})", confirmed_hash, nonce);
+                        tx_hashes.push(confirmed_hash);
+                        account_roles.push("Master Account".to_string());
                     }
                     Err(e) => {
-                        warn!("Provider connect error: {}. Simulated broadcast.", e);
+                        warn!("Master Account broadcast attempt: {}", e);
                         let sim_hash = format!("0xsim_{:x}", rand::random::<u64>());
                         tx_hashes.push(sim_hash);
                         account_roles.push("Master Account (Simulated)".to_string());
@@ -118,14 +198,15 @@ impl Dispatcher {
             }
             ExecutionMode::MultiAccount => {
                 // Multi-Account Sequence Mode:
-                // Pipelined parallel transaction signing & concurrent broadcast
+                // Pipelined parallel transaction signing & concurrent broadcast directly to Sequencer
                 let all_accounts = self.wallet_manager.get_all_accounts().await?;
                 let mut handles = Vec::with_capacity(all_accounts.len());
 
                 for (idx, acc) in all_accounts.into_iter().enumerate() {
-                    let rpc_http_clone = rpc_http.clone();
+                    let broadcaster = self.broadcaster.clone();
                     let payload_clone = buffered_calldata.clone();
                     let target_router = signal.pool_or_router;
+                    let chain_id = self.config.chain_id;
 
                     // Atomic in-memory nonce allocation (< 10 ns)
                     let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst);
@@ -141,29 +222,32 @@ impl Dispatcher {
 
                     // Pipelined parallel dispatch worker
                     let handle = tokio::spawn(async move {
-                        let wallet = EthereumWallet::from(acc.signer);
-                        let provider_res = ProviderBuilder::new()
-                            .wallet(wallet)
-                            .connect(&rpc_http_clone)
-                            .await;
-
-                        let provider = match provider_res {
-                            Ok(p) => p,
-                            Err(e) => return (role_desc, Err(e.to_string())),
+                        let tx = TxEip1559 {
+                            chain_id,
+                            nonce,
+                            gas_limit: STATIC_GAS_LIMIT,
+                            max_fee_per_gas: max_fee_wei,
+                            max_priority_fee_per_gas: priority_fee_wei,
+                            to: TxKind::Call(target_router),
+                            value: acc_value_wei,
+                            input: Bytes::from(payload_clone),
+                            access_list: Default::default(),
                         };
 
-                        let tx_req = TransactionRequest::default()
-                            .with_to(target_router)
-                            .with_value(acc_value_wei)
-                            .with_input(Bytes::from(payload_clone))
-                            .with_nonce(nonce)
-                            .with_gas_limit(STATIC_GAS_LIMIT)
-                            .with_max_priority_fee_per_gas(priority_fee_wei)
-                            .with_max_fee_per_gas(max_fee_wei);
+                        let sig = match acc.signer.sign_hash(&tx.signature_hash()).await {
+                            Ok(s) => s,
+                            Err(e) => return (role_desc, Err(e.to_string())),
+                        };
+                        let signed_tx = tx.into_signed(sig);
+                        let envelope = TxEnvelope::Eip1559(signed_tx);
+                        let hash = format!("{:?}", envelope.tx_hash());
+                        let mut raw_bytes = Vec::new();
+                        envelope.encode_2718(&mut raw_bytes);
+                        let raw_hex = format!("0x{}", hex::encode(&raw_bytes));
 
-                        match provider.send_transaction(tx_req).await {
-                            Ok(pending) => (role_desc, Ok(format!("{:?}", pending.tx_hash()))),
-                            Err(e) => (role_desc, Err(e.to_string())),
+                        match broadcaster.broadcast_raw_tx(&raw_hex, &hash).await {
+                            Ok(confirmed_hash) => (role_desc, Ok(confirmed_hash)),
+                            Err(e) => (role_desc, Err(e)),
                         }
                     });
 

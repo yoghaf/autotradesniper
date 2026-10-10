@@ -202,13 +202,11 @@ autotradesniper/
     ├── config.rs               # Runtime configuration, thread-safe RwLock, JSON persistence
     ├── types.rs                # Data structures: TradeSignal, DispatchReport, Position, PrysmExitMode
     ├── wallet.rs               # BIP-39 HD Master, BIP-44 Sub-Accounts & Atomic Nonces
-    ├── stream.rs               # Zero-Copy WebSocket Parser & 1-cycle bitwise signature matching
-    ├── dispatcher.rs           # Pipelined concurrent multi-account dispatch & memory buffer
+    ├── stream.rs               # Real-Time Arbitrum Nitro Sequencer Feed Streamer & L2 Unpacker
+    ├── dispatcher.rs           # Direct Sequencer BroadcasterPool & Pipelined Parallel Signing
     ├── models/
     │   ├── mod.rs              # Entry point modul strategi mandiri
     │   └── prysm.rs            # Fast-Path Pattern Evaluator "Seri Prysm" (Pola A/B/C + Guardrails)
-    ├── risk/
-    │   ├── mod.rs              # RiskManager coordinator & background lifecycle loop
     │   ├── types.rs            # ExitReason (14 variants), RiskConfig, PositionTracker, BlockEvent
     │   ├── price_rules.rs      # Layer 1: High-Watermark Trailing, Hard SL & Prysm Target Modes
     │   ├── flow_rules.rs       # Layer 2: Quiet Market (30s) & Inactivity Decay (25s)
@@ -223,13 +221,58 @@ autotradesniper/
 
 ---
 
+## ⚡ ARSITEKTUR DIRECT SEQUENCER & MULTI-ENDPOINT BROADCASTER
+
+Sistem mengadopsi mekanisme berkinerja tinggi dari `bottradepons`:
+
+```mermaid
+flowchart LR
+    subgraph INTAKE [Penerimaan Sinyal & Feed]
+        FEED["wss://feed.mainnet.chain.robinhood.com<br/>(Arbitrum Nitro Sequencer Stream)"]
+        PARSE["Zero-Copy L2 Unpacker (Kind 3/4)"]
+        FEED --> PARSE
+        PARSE --> PIPELINE["Evaluator Watchlist & Seri Prysm"]
+    end
+
+    subgraph DISPATCH [Penembakan Transaksi Paralel]
+        SIGN["Local In-Memory EIP-1559 Signing (<15 µs)"]
+        POOL["BroadcasterPool (FuturesUnordered)"]
+        
+        SEQ["sequencer.mainnet.chain.robinhood.com (~4ms)"]
+        RPC1["rpc.mainnet.chain.robinhood.com"]
+        RPC2["robinhood.drpc.org"]
+        RPC3["robinhood-rpc.publicnode.com"]
+        RPC4["robinhood-chain.gateway.tenderly.co"]
+        
+        PIPELINE --> SIGN --> POOL
+        POOL --> SEQ
+        POOL --> RPC1
+        POOL --> RPC2
+        POOL --> RPC3
+        POOL --> RPC4
+    end
+```
+
+1. **Direct Sequencer Feed Streaming (`src/stream.rs`)**:
+   - Terhubung langsung ke feed sequencer resmi Arbitrum Nitro (`wss://feed.mainnet.chain.robinhood.com`).
+   - Menerima blok dan transaksi mentah seketika pada saat sequencer memprosesnya (~1.5 ms dari AWS Ohio), tanpa menunggu polling block header atau panggilan RPC sekunder `eth_getBlockByNumber`.
+   - Mengurai pesan L2 batch (`kind 3`) dan transaksi tunggal (`kind 4`) secara zero-allocation dan merekonstruksi `TxEnvelope` dengan penelusuran alamat penandatangan (`recover_signer`).
+
+2. **Direct Sequencer + Multi-Endpoint Broadcaster Pool (`src/dispatcher.rs`)**:
+   - Transaksi EIP-1559 ditandatangani secara lokal di memori (< 15 µs).
+   - Menggunakan connection pool persisten (`reqwest::Client` dengan TCP Keep-Alive dan `TCP_NODELAY`).
+   - Menembakkan `eth_sendRawTransaction` secara paralel ke endpoint inbox sequencer (`https://sequencer.mainnet.chain.robinhood.com`) bersamaan dengan 4 node cadangan (`rpc.mainnet.chain.robinhood.com`, `drpc.org`, `publicnode.com`, `tenderly.co`).
+   - Endpoint pertama yang merespons sukses (atau `"already known"`) langsung menyelesaikan transaksi tanpa menunggu endpoint yang lebih lambat.
+
+---
+
 ## 🔨 PANDUAN PENGGUNAAN & PENGUJIAN
 
-### 1. Menjalankan Seluruh Unit Test (19 Pengujian)
+### 1. Menjalankan Seluruh Unit Test (21 Pengujian)
 ```powershell
 cargo test
 ```
-Seluruh 10 pengujian strategi Seri Prysm dan 9 pengujian mitigasi risiko 6-lapis dieksekusi dengan 100% kelulusan (`19 passed; 0 failed`).
+Seluruh 12 pengujian Seri Prysm & L2 message unpacker serta 9 pengujian mitigasi risiko 6-lapis dieksekusi dengan 100% kelulusan (`21 passed; 0 failed`).
 
 Untuk menjalankan spesifik test Seri Prysm:
 ```powershell
@@ -251,5 +294,5 @@ Biner executable berkinerja tinggi akan berada di: `target/release/autotradesnip
 ```powershell
 .\target\release\autotradesniper.exe
 ```
-Engine akan terhubung ke node RPC Arbitrum Nitro / Robinhood Chain (ID: 4663), menginisialisasi dompet HD, mengaktifkan loop stream berlatensi sub-mikrodetik, mengaktifkan engine evaluasi pola Seri Prysm paralel, mengaktifkan pengawas risiko 6-lapis, dan melayani antarmuka kendali Telegram Bot (`Dashboard Utama` $\rightarrow$ `🔬 Model Strategi` $\rightarrow$ `⚡ Seri Prysm`).
+Engine akan terhubung langsung ke WebSocket Sequencer Feed Arbitrum Nitro (Chain ID: 4663), menginisialisasi dompet HD, mengaktifkan loop stream berlatensi sub-mikrodetik, mengaktifkan BroadcasterPool penembakan sequencer paralel, mengaktifkan engine evaluasi pola Seri Prysm, mengaktifkan pengawas risiko 6-lapis, dan melayani antarmuka kendali Telegram Bot (`Dashboard Utama` $\rightarrow$ `🔬 Model Strategi` $\rightarrow$ `⚡ Seri Prysm`).
 

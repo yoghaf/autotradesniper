@@ -1,15 +1,19 @@
 use crate::config::AppConfig;
 use crate::payload::DynamicFeeAdjuster;
 use crate::types::TradeSignal;
-use alloy::consensus::Transaction as TxTrait;
+use alloy::consensus::transaction::SignerRecoverable;
+use alloy::consensus::{Transaction as TxTrait, TxEnvelope};
+use alloy::eips::eip2718::Decodable2718;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::BlockTransactions;
 use anyhow::{Context, Result};
+use base64::Engine;
 use futures_util::StreamExt;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio_tungstenite::connect_async;
 use tracing::{error, info, trace, warn};
 
 /// Pre-computed 4-byte DEX Swap Method Signatures as u32 integers
@@ -128,6 +132,28 @@ impl ZeroCopyTxParser {
     }
 }
 
+/// Recursive L2 message unpacker for Arbitrum Nitro sequencer feeds
+/// Kind 4 = Single signed tx; Kind 3 = Batch of (8-byte big-endian length + message)
+pub fn extract_l2_txs<'a>(bytes: &'a [u8], out: &mut Vec<&'a [u8]>) {
+    if bytes.is_empty() {
+        return;
+    }
+    let kind = bytes[0];
+    if kind == 4 {
+        out.push(&bytes[1..]);
+    } else if kind == 3 {
+        let mut i = 1;
+        while i + 8 <= bytes.len() {
+            let n = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap_or_default()) as usize;
+            i += 8;
+            if i + n <= bytes.len() {
+                extract_l2_txs(&bytes[i..i + n], out);
+            }
+            i += n;
+        }
+    }
+}
+
 /// Real-Time Sequencer Feed & Signal Replication Stream Listener
 pub struct StreamListener {
     config: AppConfig,
@@ -151,107 +177,186 @@ impl StreamListener {
         }
     }
 
+    /// Background fee refresher to poll gas prices from RPC without adding latency to the sequencer feed
+    fn spawn_fee_refresher(&self) {
+        let fee_adjuster = self.fee_adjuster.clone();
+        let rpc_http = self.config.rpc_http_url.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_millis(1500))
+                .build()
+                .unwrap_or_default();
+            let payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_gasPrice",
+                "params": []
+            });
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Ok(resp) = client.post(&rpc_http).json(&payload).send().await {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(res_str) = json.get("result").and_then(|r| r.as_str()) {
+                            let hex_clean = res_str.trim_start_matches("0x");
+                            if let Ok(val) = u128::from_str_radix(hex_clean, 16) {
+                                let gwei = val as f64 / 1e9;
+                                fee_adjuster.update_block_fees(gwei, 2.5);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     /// Run the stream listener loop
     pub async fn run(&self) -> Result<()> {
         info!(
-            "Starting High-Frequency Sequencer Stream Listener for Chain ID: {} (WS: {})",
-            self.config.chain_id, self.config.rpc_ws_url
+            "Starting High-Frequency Sequencer Stream Listener for Chain ID: {} (Feed URL: {})",
+            self.config.chain_id, self.config.feed_url
         );
 
-        let ws_url = self.config.rpc_ws_url.clone();
+        self.spawn_fee_refresher();
+
+        let feed_url = self.config.feed_url.clone();
         let http_url = self.config.rpc_http_url.clone();
+
+        let mut backoff_secs = 1u64;
 
         loop {
             if !self.config.is_engine_running() {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
 
-            match self.listen_websocket_feed(&ws_url).await {
+            match self.listen_sequencer_feed(&feed_url).await {
                 Ok(_) => {
-                    warn!("Sequencer WebSocket stream closed gracefully. Reconnecting...");
+                    warn!("Sequencer WebSocket stream disconnected. Reconnecting in {}s...", backoff_secs);
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(30);
                 }
                 Err(e) => {
                     warn!(
-                        "Sequencer WebSocket connection failed: {}. Falling back to HTTP Polling...",
+                        "Direct Sequencer Feed connection failed: {}. Falling back to HTTP poller...",
                         e
                     );
                     if let Err(http_err) = self.listen_http_poll(&http_url).await {
-                        error!("HTTP Sequencer polling error: {}. Retrying in 2s...", http_err);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        error!("HTTP Sequencer poller error: {}. Retrying in 2s...", http_err);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                 }
             }
         }
     }
 
-    /// WebSocket Sequencer Feed connection with low-latency block streaming
-    async fn listen_websocket_feed(&self, ws_url: &str) -> Result<()> {
-        let provider = ProviderBuilder::new()
-            .connect(ws_url)
-            .await
-            .context("Failed to connect to Sequencer WebSocket")?;
+    /// Real-time Arbitrum Nitro Sequencer Feed connection (Zero-Allocation byte streamer)
+    async fn listen_sequencer_feed(&self, feed_url: &str) -> Result<()> {
+        let (ws_stream, _) = connect_async(feed_url).await
+            .context("Failed to connect to Arbitrum Sequencer Feed WebSocket")?;
 
-        info!("Successfully connected to Sequencer WebSocket Feed (TCP_NODELAY active)");
-        let sub = provider.subscribe_blocks().await?;
-        let mut stream = sub.into_stream();
+        info!("⚡ Successfully connected to Real-Time Sequencer Feed ({})", feed_url);
+        let (_, mut read) = ws_stream.split();
 
-        while let Some(block_header) = stream.next().await {
-            let start = Instant::now();
-            let block_number = block_header.number;
-
-            // Feed base fee into EMA Dynamic Fee Adjuster for adaptive fee calculation
-            if let Some(base_fee) = block_header.base_fee_per_gas {
-                let base_fee_gwei = base_fee as f64 / 1e9;
-                self.fee_adjuster.update_block_fees(base_fee_gwei, 2.5);
-            }
+        while let Some(msg_result) = read.next().await {
+            let msg = match msg_result {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!("Sequencer feed message error: {}", e);
+                    break;
+                }
+            };
 
             if !self.config.is_engine_running() {
                 continue;
             }
 
-            trace!("Received Sequencer Block #{}", block_number);
-
-            // Notify Prysm Series Strategy of new block confirmation (releases matured +3 block orders)
-            self.prysm_engine.process_new_block(block_number).await;
-
-            // Fetch block with full transactions for microsecond inspection
-            if let Ok(Some(block)) = provider.get_block_by_number(block_number.into()).await {
-                if let BlockTransactions::Full(transactions) = block.transactions {
-                    for tx in transactions {
-                        let from = tx.inner.signer();
-                        let to = tx.inner.to();
-                        let value = tx.inner.value();
-                        let input = tx.inner.input();
-                        let tx_hash = *tx.inner.tx_hash();
-
-                        // Pipeline 1: Watchlist Monitored Signals
-                        self.inspect_transaction_fast(
-                            from,
-                            to,
-                            value,
-                            input,
-                            tx_hash,
-                            block_number,
-                            start,
-                        ).await;
-
-                        // Pipeline 2: Autonomous Prysm Series Strategy Evaluator
-                        self.prysm_engine.inspect_transaction(
-                            from,
-                            to,
-                            value,
-                            input,
-                            tx_hash,
-                            block_number,
-                            start,
-                        ).await;
+            match msg {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+                            for m in messages {
+                                let seq = m.get("sequenceNumber").and_then(|s| s.as_u64()).unwrap_or(0);
+                                if let Some(b64_str) = m.pointer("/message/message/l2Msg").and_then(|s| s.as_str()) {
+                                    if let Ok(l2_bytes) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                                        self.process_l2_message(seq, &l2_bytes).await;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+                tokio_tungstenite::tungstenite::Message::Binary(bin) => {
+                    if let Ok(text) = std::str::from_utf8(&bin) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+                            if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+                                for m in messages {
+                                    let seq = m.get("sequenceNumber").and_then(|s| s.as_u64()).unwrap_or(0);
+                                    if let Some(b64_str) = m.pointer("/message/message/l2Msg").and_then(|s| s.as_str()) {
+                                        if let Ok(l2_bytes) = base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                                            self.process_l2_message(seq, &l2_bytes).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => {
+                    info!("Sequencer Feed received close frame from server");
+                    break;
+                }
+                _ => {}
             }
         }
 
         Ok(())
+    }
+
+    /// Process raw L2 sequencer bytes: release matured block queues & inspect transactions
+    async fn process_l2_message(&self, block_number: u64, l2_bytes: &[u8]) {
+        let start = Instant::now();
+
+        // 1. Notify Prysm Series Strategy of block progression (releases matured +3 block orders)
+        self.prysm_engine.process_new_block(block_number).await;
+
+        // 2. Extract signed transactions from Arbitrum Nitro L2 payload
+        let mut tx_slices = Vec::with_capacity(16);
+        extract_l2_txs(l2_bytes, &mut tx_slices);
+
+        for tx_raw in tx_slices {
+            let mut slice = tx_raw;
+            if let Ok(envelope) = TxEnvelope::decode_2718(&mut slice) {
+                if let Ok(from) = envelope.recover_signer() {
+                    let to = envelope.to();
+                    let value = envelope.value();
+                    let input = envelope.input();
+                    let tx_hash = *envelope.tx_hash();
+
+                    // Pipeline 1: Watchlist Target Wallets
+                    self.inspect_transaction_fast(
+                        from,
+                        to,
+                        value,
+                        input,
+                        tx_hash,
+                        block_number,
+                        start,
+                    ).await;
+
+                    // Pipeline 2: Autonomous Prysm Pattern Evaluator
+                    self.prysm_engine.inspect_transaction(
+                        from,
+                        to,
+                        value,
+                        input,
+                        tx_hash,
+                        block_number,
+                        start,
+                    ).await;
+                }
+            }
+        }
     }
 
     /// HTTP fallback polling in case WS feed is not reachable or during dev

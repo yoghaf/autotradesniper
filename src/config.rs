@@ -46,6 +46,8 @@ pub struct RuntimeState {
 pub struct AppConfig {
     pub rpc_http_url: String,
     pub rpc_ws_url: String,
+    pub feed_url: String,
+    pub send_rpcs: Vec<String>,
     pub chain_id: u64,
     pub telegram_bot_token: String,
     pub telegram_authorized_chat_id: i64,
@@ -84,10 +86,23 @@ impl AppConfig {
     pub fn load_from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
 
+        let feed_url = std::env::var("FEED_URL")
+            .or_else(|_| std::env::var("RPC_WS_URL"))
+            .unwrap_or_else(|_| "wss://feed.mainnet.chain.robinhood.com".to_string());
         let rpc_http_url = std::env::var("RPC_HTTP_URL")
-            .unwrap_or_else(|_| "https://rpc.robinhood.com".to_string());
+            .unwrap_or_else(|_| "https://rpc.mainnet.chain.robinhood.com".to_string());
         let rpc_ws_url = std::env::var("RPC_WS_URL")
-            .unwrap_or_else(|_| "wss://rpc.robinhood.com/ws".to_string());
+            .unwrap_or_else(|_| "wss://feed.mainnet.chain.robinhood.com".to_string());
+
+        let raw_send_rpcs = std::env::var("SEND_RPCS").unwrap_or_else(|_| {
+            "https://sequencer.mainnet.chain.robinhood.com,https://rpc.mainnet.chain.robinhood.com,https://robinhood-rpc.publicnode.com,https://robinhood.drpc.org,https://robinhood-chain.gateway.tenderly.co".to_string()
+        });
+        let send_rpcs: Vec<String> = raw_send_rpcs
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let chain_id = std::env::var("CHAIN_ID")
             .unwrap_or_else(|_| "4663".to_string())
             .parse::<u64>()
@@ -181,6 +196,8 @@ impl AppConfig {
         let config = Self {
             rpc_http_url,
             rpc_ws_url,
+            feed_url,
+            send_rpcs,
             chain_id,
             telegram_bot_token,
             telegram_authorized_chat_id,

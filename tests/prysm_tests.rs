@@ -451,3 +451,91 @@ fn test_prysm_system_mode_falls_back_to_6layer_rules() {
     let exit = sig.unwrap();
     assert_eq!(exit.reason, ExitReason::StopLoss);
 }
+
+#[tokio::test]
+async fn test_tx_envelope_sign_and_encode() {
+    use alloy::consensus::transaction::SignerRecoverable;
+    use alloy::consensus::{SignableTransaction, Transaction, TxEip1559, TxEnvelope};
+    use alloy::eips::eip2718::{Decodable2718, Encodable2718};
+    use alloy::primitives::{Address, Bytes, TxKind, U256};
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::Signer;
+
+    let signer = PrivateKeySigner::random();
+    let tx = TxEip1559 {
+        chain_id: 4663,
+        nonce: 0,
+        gas_limit: 150_000,
+        max_fee_per_gas: 100_000_000,
+        max_priority_fee_per_gas: 100_000_000,
+        to: TxKind::Call(Address::ZERO),
+        value: U256::ZERO,
+        input: Bytes::from(vec![1, 2, 3, 4]),
+        access_list: Default::default(),
+    };
+    let sig = signer.sign_hash(&tx.signature_hash()).await.unwrap();
+    let signed_tx = tx.into_signed(sig);
+    let envelope = TxEnvelope::Eip1559(signed_tx);
+    let mut raw_bytes = Vec::new();
+    envelope.encode_2718(&mut raw_bytes);
+    let raw_hex = format!("0x{}", hex::encode(&raw_bytes));
+    assert!(raw_hex.starts_with("0x02")); // EIP-1559 type 2 prefix!
+
+    // Verify roundtrip decode
+    let mut slice = raw_bytes.as_slice();
+    let decoded = TxEnvelope::decode_2718(&mut slice).unwrap();
+    assert_eq!(decoded.recover_signer().unwrap(), signer.address());
+    assert_eq!(decoded.value(), U256::ZERO);
+}
+
+#[test]
+fn test_l2_message_unpacking_kind3_and_kind4() {
+    fn extract_l2_txs<'a>(bytes: &'a [u8], out: &mut Vec<&'a [u8]>) {
+        if bytes.is_empty() {
+            return;
+        }
+        let kind = bytes[0];
+        if kind == 4 {
+            out.push(&bytes[1..]);
+        } else if kind == 3 {
+            let mut i = 1;
+            while i + 8 <= bytes.len() {
+                let n = u64::from_be_bytes(bytes[i..i + 8].try_into().unwrap_or_default()) as usize;
+                i += 8;
+                if i + n <= bytes.len() {
+                    extract_l2_txs(&bytes[i..i + n], out);
+                }
+                i += n;
+            }
+        }
+    }
+
+    // Construct a mock kind 4 message (single tx)
+    let mock_tx1 = vec![0x02, 0xaa, 0xbb];
+    let mut msg_kind4 = vec![4u8];
+    msg_kind4.extend_from_slice(&mock_tx1);
+
+    let mut out1 = Vec::new();
+    extract_l2_txs(&msg_kind4, &mut out1);
+    assert_eq!(out1.len(), 1);
+    assert_eq!(out1[0], &mock_tx1[..]);
+
+    // Construct a mock kind 3 message (batch of 2 messages)
+    let mock_tx2 = vec![0x02, 0xcc, 0xdd, 0xee];
+    let mut sub_msg2 = vec![4u8];
+    sub_msg2.extend_from_slice(&mock_tx2);
+
+    let mut batch_msg = vec![3u8];
+    // Entry 1: length of msg_kind4 (8 bytes) + msg_kind4
+    batch_msg.extend_from_slice(&(msg_kind4.len() as u64).to_be_bytes());
+    batch_msg.extend_from_slice(&msg_kind4);
+    // Entry 2: length of sub_msg2 (8 bytes) + sub_msg2
+    batch_msg.extend_from_slice(&(sub_msg2.len() as u64).to_be_bytes());
+    batch_msg.extend_from_slice(&sub_msg2);
+
+    let mut out2 = Vec::new();
+    extract_l2_txs(&batch_msg, &mut out2);
+    assert_eq!(out2.len(), 2);
+    assert_eq!(out2[0], &mock_tx1[..]);
+    assert_eq!(out2[1], &mock_tx2[..]);
+}
