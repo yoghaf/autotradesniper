@@ -1,0 +1,7 @@
+/target
+.env
+runtime_config.json
+errors.txt
+*.log
+.DS_Store
+Thumbs.db

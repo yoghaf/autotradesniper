@@ -1,0 +1,30 @@
+[package]
+name = "autotradesniper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "2.5.0", features = [
+    "full",
+    "network",
+    "providers",
+    "rpc-types",
+    "signer-local",
+    "contract",
+    "consensus",
+    "sol-types",
+] }
+tokio = { version = "1.43", features = ["full"] }
+teloxide = { version = "0.13", features = ["macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bip39 = { version = "2.1", features = ["rand"] }
+bip32 = { version = "0.5", features = ["secp256k1"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "2.0"
+hex = "0.4"
+futures-util = "0.3"
+rand = "0.8"
