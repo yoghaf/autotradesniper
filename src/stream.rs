@@ -1,6 +1,7 @@
 use crate::addr_set::AddressSet;
 use crate::config::AppConfig;
 use crate::payload::DynamicFeeAdjuster;
+use crate::risk::curve_mirror::CurveMirror;
 use crate::types::TradeSignal;
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::consensus::{Transaction as TxTrait, TxEnvelope};
@@ -87,6 +88,59 @@ impl Default for FeedTiming {
 
 /// `arbostypes.L1MessageType_L2Message`: only these feed messages carry an L2 message payload.
 pub const L1_MESSAGE_TYPE_L2_MESSAGE: u8 = 3;
+
+/// Feed message kinds that never execute a contract call (end of block, chain init, ETH deposit,
+/// batch posting report). Any *other* non-L2 kind (L1-funded tx, retryable, ...) can call a curve
+/// without the call being visible to us, so the curve replica treats its block as uninspected.
+fn kind_cannot_call_contracts(kind: u8) -> bool {
+    matches!(kind, 6 | 11 | 12 | 13)
+}
+
+/// Cheap content fingerprint of a feed message (length plus head and tail of its payload): two
+/// deliveries of one block number with different fingerprints mean the sequencer reorganised.
+fn message_fingerprint(timestamp: u64, l2_msg: &str) -> u64 {
+    let b = l2_msg.as_bytes();
+    let mut h = (b.len() as u64 ^ timestamp.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for chunk in [&b[..b.len().min(32)], &b[b.len().saturating_sub(32)..]] {
+        for &byte in chunk {
+            h = (h ^ byte as u64).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+    h | 1 // 0 marks an empty slot
+}
+
+/// Fingerprints of recently won blocks, indexed by block number (lock-free, fixed size).
+struct ReorgSentinel {
+    tags: Box<[AtomicU64]>,
+    prints: Box<[AtomicU64]>,
+}
+
+impl ReorgSentinel {
+    const SLOTS: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            tags: (0..Self::SLOTS).map(|_| AtomicU64::new(u64::MAX)).collect(),
+            prints: (0..Self::SLOTS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record(&self, block: u64, print: u64) {
+        let i = block as usize % Self::SLOTS;
+        self.prints[i].store(print, Ordering::Relaxed);
+        self.tags[i].store(block, Ordering::Release);
+    }
+
+    /// True if `block` was recorded with a different fingerprint.
+    fn differs(&self, block: u64, print: u64) -> bool {
+        let i = block as usize % Self::SLOTS;
+        if self.tags[i].load(Ordering::Acquire) != block {
+            return false; // not recorded (yet), or already overwritten
+        }
+        let seen = self.prints[i].load(Ordering::Relaxed);
+        seen != 0 && seen != print
+    }
+}
 const L2_KIND_BATCH: u8 = 3;
 const L2_KIND_SIGNED_TX: u8 = 4;
 /// Nitro rejects L2 batches nested deeper than this (`parseL2Message`, depth >= 16).
@@ -164,16 +218,28 @@ pub struct L2Txs<'a> {
     depth: usize,
     root: Option<&'a [u8]>,
     too_deep: bool,
+    /// A message Nitro executes that is not a signed tx (delayed-inbox unsigned / contract tx,
+    /// compressed tx, unknown kind) was skipped: the block may call contracts we did not see.
+    hidden: bool,
 }
+
+/// L2 message kinds that execute nothing: non-mutating call, heartbeat.
+const L2_KIND_NONMUTATING_CALL: u8 = 2;
+const L2_KIND_HEARTBEAT: u8 = 6;
 
 impl<'a> L2Txs<'a> {
     pub fn new(message: &'a [u8]) -> Self {
-        Self { open: [&[]; MAX_L2_BATCH_DEPTH], depth: 0, root: Some(message), too_deep: false }
+        Self { open: [&[]; MAX_L2_BATCH_DEPTH], depth: 0, root: Some(message), too_deep: false, hidden: false }
     }
 
     /// A batch nested deeper than Nitro allows was met: the message is void as a whole.
     pub fn is_void(&self) -> bool {
         self.too_deep
+    }
+
+    /// Something executable that is not a signed tx was walked over so far.
+    pub fn has_hidden_calls(&self) -> bool {
+        self.hidden
     }
 
     /// Look at one message found at the current depth; yields the tx if it is one.
@@ -189,7 +255,11 @@ impl<'a> L2Txs<'a> {
                 }
                 None
             }
-            _ => None,
+            Some((&L2_KIND_NONMUTATING_CALL | &L2_KIND_HEARTBEAT, _)) | None => None,
+            Some(_) => {
+                self.hidden = true;
+                None
+            }
         }
     }
 }
@@ -222,6 +292,14 @@ impl<'a> Iterator for L2Txs<'a> {
         }
         None
     }
+}
+
+/// Every call this message makes is a signed tx we can read (or the message is void, which
+/// executes nothing). `false`: a delayed-inbox unsigned/contract tx or an unknown kind is in it.
+pub fn l2_message_is_fully_visible(message: &[u8]) -> bool {
+    let mut walk = L2Txs::new(message);
+    walk.by_ref().for_each(drop);
+    walk.is_void() || !walk.has_hidden_calls()
 }
 
 /// `false` if Nitro would void the whole message (batches nested beyond [`MAX_L2_BATCH_DEPTH`]).
@@ -400,6 +478,9 @@ pub struct StreamListener {
     fee_refresher_started: AtomicBool,
     pool_buy_tx: Option<mpsc::Sender<PoolBuy>>,
     timing: FeedTiming,
+    /// In-memory curve reserves for the risk engine (fed with every block, see `with_curve_mirror`).
+    curve_mirror: Option<Arc<CurveMirror>>,
+    sentinel: ReorgSentinel,
 }
 
 impl StreamListener {
@@ -430,7 +511,16 @@ impl StreamListener {
             fee_refresher_started: AtomicBool::new(false),
             pool_buy_tx: None,
             timing: FeedTiming::default(),
+            curve_mirror: None,
+            sentinel: ReorgSentinel::new(),
         }
+    }
+
+    /// Feed every block into `mirror`: trades on tracked curves are replayed in memory, so the risk
+    /// engine values positions without an `eth_call` per tick.
+    pub fn with_curve_mirror(mut self, mirror: Arc<CurveMirror>) -> Self {
+        self.curve_mirror = Some(mirror).filter(|m| m.policy().enabled);
+        self
     }
 
     /// Override the liveness timings (tests; production uses the defaults).
@@ -750,16 +840,19 @@ impl StreamListener {
                     last_rx = received_at;
                     match msg {
                         Message::Text(text) => {
-                            if self.config.is_engine_running() {
-                                let summary = self.handle_feed_frame(stats, text.as_bytes(), &mut b64_buf, received_at).await;
+                            let running = self.config.is_engine_running();
+                            // Paused intake still supervises open positions: their curves keep updating.
+                            if running || self.mirror_tracks_anything() {
+                                let summary = self.handle_feed_frame(stats, text.as_bytes(), &mut b64_buf, received_at, running).await;
                                 note_progress(&summary, &mut own_next_seq, &mut last_message, received_at);
                             } else {
                                 last_message = received_at;
                             }
                         }
                         Message::Binary(bin) => {
-                            if self.config.is_engine_running() {
-                                let summary = self.handle_feed_frame(stats, &bin, &mut b64_buf, received_at).await;
+                            let running = self.config.is_engine_running();
+                            if running || self.mirror_tracks_anything() {
+                                let summary = self.handle_feed_frame(stats, &bin, &mut b64_buf, received_at, running).await;
                                 note_progress(&summary, &mut own_next_seq, &mut last_message, received_at);
                             } else {
                                 last_message = received_at;
@@ -821,13 +914,20 @@ impl StreamListener {
         true
     }
 
+    fn mirror_tracks_anything(&self) -> bool {
+        self.curve_mirror.as_deref().is_some_and(|m| m.tracked_count() > 0)
+    }
+
     /// Decode one broadcaster frame and process each contained message in order.
+    ///
+    /// `running = false` (intake paused): only the curve replica sees the blocks.
     async fn handle_feed_frame(
         &self,
         stats: &FeedStats,
         frame: &[u8],
         b64_buf: &mut Vec<u8>,
         received_at: Instant,
+        running: bool,
     ) -> FrameSummary {
         stats.frames.fetch_add(1, Ordering::Relaxed);
         let parsed: FeedFrame<'_> = match serde_json::from_slice(frame) {
@@ -850,10 +950,21 @@ impl StreamListener {
             summary.max_seq = Some(summary.max_seq.map_or(seq, |s| s.max(seq)));
             // Every feed message produces exactly one L2 block.
             let block_number = self.config.feed_genesis_block.saturating_add(seq);
-            if !self.claim_feed_message(stats, seq, block_number) {
-                continue; // another feed (or the HTTP bridge) was first
-            }
             let incoming = m.message.message;
+            let timestamp = incoming.header.as_ref().map_or(0, |h| h.timestamp);
+            if !self.claim_feed_message(stats, seq, block_number) {
+                // Another feed (or the HTTP bridge) was first. The same block number with other
+                // content is a sequencer reorg: the curve replica must not trust what it applied.
+                if let Some(mirror) = self.curve_mirror.as_deref()
+                    && self.sentinel.differs(block_number, message_fingerprint(timestamp, &incoming.l2_msg))
+                {
+                    mirror.on_reorg(block_number);
+                }
+                continue;
+            }
+            if self.curve_mirror.is_some() {
+                self.sentinel.record(block_number, message_fingerprint(timestamp, &incoming.l2_msg));
+            }
             let carries_l2 = incoming.header.as_ref().is_none_or(|h| h.kind == L1_MESSAGE_TYPE_L2_MESSAGE);
             let stale = incoming.header.as_ref().is_some_and(|h| is_stale_block(h.timestamp, now_secs));
             if stale && self.stale_skipped.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
@@ -866,17 +977,23 @@ impl StreamListener {
             }
 
             b64_buf.clear();
-            let l2_bytes: &[u8] = if carries_l2
-                && !stale
+            // Too old to trade on, but its trades still moved the curves we hold: the replica sees
+            // a stale block too (nothing else does).
+            let mirror_wants = self.mirror_tracks_anything();
+            let act = running && !stale;
+            let decoded = carries_l2
+                && (act || mirror_wants)
                 && base64::engine::general_purpose::STANDARD
                     .decode_vec(incoming.l2_msg.as_bytes(), b64_buf)
-                    .is_ok()
-            {
-                b64_buf
+                    .is_ok();
+            let l2_bytes: &[u8] = if decoded { b64_buf } else { &[] };
+            // Could this block hold curve calls the replica did not get to see?
+            let inspected = if carries_l2 {
+                decoded || incoming.l2_msg.is_empty()
             } else {
-                &[]
+                incoming.header.as_ref().is_some_and(|h| kind_cannot_call_contracts(h.kind))
             };
-            self.process_l2_message(block_number, l2_bytes, received_at).await;
+            self.process_l2_message(block_number, l2_bytes, received_at, timestamp, inspected, running, act).await;
         }
         summary
     }
@@ -899,11 +1016,42 @@ impl StreamListener {
     }
 
     /// Process raw L2 sequencer bytes: release matured block queues & inspect transactions
-    async fn process_l2_message(&self, block_number: u64, l2_bytes: &[u8], start: Instant) {
+    ///
+    /// `inspected = false`: the block may hold contract calls that are not in `l2_bytes` (stale
+    /// backlog, undecodable payload, L1-originated message); the curve replica treats it as a gap.
+    ///
+    /// `act = false` (a stale block, or intake paused): only the curve replica looks at the
+    /// transactions; `running = false` also keeps the block from the Prysm scheduler.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_l2_message(
+        &self,
+        block_number: u64,
+        l2_bytes: &[u8],
+        start: Instant,
+        timestamp: u64,
+        inspected: bool,
+        running: bool,
+        act: bool,
+    ) {
 
         // 1. Notify Prysm Series Strategy of block progression (releases matured +3 block orders)
-        self.prysm_engine.process_new_block(block_number).await;
+        if running {
+            self.prysm_engine.process_new_block(block_number).await;
+        }
 
+        let mirror = self.curve_mirror.as_deref();
+        if let Some(m) = mirror {
+            // Delayed-inbox calls ride in kind-3 messages as unsigned txs we cannot read.
+            let visible = m.tracked_count() == 0 || l2_bytes.is_empty() || l2_message_is_fully_visible(l2_bytes);
+            m.begin_block(block_number, timestamp, inspected && visible);
+        }
+        self.walk_l2_message(block_number, l2_bytes, start, mirror, act).await;
+        if let Some(m) = mirror {
+            m.end_block(block_number);
+        }
+    }
+
+    async fn walk_l2_message(&self, block_number: u64, l2_bytes: &[u8], start: Instant, mirror: Option<&CurveMirror>, act: bool) {
         if l2_bytes.is_empty() {
             return;
         }
@@ -911,10 +1059,23 @@ impl StreamListener {
         if l2_bytes[0] == L2_KIND_BATCH && !l2_message_is_valid(l2_bytes) {
             return;
         }
+        if !act {
+            if let Some(m) = mirror {
+                for (tx_index, tx_raw) in L2Txs::new(l2_bytes).enumerate() {
+                    m.observe_raw_tx(block_number, tx_index as u32, tx_raw);
+                }
+            }
+            return;
+        }
 
         // 2. Walk the signed transactions of the Arbitrum Nitro L2 payload in place
         let prysm_enabled = self.config.is_prysm_enabled();
-        for tx_raw in L2Txs::new(l2_bytes) {
+        for (tx_index, tx_raw) in L2Txs::new(l2_bytes).enumerate() {
+            // Curve replica first: sells and calls through routers are not candidates below.
+            // Allocation-free; a single atomic load while no curve is tracked.
+            if let Some(m) = mirror {
+                m.observe_raw_tx(block_number, tx_index as u32, tx_raw);
+            }
             // Zero-copy prefilter: almost every tx in a block ends here without a heap touch.
             if !self.is_candidate_tx(tx_raw, prysm_enabled) {
                 continue;
@@ -988,7 +1149,20 @@ impl StreamListener {
                         }
                         let start = Instant::now();
                         self.prysm_engine.process_new_block(block_num).await;
-                        if is_stale_block(block.header.timestamp, unix_now_secs()) {
+                        let stale = is_stale_block(block.header.timestamp, unix_now_secs());
+                        let full = matches!(block.transactions, BlockTransactions::Full(_));
+                        let mirror = self.curve_mirror.as_deref();
+                        if let Some(m) = mirror {
+                            // An RPC block holds every executed tx (L1-originated ones included).
+                            m.begin_block(block_num, block.header.timestamp, full);
+                            if let BlockTransactions::Full(txs) = &block.transactions {
+                                for (i, tx) in txs.iter().enumerate() {
+                                    m.observe(block_num, i as u32, tx.inner.to(), tx.inner.value(), tx.inner.input());
+                                }
+                            }
+                            m.end_block(block_num);
+                        }
+                        if stale {
                             continue;
                         }
 

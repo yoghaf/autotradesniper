@@ -197,6 +197,15 @@ pub struct PositionTracker {
     /// Last exit that failed on-chain; the watchdog re-issues it with wider slippage.
     pub pending_exit: Option<ExitSignal>,
     pub exit_attempts: u32,
+    /// Last `balanceOf` poll while the entry fill is not seen yet (in-memory valuation path).
+    pub last_balance_poll: Option<Instant>,
+    /// Block of the feed-predicted (not yet chain-confirmed) valuation that set the current
+    /// trailing peak / activation; `None` once confirmed. A trailing exit verifies it first.
+    pub peak_block: Option<u64>,
+    /// Trailing peak / activation as of the last valuation the chain confirmed (RPC, or replica
+    /// state with no unconfirmed trade): what a refuted peak falls back to.
+    pub confirmed_peak_eth: f64,
+    pub confirmed_activated: bool,
 }
 
 impl PositionTracker {
@@ -232,6 +241,10 @@ impl PositionTracker {
             exit_preapproved: false,
             pending_exit: None,
             exit_attempts: 0,
+            last_balance_poll: None,
+            peak_block: None,
+            confirmed_peak_eth: entry_price_eth,
+            confirmed_activated: false,
         }
     }
 }

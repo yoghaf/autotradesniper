@@ -2,6 +2,7 @@ use autotradesniper::config::AppConfig;
 use autotradesniper::dispatcher::{BroadcasterPool, Dispatcher as EngineDispatcher, PresignPolicy};
 use autotradesniper::models::PrysmEngine;
 use autotradesniper::payload::DynamicFeeAdjuster;
+use autotradesniper::risk::curve_mirror::{CurveMirror, MirrorPolicy};
 use autotradesniper::risk::types::ExitVenue;
 use autotradesniper::risk::RiskManager;
 use autotradesniper::stream::{PoolBuy, StreamListener};
@@ -98,6 +99,20 @@ async fn main() -> Result<()> {
     let reader = Arc::new(BroadcasterPool::new(read_rpcs));
     let keep_warm_reader = reader.spawn_keep_warm(Duration::from_secs(20));
 
+    // In-memory curve reserves: the risk loop values Pons positions from the feed instead of an
+    // eth_call per position every 100 ms; exact pinned readings keep it honest.
+    let mirror_policy = MirrorPolicy::from_env();
+    info!(
+        "Curve replica: {} (stale after {:?}, gap grace {:?}, verify every {:?}, confirm exits: {})",
+        if mirror_policy.enabled { "on" } else { "off" },
+        mirror_policy.stale_after,
+        mirror_policy.gap_grace,
+        mirror_policy.verify_every,
+        mirror_policy.confirm_exits
+    );
+    let curve_mirror = Arc::new(CurveMirror::new(mirror_policy));
+    let mirror_worker = curve_mirror.spawn_anchor_worker(reader.clone());
+
     let risk_manager = Arc::new(
         RiskManager::new(
             config.clone(),
@@ -106,13 +121,15 @@ async fn main() -> Result<()> {
             exit_alert_tx,
         )
         .with_execution(broadcaster.clone(), fee_adjuster.clone())
-        .with_reader(reader.clone()),
+        .with_reader(reader.clone())
+        .with_curve_mirror(curve_mirror.clone()),
     );
 
     let prysm_engine = Arc::new(
         PrysmEngine::new(config.clone(), signal_tx.clone())
             .with_broadcaster(reader.clone())
-            .with_presigner(dispatcher.clone()),
+            .with_presigner(dispatcher.clone())
+            .with_curve_mirror(curve_mirror.clone()),
     );
     if let Ok(master_acc) = wallet_manager.derive_account(0).await {
         prysm_engine.set_master_address(master_acc.address).await;
@@ -122,7 +139,8 @@ async fn main() -> Result<()> {
     let (pool_buy_tx, mut pool_buy_rx) = mpsc::channel::<PoolBuy>(4096);
     let stream_listener = Arc::new(
         StreamListener::new(config.clone(), fee_adjuster.clone(), prysm_engine.clone(), signal_tx)
-            .with_pool_buy_sink(pool_buy_tx),
+            .with_pool_buy_sink(pool_buy_tx)
+            .with_curve_mirror(curve_mirror.clone()),
     );
     let risk_flow = risk_manager.clone();
     let flow_task = tokio::spawn(async move {
@@ -287,7 +305,7 @@ async fn main() -> Result<()> {
 
     info!("Shutting down engine gracefully.");
     config.is_engine_active.store(false, std::sync::atomic::Ordering::SeqCst);
-    for task in [stream_task, signal_task, risk_task, keep_warm, keep_warm_reader, flow_task] {
+    for task in [stream_task, signal_task, risk_task, keep_warm, keep_warm_reader, flow_task, mirror_worker] {
         task.abort();
     }
 

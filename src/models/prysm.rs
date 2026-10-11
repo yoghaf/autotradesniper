@@ -283,6 +283,8 @@ struct Inner {
     presigner: OnceLock<Arc<Dispatcher>>,
     /// One reserve refresh at a time.
     refreshing: AtomicBool,
+    /// In-memory curve replica: told each resolved launch's block (snipe-tax schedule).
+    mirror: OnceLock<Arc<crate::risk::curve_mirror::CurveMirror>>,
 }
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -310,6 +312,7 @@ impl PrysmEngine {
                 poll_ms: AtomicU64::new(RECEIPT_POLL_INTERVAL.as_millis() as u64),
                 presigner: OnceLock::new(),
                 refreshing: AtomicBool::new(false),
+                mirror: OnceLock::new(),
             }),
         }
     }
@@ -325,6 +328,13 @@ impl PrysmEngine {
     /// only broadcasts stored bytes. Without it the engine behaves as before.
     pub fn with_presigner(self, dispatcher: Arc<Dispatcher>) -> Self {
         let _ = self.inner.presigner.set(dispatcher);
+        self
+    }
+
+    /// Tell the in-memory curve replica when each resolved curve launched, so the launch-window
+    /// buy tax of its first seconds is replayed exactly.
+    pub fn with_curve_mirror(self, mirror: Arc<crate::risk::curve_mirror::CurveMirror>) -> Self {
+        let _ = self.inner.mirror.set(mirror);
         self
     }
 
@@ -1068,6 +1078,9 @@ impl Inner {
                 info!("🎉 [Prysm Receipt Resolved] Launch {:?}: Token {:?}, Curve {:?}", launch_tx, token, curve);
                 let meta = locked(&inner.launches_by_tx).get(&launch_tx).cloned();
                 if let Some(mut meta) = meta {
+                    if let Some(mirror) = inner.mirror.get() {
+                        mirror.note_launch(curve, meta.launch_block);
+                    }
                     meta.token_address = token;
                     meta.pool_address = curve;
                     let mut recent = locked(&inner.recent_launches);

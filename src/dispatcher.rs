@@ -92,11 +92,52 @@ pub fn send_raw_tx_body(raw_tx: &[u8]) -> bytes::Bytes {
     bytes::Bytes::from(body)
 }
 
+/// JSON-RPC requests issued by one pool, by method (shared by its clones).
+#[derive(Debug, Default)]
+pub struct RpcCallCounters {
+    pub eth_call: std::sync::atomic::AtomicU64,
+    pub receipts: std::sync::atomic::AtomicU64,
+    pub block_number: std::sync::atomic::AtomicU64,
+    pub other: std::sync::atomic::AtomicU64,
+}
+
+/// Point-in-time copy of [`RpcCallCounters`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RpcCallCounts {
+    pub eth_call: u64,
+    pub receipts: u64,
+    pub block_number: u64,
+    pub other: u64,
+}
+
+impl RpcCallCounters {
+    fn bump(&self, method: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match method {
+            "eth_call" => self.eth_call.fetch_add(1, Relaxed),
+            "eth_getTransactionReceipt" => self.receipts.fetch_add(1, Relaxed),
+            "eth_blockNumber" => self.block_number.fetch_add(1, Relaxed),
+            _ => self.other.fetch_add(1, Relaxed),
+        };
+    }
+
+    pub fn snapshot(&self) -> RpcCallCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        RpcCallCounts {
+            eth_call: self.eth_call.load(Relaxed),
+            receipts: self.receipts.load(Relaxed),
+            block_number: self.block_number.load(Relaxed),
+            other: self.other.load(Relaxed),
+        }
+    }
+}
+
 /// Pre-warmed Persistent Connection Multi-Endpoint RPC & Direct Sequencer Broadcaster Pool
 #[derive(Clone)]
 pub struct BroadcasterPool {
     client: reqwest::Client,
     send_rpcs: Arc<[String]>,
+    calls: Arc<RpcCallCounters>,
 }
 
 impl BroadcasterPool {
@@ -112,7 +153,12 @@ impl BroadcasterPool {
             .timeout(Duration::from_millis(2500))
             .build()
             .unwrap_or_default();
-        Self { client, send_rpcs: send_rpcs.into() }
+        Self { client, send_rpcs: send_rpcs.into(), calls: Arc::new(RpcCallCounters::default()) }
+    }
+
+    /// Read requests issued so far (one per logical call, not per endpoint raced).
+    pub fn call_counts(&self) -> RpcCallCounts {
+        self.calls.snapshot()
     }
 
     /// Periodic cheap `eth_chainId` to every endpoint so TLS sessions stay warm.
@@ -235,6 +281,7 @@ impl BroadcasterPool {
         if self.send_rpcs.is_empty() {
             return Err("no RPC endpoints configured".to_string());
         }
+        self.calls.bump(method);
         let body = bytes::Bytes::from(
             serde_json::to_vec(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}))
                 .map_err(|e| e.to_string())?,
@@ -276,6 +323,7 @@ impl BroadcasterPool {
         if self.send_rpcs.is_empty() {
             return Err("no RPC endpoints configured".to_string());
         }
+        self.calls.bump(method);
         let body = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -317,16 +365,36 @@ impl BroadcasterPool {
 
     /// Perform eth_call on a target contract
     pub async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.eth_call_at(to, data, None).await
+    }
+
+    /// `eth_call` against the state *after* block `block` (`None` = `latest`).
+    ///
+    /// Pinning the block is what lets a reading be merged with locally replayed trades: the caller
+    /// knows exactly which trades the result already contains. A node that has not imported the
+    /// block yet answers with an error (callers retry).
+    pub async fn eth_call_at(&self, to: Address, data: &[u8], block: Option<u64>) -> Result<Vec<u8>, String> {
+        let tag = match block {
+            Some(n) => serde_json::Value::String(format!("0x{:x}", n)),
+            None => serde_json::Value::String("latest".to_string()),
+        };
         let params = serde_json::json!([
             {
                 "to": format!("{:?}", to),
                 "data": alloy::hex::encode_prefixed(data)
             },
-            "latest"
+            tag
         ]);
         let res = self.call_rpc("eth_call", params).await?;
         let hex_str = res.as_str().ok_or_else(|| "eth_call result not a string".to_string())?;
         alloy::hex::decode(hex_str.trim_start_matches("0x")).map_err(|e| e.to_string())
+    }
+
+    /// `eth_blockNumber` of the first endpoint that answers.
+    pub async fn block_number(&self) -> Result<u64, String> {
+        let res = self.call_rpc("eth_blockNumber", serde_json::json!([])).await?;
+        let hex_str = res.as_str().ok_or_else(|| "eth_blockNumber result not a string".to_string())?;
+        u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
     }
 
     /// Query eth_getTransactionReceipt for a given transaction hash (first endpoint that has it)

@@ -12,10 +12,11 @@
 //!
 //! Part B fires a full entry (master + N carriers) at a local mock node and records when the node
 //! has *read* each request completely, relative to the instant the dispatch starts. It compares
-//!   * on-the-fly:      nothing prepared (the former behaviour),
-//!   * carriers staged: what the default Block +1 profile can prepare (the primary needs the curve
-//!                      address from T_LAUNCH, so it is signed in the hot path),
-//!   * fully staged:    carriers and primary prepared (an order that waits for a later block).
+//!   * on-the-fly: nothing prepared (the former behaviour),
+//!   * carriers staged: what the default Block +1 profile can prepare (the primary needs the
+//!     curve address from T_LAUNCH, so it is signed in the hot path),
+//!   * fully staged: carriers and primary prepared (an order that waits for a later block),
+//!
 //! with 2 and 4 runtime worker threads: signing N+1 transactions in parallel on fewer cores than
 //! transactions serialises, which is exactly the contention staging removes.
 //!

@@ -19,6 +19,10 @@ harness = false
 name = "presign_latency"
 harness = false
 
+[[bench]]
+name = "mirror_latency"
+harness = false
+
 [dependencies]
 alloy = { version = "2.5.0", features = [
     "full",

@@ -1,4 +1,5 @@
 pub mod anomaly_sensor;
+pub mod curve_mirror;
 pub mod evaluator;
 pub mod flow_rules;
 pub mod migration_rules;
@@ -11,6 +12,7 @@ use crate::dispatcher::BroadcasterPool;
 use crate::models::prysm::is_prysm_tag;
 use crate::payload::{self, CalldataPayloadBuilder, DynamicFeeAdjuster, PONS_ASSUMED_CREATOR_TAX_BPS, PONS_BASE_FEE_BPS};
 use crate::risk::anomaly_sensor::AnomalySensor;
+use crate::risk::curve_mirror::{adaptive_exit_slippage, CurveMirror, CurveSnapshot, StaleReason};
 use crate::risk::evaluator::RiskEvaluator;
 use crate::risk::flow_rules::FlowRules;
 use crate::risk::types::{
@@ -50,6 +52,10 @@ const MAX_EXIT_ROUNDS: u32 = 10;
 const SELL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(6);
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const V2_EXIT_DEADLINE_SECS: u64 = 120;
+/// `balanceOf` cadence while waiting for the entry fill on the in-memory valuation path.
+const BALANCE_POLL_EVERY: Duration = Duration::from_millis(250);
+/// Cadence of the valuation-source summary in the log.
+const MIRROR_REPORT_EVERY: Duration = Duration::from_secs(60);
 
 /// Aborts the wrapped task when dropped, so a cancelled or panicking supervisor cannot leak it.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -94,6 +100,8 @@ struct QuoteRequest {
     pool: Address,
     token: Option<Address>,
     tokens_held: U256,
+    /// In-memory path: read `balanceOf` this tick (throttled while the fill is not seen).
+    poll_balance: bool,
 }
 
 #[derive(Default)]
@@ -104,6 +112,21 @@ struct Quote {
     /// What selling `tokens_held` would return right now, after fees.
     value_wei: Option<U256>,
     reserves: Option<(U256, U256)>,
+    /// Valued from the in-memory curve replica (no `getReserves` call), on this state.
+    mirror: Option<CurveSnapshot>,
+}
+
+/// Exits decided from a price (as opposed to time, flow or operator input).
+fn is_price_driven(reason: ExitReason) -> bool {
+    matches!(
+        reason,
+        ExitReason::TrailingStop
+            | ExitReason::StopLoss
+            | ExitReason::PreGraduationGuard
+            | ExitReason::SecondaryPoolTrailing
+            | ExitReason::PrysmTargetMcap
+            | ExitReason::PrysmTargetStopLoss
+    )
 }
 
 /// Widen the slippage after a failed sell (e.g. 5% -> 15% -> 35% -> 75%, capped at 90%).
@@ -192,6 +215,34 @@ async fn fetch_quote(reader: &BroadcasterPool, owner: Address, req: &QuoteReques
     quote
 }
 
+/// One valuation on the in-memory replica: reserves and value are computed locally (no
+/// `getReserves`); RPC is only asked what the replica cannot know, i.e. the token of a curve
+/// (once) and our balance until the entry fill is seen (throttled). Once both are known this is
+/// pure arithmetic, no I/O and no await.
+async fn fetch_quote_mirrored(reader: Option<&BroadcasterPool>, owner: Option<Address>, req: &QuoteRequest, snap: CurveSnapshot) -> Quote {
+    let mut quote = Quote { token: req.token, reserves: Some(snap.reserves()), mirror: Some(snap), ..Quote::default() };
+    if quote.token.is_none()
+        && let Some(reader) = reader
+    {
+        quote.token = eth_call_within(reader, req.pool, &payload::PONS_PAIR_TOKEN_SELECTOR, QUOTE_TIMEOUT)
+            .await
+            .ok()
+            .and_then(|raw| CalldataPayloadBuilder::decode_address_output(&raw));
+    }
+    let Some(token) = quote.token else { return quote };
+    if req.tokens_held.is_zero()
+        && req.poll_balance
+        && let (Some(reader), Some(owner)) = (reader, owner)
+    {
+        quote.balance = erc20_balance(reader, token, owner, QUOTE_TIMEOUT).await.ok();
+    }
+    let held = if req.tokens_held.is_zero() { quote.balance.unwrap_or_default() } else { req.tokens_held };
+    if !held.is_zero() {
+        quote.value_wei = Some(snap.value_of(held));
+    }
+    quote
+}
+
 /// Comprehensive Multi-Layered Risk Management & Liquidation Engine
 pub struct RiskManager {
     config: AppConfig,
@@ -209,6 +260,12 @@ pub struct RiskManager {
     reader: Option<Arc<BroadcasterPool>>,
     fee_adjuster: Option<Arc<DynamicFeeAdjuster>>,
     exits_in_flight: Arc<Mutex<HashSet<String>>>,
+    /// In-memory curve reserves fed by the sequencer stream (optional; without it every valuation
+    /// is an RPC read, as before).
+    mirror: Option<Arc<CurveMirror>>,
+    /// `(owner, token, spender)` approvals seen sufficient or accepted (in-memory exit path only):
+    /// the first sell skips the allowance read; a sell that reverts checks it again.
+    approvals: Arc<Mutex<HashSet<(Address, Address, Address)>>>,
 }
 
 impl RiskManager {
@@ -230,7 +287,21 @@ impl RiskManager {
             reader: None,
             fee_adjuster: None,
             exits_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            mirror: None,
+            approvals: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Value Pons positions from the in-memory curve replica (see [`CurveMirror`]): the 100 ms loop
+    /// then reads no reserves over RPC while the replica is fresh, and is also woken by every
+    /// change of a held curve instead of waiting for its next tick.
+    pub fn with_curve_mirror(mut self, mirror: Arc<CurveMirror>) -> Self {
+        self.mirror = Some(mirror).filter(|m| m.policy().enabled);
+        self
+    }
+
+    pub fn curve_mirror(&self) -> Option<Arc<CurveMirror>> {
+        self.mirror.clone()
     }
 
     pub fn with_execution(
@@ -326,6 +397,11 @@ impl RiskManager {
             tracker.current_mcap_usd = 5000.0;
         }
 
+        if venue == ExitVenue::PonsCurve
+            && let Some(mirror) = &self.mirror
+        {
+            mirror.track(pool_address);
+        }
         self.trackers.write().await.insert(pos_id, tracker);
 
         pos
@@ -395,17 +471,22 @@ impl RiskManager {
     /// balance dropped) or the master holds nothing. On failure it stays open and the watchdog
     /// re-issues the exit with wider slippage; after `MAX_EXIT_ROUNDS` the operator is alerted.
     pub async fn execute_liquidation(&self, signal: ExitSignal) {
-        let Some(_flight) = ExitFlight::claim(&self.exits_in_flight, &signal.position_id) else {
+        let Some(flight) = ExitFlight::claim(&self.exits_in_flight, &signal.position_id) else {
             return; // an exit for this position is already running
         };
+        self.run_liquidation(signal, flight).await;
+    }
+
+    /// The exit itself; `_flight` keeps every other trigger of this position out until it ends.
+    async fn run_liquidation(&self, signal: ExitSignal, _flight: ExitFlight) {
         let target = {
             let trackers = self.trackers.read().await;
             trackers
                 .get(&signal.position_id)
                 .filter(|t| t.position.is_open)
-                .map(|t| (t.venue, t.token))
+                .map(|t| (t.venue, t.token, t.tokens_held))
         };
-        let Some((venue, token_hint)) = target else { return };
+        let Some((venue, token_hint, held_hint)) = target else { return };
 
         warn!(
             "🚨 LIQUIDATION TRIGGERED: [{}] Position: {} -> {}",
@@ -421,7 +502,7 @@ impl RiskManager {
             return;
         };
 
-        match self.liquidate_onchain(&broadcaster, &signal, venue, token_hint).await {
+        match self.liquidate_onchain(&broadcaster, &signal, venue, token_hint, held_hint).await {
             Ok(SellOutcome::Sold(hash)) => {
                 info!("🚀 LIQUIDATION CONFIRMED ON-CHAIN: {} (Tx: {})", signal.position_id, hash);
                 self.close_position(&signal.position_id, Some(hash), signal.reason.to_string()).await;
@@ -440,6 +521,7 @@ impl RiskManager {
         signal: &ExitSignal,
         venue: ExitVenue,
         token_hint: Option<Address>,
+        master_held: U256,
     ) -> Result<SellOutcome> {
         let reader = self.reader().context("no read pool")?;
         let token = match token_hint {
@@ -454,10 +536,13 @@ impl RiskManager {
 
         // Master and satellites (they also bought in MultiAccount mode) sell concurrently; the
         // sequencer is FIFO per arrival, and the accounts share no nonce.
+        // In-memory exit path: the master's balance was read when its fill was observed, so the
+        // first sell skips that read (a stale amount reverts, and the retry reads the balance).
+        let master_hint = (self.mirror.is_some() && !master_held.is_zero()).then_some(master_held);
         let (master_res, satellite_res) = tokio::join!(
-            self.liquidate_account(broadcaster, master, token, venue, signal),
+            self.liquidate_account(broadcaster, master, token, venue, signal, master_hint),
             futures_util::future::join_all(
-                satellites.iter().map(|acc| self.liquidate_account(broadcaster, acc, token, venue, signal))
+                satellites.iter().map(|acc| self.liquidate_account(broadcaster, acc, token, venue, signal, None))
             )
         );
         for (acc, res) in satellites.iter().zip(satellite_res) {
@@ -477,18 +562,33 @@ impl RiskManager {
         token: Address,
         venue: ExitVenue,
         signal: &ExitSignal,
+        known_balance: Option<U256>,
     ) -> Result<SellOutcome> {
         let reader = self.reader().context("no read pool")?;
-        let mut balance = erc20_balance(&reader, token, acc.address, EXIT_READ_TIMEOUT).await?;
+        // Zero reads before the first sell when the balance is known and the approval was accepted
+        // at fill time; a sell that reverts on either falls back to reading both.
+        let (mut balance, mut balance_fresh) = match known_balance {
+            Some(b) => (b, false),
+            None => (erc20_balance(&reader, token, acc.address, EXIT_READ_TIMEOUT).await?, true),
+        };
         if balance.is_zero() {
             return Ok(SellOutcome::NothingHeld);
         }
-        self.ensure_allowance(broadcaster, &reader, acc, token, signal.pool_address, balance).await?;
+        let spender = signal.pool_address;
+        let mut approval_checked = false;
+        if !self.approval_known(acc.address, token, spender) {
+            self.ensure_allowance(broadcaster, &reader, acc, token, spender, balance).await?;
+            approval_checked = true;
+        }
 
         let mut slippage = signal.slippage_percent;
         let mut last_err = anyhow!("no sell attempted");
         for attempt in 1..=SELL_ATTEMPTS {
-            match self.sell_once(broadcaster, &reader, acc, token, venue, signal.pool_address, balance, slippage, signal.is_emergency).await {
+            if attempt > 1 && !approval_checked {
+                self.ensure_allowance(broadcaster, &reader, acc, token, spender, balance).await?;
+                approval_checked = true;
+            }
+            match self.sell_once(broadcaster, &reader, acc, token, venue, signal.pool_address, balance, balance_fresh, slippage, signal.is_emergency).await {
                 Ok(hash) => return Ok(SellOutcome::Sold(hash)),
                 Err(e) => {
                     warn!(
@@ -501,11 +601,21 @@ impl RiskManager {
             slippage = escalate_slippage(slippage);
             // A sell that landed after its confirmation window may already have emptied it.
             balance = erc20_balance(&reader, token, acc.address, EXIT_READ_TIMEOUT).await?;
+            balance_fresh = true;
             if balance.is_zero() {
                 return Ok(SellOutcome::NothingHeld);
             }
         }
         Err(last_err)
+    }
+
+    /// Only with the curve replica: without it the exit path reads everything, as it always did.
+    fn approval_known(&self, owner: Address, token: Address, spender: Address) -> bool {
+        self.mirror.is_some() && self.approvals.lock().unwrap_or_else(|e| e.into_inner()).contains(&(owner, token, spender))
+    }
+
+    fn note_approval(&self, owner: Address, token: Address, spender: Address) {
+        self.approvals.lock().unwrap_or_else(|e| e.into_inner()).insert((owner, token, spender));
     }
 
     /// Approve `spender` for the token when the allowance does not cover `needed`.
@@ -526,12 +636,16 @@ impl RiskManager {
             .and_then(|raw| CalldataPayloadBuilder::decode_u256_output(&raw))
             .unwrap_or(U256::ZERO);
         if allowance >= needed {
+            self.note_approval(acc.address, token, spender);
             return Ok(());
         }
         info!("[{}] approving {:?} to spend {:?}", acc.role, spender, token);
         let approve = CalldataPayloadBuilder::build_erc20_approve_payload(spender, U256::MAX);
         let hash = self.send_tx(broadcaster, acc, token, approve).await.context("approve")?;
         info!("✅ [{}] approval accepted: {}", acc.role, hash);
+        // U256::MAX: never runs out. Sequenced FCFS ahead of any later sell from this account; if it
+        // still failed, that sell reverts and the retry reads the allowance again.
+        self.note_approval(acc.address, token, spender);
         Ok(())
     }
 
@@ -545,10 +659,29 @@ impl RiskManager {
         venue: ExitVenue,
         pool: Address,
         amount: U256,
+        amount_is_fresh: bool,
         slippage_percent: f64,
         emergency: bool,
     ) -> Result<String> {
-        let min_out = match quote_exit(reader, venue, pool, token, amount, EXIT_READ_TIMEOUT).await {
+        // In-memory quote when the replica vouches for the curve: no `getReserves` round trip
+        // between the trigger and the broadcast, and a tolerance that widens with recent volatility.
+        let mirrored = match (venue, &self.mirror) {
+            (ExitVenue::PonsCurve, Some(m)) => match m.read(&pool).fresh() {
+                // Confirmed state (just anchored, e.g. by the exit confirmation), or speed mode where
+                // the operator chose to act on predicted state anyway.
+                Some(snap) if snap.unconfirmed_trades == 0 || !m.policy().confirm_exits => Some(snap),
+                // Predicted trades on top: price the floor on an exact reading at the head instead,
+                // so an unconfirmed (possibly reverted) sell in the feed cannot lower it.
+                Some(snap) => m.confirm(pool, snap.as_of_block).await,
+                None => None,
+            },
+            _ => None,
+        };
+        let (quote, slippage_percent) = match mirrored {
+            Some(snap) => (Ok(snap.value_of(amount)), adaptive_exit_slippage(slippage_percent, snap.volatility_bps, emergency)),
+            None => (quote_exit(reader, venue, pool, token, amount, EXIT_READ_TIMEOUT).await, slippage_percent),
+        };
+        let min_out = match quote {
             Ok(expected) => {
                 let slip_bps = (slippage_percent.clamp(0.0, 99.0) * 100.0) as u64;
                 expected * U256::from(10_000 - slip_bps) / U256::from(10_000)
@@ -570,14 +703,38 @@ impl RiskManager {
             }
         };
         let hash = self.send_tx(broadcaster, acc, pool, calldata).await.context("sell")?;
-        self.confirm_sell(reader, &hash, acc, token, amount).await?;
+        if let Err(e) = self.confirm_sell(reader, &hash, acc, token, amount, amount_is_fresh).await {
+            // The floor came from a state the chain did not have (or the curve moved past it):
+            // re-anchor the replica before the next attempt quotes from it.
+            if venue == ExitVenue::PonsCurve
+                && let Some(m) = &self.mirror
+            {
+                m.invalidate(pool, StaleReason::ExitReverted);
+            }
+            return Err(e);
+        }
         Ok(hash)
     }
 
     /// "Accepted by an endpoint" is not "sold": a sell can revert on its minimum output.
-    async fn confirm_sell(&self, reader: &BroadcasterPool, hash: &str, acc: &TreasuryAccount, token: Address, amount_before: U256) -> Result<()> {
+    ///
+    /// The receipt decides. Without one in time, the balance does: lower than a balance read just
+    /// before the sell (`before_is_fresh`), or zero when the amount sold came from an older reading
+    /// (a stale amount must never let a reverted sell pass as a sale).
+    async fn confirm_sell(
+        &self,
+        reader: &BroadcasterPool,
+        hash: &str,
+        acc: &TreasuryAccount,
+        token: Address,
+        amount_before: U256,
+        before_is_fresh: bool,
+    ) -> Result<()> {
         let tx_hash = B256::from_str(hash).context("sell hash")?;
         let deadline = Instant::now() + SELL_CONFIRM_TIMEOUT;
+        // A new feed block means the one holding our sell is sealed: ask for the receipt right then
+        // instead of at the next poll tick.
+        let mut blocks = self.mirror.as_ref().map(|m| m.subscribe_head());
         while Instant::now() < deadline {
             if let Ok(Some(receipt)) = reader.get_transaction_receipt(tx_hash).await {
                 return match receipt.get("status").and_then(|s| s.as_str()) {
@@ -586,11 +743,22 @@ impl RiskManager {
                     None => Err(anyhow!("sell {} receipt has no status", hash)),
                 };
             }
-            tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+            let mut feed_gone = false;
+            match blocks.as_mut() {
+                Some(rx) => tokio::select! {
+                    _ = tokio::time::sleep(RECEIPT_POLL_INTERVAL) => {}
+                    changed = rx.changed() => feed_gone = changed.is_err(),
+                },
+                None => tokio::time::sleep(RECEIPT_POLL_INTERVAL).await,
+            }
+            if feed_gone {
+                blocks = None;
+            }
         }
         // No receipt in time: judge by the balance.
         let now = erc20_balance(reader, token, acc.address, EXIT_READ_TIMEOUT).await?;
-        anyhow::ensure!(now < amount_before, "sell {} unconfirmed and balance unchanged", hash);
+        let sold = if before_is_fresh { now < amount_before } else { now.is_zero() };
+        anyhow::ensure!(sold, "sell {} unconfirmed and balance not reduced", hash);
         Ok(())
     }
 
@@ -672,6 +840,12 @@ impl RiskManager {
         {
             let mut trackers = self.trackers.write().await;
             if let Some(tracker) = trackers.get_mut(position_id) {
+                if tracker.position.is_open
+                    && tracker.venue == ExitVenue::PonsCurve
+                    && let (Some(mirror), Ok(pool)) = (&self.mirror, Address::from_str(&tracker.position.pool_address))
+                {
+                    mirror.untrack(pool);
+                }
                 tracker.position.is_open = false;
                 tracker.position.exit_reason = Some(exit_reason.clone());
                 tracker.position.exit_tx_hash = exit_tx_hash.clone();
@@ -751,9 +925,31 @@ impl RiskManager {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         // Burst catch-up after a stall would evaluate stale state several times back-to-back.
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // With the curve replica, every change of a held curve (a trade in a feed block, an exact
+        // reading) also wakes the loop: the reaction time to a dump is the feed's, not the tick's.
+        let mut changes = self.mirror.as_ref().map(|m| m.subscribe_changes());
+        let mut last_report = Instant::now();
+        let mut fresh_reads = 0u64;
+        let mut rpc_reads = 0u64;
 
         loop {
-            interval.tick().await;
+            let mut mirror_gone = false;
+            let on_tick = match changes.as_mut() {
+                Some(rx) => tokio::select! {
+                    _ = interval.tick() => true,
+                    changed = rx.changed() => {
+                        mirror_gone = changed.is_err();
+                        false
+                    }
+                },
+                None => {
+                    interval.tick().await;
+                    true
+                }
+            };
+            if mirror_gone {
+                changes = None;
+            }
             let mut config = self.risk_config.read().await.clone();
             config.prysm_target_mcap_usd = *self.config.prysm_target_mcap_usd.read().await;
             config.prysm_target_stop_loss_percent = *self.config.prysm_target_stop_loss_percent.read().await;
@@ -777,15 +973,23 @@ impl RiskManager {
                         }
                     });
                 }
+                let now = Instant::now();
                 trackers
-                    .values()
+                    .values_mut()
                     .filter_map(|t| {
+                        let poll_balance = on_tick
+                            && t.tokens_held.is_zero()
+                            && t.last_balance_poll.is_none_or(|at| now.saturating_duration_since(at) >= BALANCE_POLL_EVERY);
+                        if poll_balance {
+                            t.last_balance_poll = Some(now);
+                        }
                         Some(QuoteRequest {
                             id: t.position.id.clone(),
                             venue: t.venue,
                             pool: Address::from_str(&t.position.pool_address).ok()?,
                             token: t.token,
                             tokens_held: t.tokens_held,
+                            poll_balance,
                         })
                     })
                     .collect()
@@ -794,20 +998,23 @@ impl RiskManager {
                 continue;
             }
 
-            // 2. Quotes with no lock held, all positions concurrently.
+            // 2. Quotes with no lock held, all positions concurrently. A Pons position whose curve
+            //    the replica vouches for is valued in memory; anything else reads RPC, but only on
+            //    the 100 ms tick (a replica wake never adds RPC traffic).
             let owner = self.wallet_manager.get_master_account().await.ok().map(|a| a.address);
-            let quotes: HashMap<String, Quote> = match (self.reader(), owner) {
-                (Some(reader), Some(owner)) => {
-                    let fetched = futures_util::future::join_all(requests.iter().map(|r| fetch_quote(&reader, owner, r))).await;
-                    requests.into_iter().map(|r| r.id).zip(fetched).collect()
-                }
-                _ => HashMap::new(),
-            };
+            let reader = self.reader();
+            let fetched = futures_util::future::join_all(requests.iter().map(|r| self.quote_for(reader.as_deref(), owner, r, on_tick))).await;
+            let quotes: HashMap<String, Quote> =
+                requests.into_iter().map(|r| r.id).zip(fetched).filter_map(|(id, q)| q.map(|q| (id, q))).collect();
+            for q in quotes.values() {
+                if q.mirror.is_some() { fresh_reads += 1 } else { rpc_reads += 1 }
+            }
 
             // 3. Apply + evaluate (short lock, no await inside).
             let now = Instant::now();
             let in_flight = self.exits_in_flight.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let mut signals = Vec::new();
+            let mut to_confirm = Vec::new();
             let mut preapprove = Vec::new();
             {
                 let mut trackers = self.trackers.write().await;
@@ -818,6 +1025,10 @@ impl RiskManager {
                         continue;
                     }
                     let quote = quotes.get(&tracker.position.id);
+                    // A replica wake re-evaluates only the positions it can value.
+                    if !on_tick && quote.is_none() {
+                        continue;
+                    }
                     let value_eth = quote.and_then(|q| Self::apply_quote(tracker, q, &mut preapprove));
 
                     // Failed exits are retried by the watchdog (5 s cadence), not every 100 ms.
@@ -849,10 +1060,13 @@ impl RiskManager {
                         continue;
                     }
 
+                    // A valuation that rests on feed-predicted trades (not yet confirmed by an exact reading).
+                    let unconfirmed = quote.and_then(|q| q.mirror).filter(|s| s.unconfirmed_trades > 0);
+                    let (peak_before, activated_before) = (tracker.highest_price_eth, tracker.high_watermark_activated);
                     let signal = match value_eth {
                         Some(value) => {
                             let block_event = BlockEvent {
-                                block_number: 0,
+                                block_number: quote.and_then(|q| q.mirror).map_or(0, |s| s.as_of_block),
                                 timestamp_secs: 0,
                                 spot_price_eth: value,
                                 curve_capacity_percent: tracker.curve_capacity_percent,
@@ -865,8 +1079,43 @@ impl RiskManager {
                         // time-based layers. The former fallback fed random prices to Layer 1.
                         None => RiskEvaluator::evaluate_time_rules(tracker, now, &config),
                     };
+                    if value_eth.is_some()
+                        && (tracker.highest_price_eth != peak_before || tracker.high_watermark_activated != activated_before)
+                    {
+                        // Remember whether the trailing peak rests on unconfirmed trades.
+                        tracker.peak_block = unconfirmed.map(|s| s.as_of_block);
+                        if unconfirmed.is_none() {
+                            tracker.confirmed_peak_eth = tracker.highest_price_eth;
+                            tracker.confirmed_activated = tracker.high_watermark_activated;
+                        }
+                    }
+                    // A drift-free exact reading at or after the peak's block proves the trades it
+                    // was built on: the peak is confirmed.
+                    if let (Some(pb), Some(snap)) = (tracker.peak_block, quote.and_then(|q| q.mirror))
+                        && snap.validated_from < pb
+                        && pb <= snap.validated_through
+                    {
+                        tracker.peak_block = None;
+                        tracker.confirmed_peak_eth = tracker.highest_price_eth;
+                        tracker.confirmed_activated = tracker.high_watermark_activated;
+                    }
                     if let Some(signal) = signal {
-                        signals.push(signal);
+                        // A price move made of feed-predicted trades is checked against the chain
+                        // before we sell on it (a sell in the feed can still revert on-chain), and a
+                        // trailing exit also checks the peak it is measured from (a reverted buy in
+                        // the feed would otherwise inflate it).
+                        let confirm_on = self.mirror.as_ref().is_some_and(|m| m.policy().confirm_exits);
+                        let check_current = unconfirmed.is_some();
+                        let check_peak = signal.reason == ExitReason::TrailingStop && tracker.peak_block.is_some();
+                        if confirm_on && is_price_driven(signal.reason) && (check_current || check_peak) {
+                            // Claimed here, under the trackers lock: the watchdog (which reads the same
+                            // unconfirmed PnL) cannot slip an unconfirmed exit in before the check.
+                            if let Some(flight) = ExitFlight::claim(&self.exits_in_flight, &tracker.position.id) {
+                                to_confirm.push((signal, tracker.clone(), unconfirmed.map(|s| s.as_of_block), config.clone(), flight));
+                            }
+                        } else {
+                            signals.push(signal);
+                        }
                     }
 
                     // Keep positions in sync
@@ -886,6 +1135,175 @@ impl RiskManager {
             for signal in signals {
                 self.spawn_liquidation(signal);
             }
+            for (signal, tracker, block, config, flight) in to_confirm {
+                self.spawn_confirmed_liquidation(signal, tracker, block, config, flight);
+            }
+
+            if let Some(mirror) = &self.mirror
+                && last_report.elapsed() >= MIRROR_REPORT_EVERY
+            {
+                let m = mirror.stats();
+                let calls = reader.as_ref().map(|r| r.call_counts()).unwrap_or_default();
+                info!(
+                    "📡 [mirror] valuations: {} in memory, {} via RPC | anchors {} ok / {} failed, drift corrections {} (max {} ppb), \
+                     calibrations {}, gaps {}, indirect {}, reorgs {}, confirmations {} (phantom rejected {}) | read-pool eth_call total {}",
+                    fresh_reads, rpc_reads, m.anchors_ok, m.anchors_failed, m.drift_corrections, m.max_drift_ppb, m.calibrations,
+                    m.gaps, m.indirect_touches, m.reorgs, m.exit_confirmations, m.phantom_exits_rejected, calls.eth_call
+                );
+                last_report = Instant::now();
+                fresh_reads = 0;
+                rpc_reads = 0;
+            }
+        }
+    }
+
+    /// Valuation of one position: in memory when the replica vouches for its curve, RPC otherwise
+    /// (only on a timer tick). `None` = no valuation this round.
+    async fn quote_for(&self, reader: Option<&BroadcasterPool>, owner: Option<Address>, req: &QuoteRequest, on_tick: bool) -> Option<Quote> {
+        if req.venue == ExitVenue::PonsCurve
+            && let Some(snap) = self.mirror.as_ref().and_then(|m| m.read(&req.pool).fresh())
+        {
+            return Some(fetch_quote_mirrored(reader, owner, req, snap).await);
+        }
+        if !on_tick {
+            return None;
+        }
+        match (reader, owner) {
+            (Some(reader), Some(owner)) => Some(fetch_quote(reader, owner, req).await),
+            _ => None,
+        }
+    }
+
+    /// Price-driven exit computed on feed-predicted state: re-evaluate it on exact readings pinned
+    /// to the blocks it rests on, and only sell if the chain agrees.
+    ///
+    /// * `at_block = Some(b)`: the current valuation came from unconfirmed trades; read block `b`.
+    /// * a trailing exit whose peak came from unconfirmed trades (`peak_block`): read that block
+    ///   too, and lower the peak to the value the chain really had there if the feed overstated it.
+    ///
+    /// The confirmed numbers are written back into the live tracker *before* the single-flight
+    /// claim (taken by the caller) is released, so neither the loop nor the watchdog act on the
+    /// unconfirmed figures afterwards.
+    fn spawn_confirmed_liquidation(&self, signal: ExitSignal, mut tracker: PositionTracker, at_block: Option<u64>, config: RiskConfig, flight: ExitFlight) {
+        let manager = self.clone_for_liquidation();
+        tokio::spawn(async move {
+            let Some(mirror) = manager.mirror.clone() else { return };
+            let pool = signal.pool_address;
+            let held = tracker.tokens_held;
+            let mut fail_open = false;
+
+            // 1. The current value.
+            if let Some(block) = at_block {
+                match mirror.confirm(pool, block).await {
+                    Some(snap) => {
+                        tracker.current_price_eth = f64::from(snap.value_of(held)) / 1e18;
+                        Self::fold_reserves(&mut tracker, snap.reserves());
+                    }
+                    None => fail_open = true,
+                }
+            }
+            // 2. The trailing peak, whatever the trigger: the re-evaluation below may itself
+            //    return a trailing exit measured from it.
+            if !fail_open && let Some(peak_block) = tracker.peak_block {
+                let real = mirror.reserves_at(pool, peak_block).await.map(|(eth, tok)| {
+                    let bps = mirror.snapshot_any(&pool).map_or(crate::risk::curve_mirror::DEFAULT_TRADE_BPS, |s| s.exit_fee_bps);
+                    f64::from(CalldataPayloadBuilder::calculate_pons_eth_out(eth, tok, held, bps, 0)) / 1e18
+                });
+                match real {
+                    Some(real) if real >= tracker.highest_price_eth => {} // the peak was real
+                    _ => {
+                        // Refuted (or unverifiable): back to what the chain did confirm. Never below
+                        // a peak confirmed earlier, never disarming a stop armed on confirmed values.
+                        let entry = tracker.entry_price_eth;
+                        let peak = real.unwrap_or(0.0).max(tracker.confirmed_peak_eth);
+                        warn!(
+                            "{}: trailing peak {:.6} ETH (block {}) not confirmed by the chain ({}); using {:.6} ETH",
+                            signal.position_id,
+                            tracker.highest_price_eth,
+                            peak_block,
+                            real.map_or("no reading".to_string(), |r| format!("{:.6} ETH there", r)),
+                            peak
+                        );
+                        tracker.highest_price_eth = peak;
+                        tracker.high_watermark_activated = tracker.confirmed_activated
+                            || (entry > 0.0 && (peak - entry) / entry * 100.0 >= config.trail_activate_percent);
+                    }
+                }
+                tracker.peak_block = None;
+                tracker.confirmed_peak_eth = tracker.highest_price_eth;
+                tracker.confirmed_activated = tracker.high_watermark_activated;
+            }
+
+            let verdict = if fail_open {
+                warn!(
+                    "{}: exact reading at block {:?} unavailable; exiting on the in-memory valuation ({})",
+                    signal.position_id, at_block, signal.reason
+                );
+                Some(signal.clone())
+            } else {
+                let value = tracker.current_price_eth;
+                let event = BlockEvent {
+                    block_number: at_block.unwrap_or_default(),
+                    timestamp_secs: 0,
+                    spot_price_eth: value,
+                    curve_capacity_percent: tracker.curve_capacity_percent,
+                    token_address: tracker.token.unwrap_or_default(),
+                };
+                let pool_quote = tracker.is_migrated_to_pool.then_some(value);
+                let verdict = RiskEvaluator::evaluate_block_event(&mut tracker, &event, pool_quote, Instant::now(), &config);
+                manager.write_back_confirmed(&tracker).await;
+                verdict
+            };
+            match verdict {
+                Some(confirmed) => manager.run_liquidation(confirmed, flight).await,
+                None => {
+                    mirror.note_phantom_rejected();
+                    warn!(
+                        "{}: {} not confirmed by the chain (block {:?}): the feed-predicted move did not happen \
+                         (reverted trades?). Position kept, valuation corrected.",
+                        signal.position_id, signal.reason, at_block
+                    );
+                    drop(flight);
+                }
+            }
+        });
+    }
+
+    /// Copy a confirmed valuation (and corrected trailing state) into the live tracker and position.
+    async fn write_back_confirmed(&self, confirmed: &PositionTracker) {
+        let id = &confirmed.position.id;
+        {
+            let mut trackers = self.trackers.write().await;
+            if let Some(t) = trackers.get_mut(id) {
+                t.current_price_eth = confirmed.current_price_eth;
+                t.highest_price_eth = confirmed.highest_price_eth;
+                t.high_watermark_activated = confirmed.high_watermark_activated;
+                t.peak_block = confirmed.peak_block;
+                t.confirmed_peak_eth = confirmed.confirmed_peak_eth;
+                t.confirmed_activated = confirmed.confirmed_activated;
+                t.curve_capacity_percent = confirmed.curve_capacity_percent;
+                t.current_mcap_usd = confirmed.current_mcap_usd;
+                t.position.pnl_percent = confirmed.position.pnl_percent;
+                t.position.current_eth_value = confirmed.position.current_eth_value;
+                t.position.current_mcap_usd = confirmed.position.current_mcap_usd;
+            }
+        }
+        let mut positions = self.positions.write().await;
+        if let Some(p) = positions.iter_mut().find(|p| &p.id == id) {
+            p.pnl_percent = confirmed.position.pnl_percent;
+            p.current_eth_value = confirmed.position.current_eth_value;
+            p.current_mcap_usd = confirmed.position.current_mcap_usd;
+        }
+    }
+
+    /// Market cap and curve capacity from reserves.
+    fn fold_reserves(tracker: &mut PositionTracker, (eth_res, tok_res): (U256, U256)) {
+        tracker.curve_capacity_percent = payload::pons_curve_capacity_percent(eth_res);
+        if let Some(mcap_eth) = payload::pons_mcap_eth(eth_res, tok_res) {
+            let mcap_usd = mcap_eth * payload::eth_usd_reference();
+            tracker.current_mcap_usd = mcap_usd;
+            tracker.position.current_mcap_usd = Some(mcap_usd);
+            tracker.mcap_from_chain = true;
         }
     }
 
@@ -907,14 +1325,8 @@ impl RiskManager {
             tracker.exit_preapproved = true;
             preapprove.push((token, spender));
         }
-        if let Some((eth_res, tok_res)) = quote.reserves {
-            tracker.curve_capacity_percent = payload::pons_curve_capacity_percent(eth_res);
-            if let Some(mcap_eth) = payload::pons_mcap_eth(eth_res, tok_res) {
-                let mcap_usd = mcap_eth * payload::eth_usd_reference();
-                tracker.current_mcap_usd = mcap_usd;
-                tracker.position.current_mcap_usd = Some(mcap_usd);
-                tracker.mcap_from_chain = true;
-            }
+        if let Some(reserves) = quote.reserves {
+            Self::fold_reserves(tracker, reserves);
         }
         if tracker.tokens_held.is_zero() {
             return None;
@@ -936,6 +1348,8 @@ impl RiskManager {
             reader: self.reader.clone(),
             fee_adjuster: self.fee_adjuster.clone(),
             exits_in_flight: self.exits_in_flight.clone(),
+            mirror: self.mirror.clone(),
+            approvals: self.approvals.clone(),
         }
     }
 

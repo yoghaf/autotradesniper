@@ -159,6 +159,51 @@ flowchart TD
 
 ---
 
+## 🪞 IN-MEMORY CURVE REPLICA (ZERO-RPC RISK LOOP)
+
+Loop risiko 100 ms dulu memanggil `eth_call getReserves()` per posisi per tick (**600/menit/posisi**, 50-200 ms, rawan 429).
+Kini posisi Pons dinilai dari replika reserve kurva di memori (`src/risk/curve_mirror.rs`).
+
+**Sumber data.** Feed sequencer Nitro hanya membawa transaksi, bukan event log. Setiap `buy`/`sell` ke kurva yang dipegang
+disimulasikan dari calldata-nya dengan matematika integer yang sama dengan jalur RPC (fee + creator tax keluar dari reserve,
+`eth * tok` konstan), termasuk prediksi revert pada `minOut`. State = **anchor** (`getReserves()` yang di-pin ke nomor blok
+eksplisit, bukan `latest`) + **jurnal** trade sesudah blok itu, diurutkan `(blok, indeks)`, sehingga urutan kedatangan dari
+feed yang berlomba tidak mengubah hasil.
+
+**Kapan RPC tetap dipakai (fallback transparan).** Baca mirror hanya `Fresh` bila kurva terjangkar, tidak dicurigai, feed hidup
+(ada blok dalam `MIRROR_STALE_AFTER_MS`; setiap blok yang tidak menyentuh kurva = bukti "tidak berubah"), dan tidak ada blok
+hilang di atas anchor yang melewati `MIRROR_GAP_GRACE_MS`. Selain itu loop membaca RPC seperti sebelumnya.
+
+| Kondisi | Penanganan |
+|---|---|
+| Blok hilang (gap) | ditunggu selama grace (feed lain bisa mengisi), lalu dibaca ulang tepat di blok sesudah gap |
+| Blok tak terbaca (backlog basi, payload rusak, pesan L1/delayed-inbox tanpa tx bertanda tangan) | dianggap gap seketika |
+| Blok datang tidak berurutan | jurnal diputar ulang dari anchor |
+| Reorg (feed mengirim blok yang sama dengan isi berbeda) | jurnal dari blok itu dibuang, baca ulang di head |
+| Panggilan yang tidak bisa didekode (router/aggregator yang menyebut alamat kurva, selector lain) | kurva dicurigai sampai dibaca ulang |
+| Prediksi revert terlalu tipis (< 10 bps), angka calldata yang overflow | kurva dicurigai; sell > total supply = revert pasti |
+| Penomoran blok feed vs RPC (`FEED_GENESIS_BLOCK`) | dicek dengan selisih head dan, persis, dengan hash tx sampel di blok yang sama; salah = mirror mati, semua ke RPC |
+| Verifikasi berkala | baca ulang tiap `MIRROR_VERIFY_SECS`; selisih prediksi dicatat (ppb), fee + creator tax dikalibrasi dari dua anchor |
+
+**Exit.** Loop dibangunkan setiap kali kurva yang dipegang berubah (bukan hanya tiap 100 ms). Exit berbasis harga yang dihitung
+dari trade prediksi dikonfirmasi dulu dengan satu baca terjangkar di blok pemicu (`MIRROR_CONFIRM_EXITS`), karena `sell` di feed
+masih bisa revert (sell tanpa saldo, buy kehabisan gas): dump/pump palsu tidak memicu jual, dan peak trailing yang dibangun dari
+trade palsu dikoreksi. Floor `minOut` dihitung dari state terkonfirmasi dengan slippage adaptif (volatilitas terbaru), balance &
+approval master tidak dibaca ulang sebelum jual pertama, dan posisi **hanya ditutup setelah receipt status 1** (tanpa receipt:
+saldo harus turun dari bacaan segar, atau nol bila jumlahnya dari bacaan lama). Sell yang revert membuat mirror dibaca ulang.
+
+**Angka** (`cargo test --test curve_mirror`, `cargo bench --bench mirror_latency`, container 2 core):
+- `getReserves`: **600/menit/posisi → 0** di antara verifikasi; dengan default (verifikasi 30 dtk) ≈ 2/menit per kurva
+  + 1 `eth_blockNumber`/menit + 1 baca per exit yang dikonfirmasi (**-99,7%**).
+- Baca mirror + valuasi posisi: **≈ 153 ns** median (p99 < 0,6 µs). Biaya feed per tx: 3 ns tanpa kurva dilacak, ≈ 110-250 ns
+  dengan kurva dilacak, ≈ 0,35 µs untuk trade yang diterapkan.
+
+**Asumsi yang perlu Anda verifikasi terhadap kontrak Pons V2:** fee + creator tax keluar dari reserve (invarian `eth*tok`
+diuji di setiap anchor; bila patah, log memperingatkan dan kurva diverifikasi tiap 2 dtk), jadwal snipe tax 9900/618/19 bps per
+detik sejak launch, dan rumus kapasitas graduation `(E - 1,68)/4,2 ETH` (V2 lulus saat kurva habis terjual).
+
+---
+
 ## 🧊 AOT PRE-SIGNING PIPELINE (ZERO-CRYPTO HOT PATH)
 
 Tanda tangan ECDSA + keccak atas tx berkalldata 94,5 KB (≈ **0,70 ms per tx** di rilis: 0,29 ms signature hash + 0,09 ms
@@ -249,11 +294,13 @@ autotradesniper/
 ├── README.md                   # Dokumentasi sistem & laporan audit performa
 ├── benches/
 │   ├── latency_benchmark.rs    # Criterion microsecond latency benchmark suite
-│   └── presign_latency.rs      # Pre-signed vs on-the-fly: biaya per tx & latensi dispatch end-to-end
+│   ├── presign_latency.rs      # Pre-signed vs on-the-fly: biaya per tx & latensi dispatch end-to-end
+│   └── mirror_latency.rs       # Biaya baca mirror kurva & biaya per tx di jalur feed
 ├── tests/
 │   ├── risk_tests.rs           # Test suite komprehensif 6 lapis pertahanan risk engine
 │   ├── prysm_tests.rs          # Test suite komprehensif Pola A/B/C, Guardrails & Exit Mode Seri Prysm
-│   └── presign_pipeline.rs     # Regresi AOT pre-signing: keabsahan paket, pembatalan aman, nonce lease, eksekusi instan
+│   ├── presign_pipeline.rs     # Regresi AOT pre-signing: keabsahan paket, pembatalan aman, nonce lease, eksekusi instan
+│   └── curve_mirror.rs         # Regresi mirror kurva: sinkronisasi, celah/reorg, loop risiko tanpa RPC, exit berbasis receipt
 └── src/
     ├── lib.rs                  # Root library & MinGW compatibility symbols
     ├── main.rs                 # Entry point & Tokio concurrent task supervisor
@@ -265,6 +312,8 @@ autotradesniper/
     ├── dispatcher.rs           # Direct Sequencer BroadcasterPool & Pipelined Parallel Signing
     ├── dispatcher/
     │   └── presign.rs          # AOT pre-signing: StagedBatch (state machine CAS), StagingBook, PresignPolicy
+    ├── risk/
+    │   └── curve_mirror.rs     # Replika reserve kurva in-memory (anchor + jurnal), dipakai loop risiko
     ├── models/
     │   ├── mod.rs              # Entry point modul strategi mandiri
     │   └── prysm.rs            # Fast-Path Pattern Evaluator "Seri Prysm" (Pola A/B/C + Guardrails)
@@ -331,7 +380,7 @@ flowchart LR
 
 ## 🔨 PANDUAN PENGGUNAAN & PENGUJIAN
 
-### 1. Menjalankan Seluruh Unit & Integration Test (148 Pengujian)
+### 1. Menjalankan Seluruh Unit & Integration Test (184 Pengujian)
 ```powershell
 cargo test
 ```
