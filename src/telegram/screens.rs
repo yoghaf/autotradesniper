@@ -8,7 +8,7 @@
 use crate::models::prysm::PrysmMatchReport;
 pub use crate::telegram::control::PrysmCounts;
 use crate::telegram::control::{
-    ApplyReport, BreakerOutcome, FeePreset, PositionView, PrysmView, SettingsView, SystemSnapshot, CARRIER_CHOICES,
+    ApplyReport, BreakerOutcome, FeePreset, PositionView, PrysmView, SettingsView, SystemSnapshot, CARRIER_CHOICES, TRAILING_CHOICES,
 };
 use crate::telegram::html::escape as e;
 use crate::types::{DispatchReport, ExecutionMode, GasRebalanceResult, Position, TradeSignal};
@@ -88,14 +88,16 @@ pub fn main_menu_keyboard(is_running: bool, breaker: Option<u64>) -> InlineKeybo
 }
 
 pub fn settings_keyboard(view: &SettingsView) -> InlineKeyboardMarkup {
-    settings_keyboard_parts(view.mode, view.carriers, view.preset, view.padding_on)
+    settings_keyboard_parts(view.mode, view.carriers, view.preset, view.padding_on, Some(view.trailing_stop_percent))
 }
 
+/// `trailing`: the current trailing-stop distance (marks its button), `None` when unknown.
 pub fn settings_keyboard_parts(
     mode: ExecutionMode,
     carriers: usize,
     preset: Option<FeePreset>,
     padding_on: bool,
+    trailing: Option<f64>,
 ) -> InlineKeyboardMarkup {
     let mark = |on: bool, label: String| if on { format!("{} ✅", label) } else { label };
     // The target mode is in the callback: a repeated or stale press cannot flip it back.
@@ -118,6 +120,15 @@ pub fn settings_keyboard_parts(
             InlineKeyboardButton::callback(mark(preset == Some(*p), format!("{} {} {:.1}G", icon, p.label(), p.gwei().0)), p.callback())
         })
         .collect();
+    // The target distance is in the callback: a repeated or stale press cannot change it twice.
+    let mut trailing_row: Vec<InlineKeyboardButton> = TRAILING_CHOICES
+        .iter()
+        .map(|p| {
+            let on = trailing.is_some_and(|t| (t - f64::from(*p)).abs() < 1e-9);
+            InlineKeyboardButton::callback(mark(on, format!("📉 Trail {}%", p)), format!("cfg_trail:{}", p))
+        })
+        .collect();
+    trailing_row.push(InlineKeyboardButton::callback("↺ .env", "cfg_trail:env"));
     InlineKeyboardMarkup::new(vec![
         vec![mode_btn],
         carriers_row,
@@ -136,6 +147,7 @@ pub fn settings_keyboard_parts(
             InlineKeyboardButton::callback("⏱ Exit: 45s", "cfg_exit:45"),
             InlineKeyboardButton::callback("⏱ Exit: 60s", "cfg_exit:60"),
         ],
+        trailing_row,
         back("menu_main", "🔙 Kembali ke Menu Utama"),
     ])
 }
@@ -436,6 +448,7 @@ pub fn settings(v: &SettingsView) -> String {
          • <b>Padding master:</b> {}\n\
          • <b>Fee:</b> {}\n\
          • <b>Target Profit:</b> +{:.1}%\n\
+         • <b>Trailing Stop:</b> -{:.1}% dari puncak ({})\n\
          • <b>Time-Decay Exit:</b> {} detik\n\
          {RULE}\n\
          <i>Setiap perubahan langsung berlaku: batch pre-sign yang sudah siap dibentuk ulang dan ditandatangani ulang sebelum blok target. Tip preset adalah minimum: engine hanya menawar lebih tinggi bila jaringan melaporkan tip lebih tinggi.</i>",
@@ -446,6 +459,8 @@ pub fn settings(v: &SettingsView) -> String {
         kb(v.master_padding_bytes()),
         e(&fee),
         v.target_profit_percent,
+        v.trailing_stop_percent,
+        if v.trailing_from_runtime { "diatur via Telegram" } else { "dari .env" },
         v.time_decay_exit_secs
     )
 }

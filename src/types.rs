@@ -23,7 +23,7 @@ impl std::fmt::Display for ExecutionMode {
 /// Position exit mode specifically configured for Prysm Series Strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrysmExitMode {
-    /// Opsi 1: Multi-Layer Default (Trailing +20% / -15% peak, Quiet 30s, Idle 25s, Hard SL -20%)
+    /// Opsi 1: Multi-Layer Default (Trailing +20% / -TRAILING_STOP_PERCENT dari puncak (default 10%), Quiet 30s, Idle 25s, Hard SL -20%)
     System,
     /// Opsi 2: Valuation Target (Take-Profit at Market Cap >= $10,000 USD, Hard SL at -30%)
     Target,

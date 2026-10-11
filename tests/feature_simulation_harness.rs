@@ -48,7 +48,7 @@ use autotradesniper::models::prysm::{COMPANION_ACCOUNTS, PRYSMCLOUD_SUBSTRING};
 use autotradesniper::models::PrysmEngine;
 use autotradesniper::payload::{self, CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
 use autotradesniper::risk::curve_mirror::{CurveMirror, MirrorPolicy, MirrorRead};
-use autotradesniper::risk::types::ExitVenue;
+use autotradesniper::risk::types::{ExitVenue, DEFAULT_TRAILING_STOP_PERCENT};
 use autotradesniper::risk::RiskManager;
 use autotradesniper::stream::StreamListener;
 use autotradesniper::telegram::{html, screens, Action, ControlPlane, EngineHandles};
@@ -90,6 +90,8 @@ const TOKEN_CALL_EXEC_GAS: u64 = 30_000;
 /// Every carrier account (indices 1..=5) is funded with this much at start.
 const CARRIER_FUNDING_ETH: f64 = 0.5;
 const MASTER_FUNDING_ETH: f64 = 1.0;
+/// Trailing-stop distance in force in these tests: the production default (`TRAILING_STOP_PERCENT`).
+const TRAIL: f64 = DEFAULT_TRAILING_STOP_PERCENT;
 /// `main.rs`: a signal older than this when the dispatcher picks it up is dropped.
 const MAX_SIGNAL_QUEUE_AGE: Duration = Duration::from_secs(3);
 const RELEASE: bool = !cfg!(debug_assertions);
@@ -1179,6 +1181,7 @@ impl Engine {
         *config.prysm_max_signal_age_secs.write().await = 15;
         *config.prysm_slippage_percent.write().await = 25.0;
         *config.prysm_target_stop_loss_percent.write().await = 30.0;
+        *config.trailing_stop_percent.write().await = TRAIL;
         // USD thresholds at the default $2,600 reference, held fixed in ETH terms whatever
         // `ETH_USD_PRICE` says: production defaults $8,000 (entry ceiling) and $10,000 (take-profit).
         let usd = payload::eth_usd_reference() / payload::DEFAULT_ETH_USD_PRICE;
@@ -1910,13 +1913,14 @@ async fn s2_default_block_plus_one_profile_prebuilds_the_carriers() {
 }
 
 /// Variant: a node that enforces the EIP-7623 calldata floor on L2 gas (whether Arbitrum does is
-/// not established; the engine sizes its first attempt without it). 94.5 KB of calldata then
-/// needs ~1M gas, every pre-signed packet is refused once, and the engine's single escalated
-/// retry (re-signed inline) must still put the whole swarm into L+2.
+/// not established). 94.5 KB of calldata then needs ~1M gas; the engine sizes every padded packet
+/// for that floor up front, so all of them are accepted on the first attempt and still go out
+/// pre-signed, in one burst.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn s2_variant_swarm_survives_an_enforced_eip7623_calldata_floor() {
+async fn s2_variant_enforced_eip7623_floor_is_cleared_on_the_first_attempt() {
     let world = World::alone().await;
     world.enforce_calldata_floor();
+    world.set_send_latency(SEND_LATENCY);
     let engine = Engine::start(&world, Opts { carriers: 2, prysm_delay: 2, ..Opts::default() }).await;
     let already = world.sent().len();
     let run = launch_timeline(&world, &engine, 0.021, pola_a_calldata(), 1).await;
@@ -1926,20 +1930,26 @@ async fn s2_variant_swarm_survives_an_enforced_eip7623_calldata_floor() {
         println!("SENT[{}]: from={:?}, to={:?}, input_len={}, gas={}, acc={}, ref={:?}", i, tx.from, tx.to, tx.input_len, tx.gas_limit, tx.accepted(), tx.refused);
     }
     let b = &run.burst;
+    let p = engine.dispatcher.presign_snapshot();
     println!(
-        "floor enforced: {} first attempts refused ({:?}); {} retries accepted with gas limits {:?}; accepted packets at the node {:.3} ms after the trigger, spread {:.3} ms",
+        "floor enforced: {} refused, {} accepted on the first attempt with gas limits {:?} (floor for 94.5 KB: {}); at the node {:.3} ms after the trigger, spread {:.3} ms",
         refused.len(),
-        refused.first().and_then(|s| s.refused.clone()),
         b.txs.len(),
         b.txs.iter().map(|s| s.gas_limit).collect::<Vec<_>>(),
+        floor_gas(&vec![0u8; payload::TARGET_CALLDATA_BUFFER_SIZE]),
         ms(b.trigger_to_first),
         ms(b.spread)
     );
-    assert_eq!(refused.len(), 3, "each pre-signed packet refused once");
-    assert!(refused.iter().all(|s| s.refused.as_deref().unwrap_or_default().contains("floor data gas")));
-    assert!(b.txs.iter().all(|s| s.gas_limit >= floor_gas(&vec![0u8; s.input_len])), "retried above the floor");
+    println!("pre-sign: {:?}", p);
+    assert!(refused.is_empty(), "no packet refused for the floor: {:?}", refused.iter().map(|s| &s.refused).collect::<Vec<_>>());
+    assert_eq!(all.len(), 3, "one attempt per account: no retry");
+    // The node accepted each one, i.e. its limit covers max(intrinsic, floor) + L1 (checked there).
+    let staged = run.staged_at_trigger.as_ref().expect("staged before the trigger");
+    assert!(staged.all_signed(), "pre-signed before the trigger block");
+    assert_eq!(b.txs.iter().map(|s| s.hash).collect::<HashSet<_>>(), staged.expected(&engine), "the staged packets, unchanged");
+    assert_eq!((p.prebuilt_sent, p.signed_inline_fresh + p.signed_inline_leased, p.resigned_stale), (3, 0, 0), "no signature on the hot path");
+    assert!(b.last_start_after_first_done_ms < ms(SEND_LATENCY), "one burst: no serial send");
     assert_swarm(&world, &engine, &run, &engine.carriers, 0.01);
-    println!("pre-sign: {:?}", engine.dispatcher.presign_snapshot());
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2165,14 +2175,14 @@ async fn s4_in_memory_valuation_without_rpc_reads_and_the_trailing_stop() {
     println!("mirror read + valuation + graduation capacity: median {:?} per position ({})", median, if RELEASE { "release" } else { "debug" });
     assert!(median < if RELEASE { Duration::from_micros(1) } else { Duration::from_micros(50) }, "{median:?}");
 
-    // ── Pull back: held inside the 15% trailing distance, exit decided on the first valuation past it.
+    // ── Pull back: held inside the trailing distance, exit decided on the first valuation past it.
     let start = track.obs.len();
     track.until(60, || whale_sell_part(&world, &whale, token, curve, 12), |_| false).await;
     let (held_obs, trigger) = track.split();
     println!("pull-back (PnL %, drawdown %): {:?}", &track.path()[start..]);
-    assert!(held_obs.iter().all(|o| o.drawdown < 15.0), "no exit inside the 15% distance");
+    assert!(held_obs.iter().all(|o| o.drawdown < TRAIL), "no exit inside the {TRAIL}% distance");
     assert!(held_obs[start..].iter().any(|o| o.drawdown > 6.0), "held through a pull-back deeper than 6%");
-    assert!(trigger.drawdown >= 15.0, "the exit came on crossing the distance: {trigger:?}");
+    assert!(trigger.drawdown >= TRAIL, "the exit came on crossing the distance: {trigger:?}");
     let closed = track.settle().await;
     // Decided on feed-predicted state, the exit was first re-checked with an exact reading pinned
     // to the trigger block.
@@ -2234,6 +2244,45 @@ async fn s4_mirror_calibrates_a_non_default_creator_tax() {
     let periodic = (elapsed.as_secs_f64() / verify.as_secs_f64()).ceil() as usize + 1;
     println!("after calibration: 8 blocks valued exactly in {:?}; state reads {} (periodic verification every {:?})", elapsed, reads.len(), verify);
     assert!(reads.len() <= periodic, "only the periodic verification reads: {reads:?}");
+}
+
+/// The trailing-stop distance changed from Telegram while a position is open: a 6% pull-back is
+/// held at the default 10%, and the "Trail 5%" button makes the very next evaluation sell it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn s4_trailing_distance_changed_at_runtime_applies_to_the_open_position() {
+    let world = World::new().await;
+    let whale = world.trader();
+    world.fund(whale.address(), 20.0);
+    let engine = Engine::start(&world, Opts::default()).await;
+    let (_, token, curve) = launch_curve(&world, 0.3, plain_launch_calldata());
+    world.seal(Vec::new());
+    let pos = engine.enter(&world, token, curve, 0.01, None).await;
+    let mut track = Track::new(&world, &engine, &pos, token, curve).await;
+    track.until(80, || vec![whale.buy(curve, wei(0.03), U256::ZERO)], |o| o.pnl >= 30.0).await;
+    let six = track.until(40, || whale_sell_part(&world, &whale, token, curve, 40), |o| o.drawdown >= 6.0).await;
+    assert!(!six.exiting && six.drawdown < TRAIL, "held at {:.1}% with the {TRAIL}% default", six.drawdown);
+    // Two empty blocks: still held, nothing changed.
+    for _ in 0..2 {
+        assert!(!track.step(Vec::new()).await.exiting);
+    }
+
+    // The button carries the target distance (callback "cfg_trail:5").
+    let rep = engine.control.set_trailing_stop(5.0).await;
+    println!("cfg_trail:5 -> {:?}", rep.changes);
+    assert!(!rep.aborted && rep.changes.iter().any(|c| c.contains("-10.0% → -5.0%")), "{rep:?}");
+    assert_eq!(engine.config.trailing_stop().await, (5.0, true));
+    let next = track.step(Vec::new()).await;
+    println!("next block: drawdown {:.1}% -> exiting {}", next.drawdown, next.exiting);
+    assert!(next.exiting, "{:.1}% from the peak is beyond the new 5% distance", next.drawdown);
+    let closed = track.settle().await;
+    assert!(closed.exit_reason.as_deref().unwrap_or_default().contains("High-Watermark Trailing"), "{:?}", closed.exit_reason);
+    assert_exit_settled(&world, &engine, &closed, token);
+
+    // Out of range is refused and changes nothing; reset returns to the `.env` value.
+    assert!(engine.control.set_trailing_stop(2.0).await.aborted);
+    assert_eq!(engine.config.trailing_stop().await, (5.0, true));
+    engine.control.reset_trailing_stop().await;
+    assert_eq!(engine.config.trailing_stop().await, (engine.config.trailing_stop_from_env, false));
 }
 
 /// Prysm "Target" exit mode: take-profit at $10k market cap, strict stop-loss at -30%; the
@@ -2331,6 +2380,8 @@ async fn s4_pre_graduation_guard_sells_before_the_curve_reaches_4_2_eth() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s5_buttons_reshape_the_live_swarm_and_panic_cuts_queues_and_liquidates() {
     let world = World::new().await;
+    // Every reshape and re-sign below must keep the packets above the EIP-7623 floor.
+    world.enforce_calldata_floor();
     let engine = Engine::start(&world, Opts { carriers: 1, prysm_delay: 2, presign_hold: Duration::from_secs(60), ..Opts::default() }).await;
     let (launch, token, _) = launch_curve(&world, 0.021, pola_a_calldata());
     let batch = || engine.dispatcher.staged_batch(launch).expect("staged");
@@ -2492,15 +2543,15 @@ async fn s6_full_life_cycle_dry_run() {
     step(&format!("price up: PnL {:.1}% after {} blocks, valued in memory ({} state reads over RPC)", top.pnl, track.obs.len(), reads.len()));
     assert!(reads.is_empty() && !top.exiting, "{reads:?}");
 
-    // 7. A 6% correction from the peak: inside the 15% trailing distance, the position is held.
+    // 7. A 6% correction from the peak: inside the trailing distance, the position is held.
     let six = track.until(40, || whale_sell_part(&world, &whale, token, curve, 40), |o| o.drawdown >= 6.0).await;
-    assert!(!six.exiting, "a 6% pull-back is inside the 15% trailing distance: {six:?}");
-    step(&format!("correction {:.1}% from the peak (PnL {:.1}%): held, trailing stop armed at -15%", six.drawdown, six.pnl));
+    assert!(!six.exiting, "a 6% pull-back is inside the {TRAIL}% trailing distance: {six:?}");
+    step(&format!("correction {:.1}% from the peak (PnL {:.1}%): held, trailing stop armed at -{TRAIL}%", six.drawdown, six.pnl));
 
     // 8. The correction deepens -> trailing stop -> receipt-confirmed sell.
     track.until(60, || whale_sell_part(&world, &whale, token, curve, 12), |_| false).await;
     let (held, trigger) = track.split();
-    assert!(held.iter().all(|o| o.drawdown < 15.0) && trigger.drawdown >= 15.0, "{:?}", track.path());
+    assert!(held.iter().all(|o| o.drawdown < TRAIL) && trigger.drawdown >= TRAIL, "{:?}", track.path());
     step(&format!("block #{}: drawdown {:.1}% from the peak (PnL {:.1}%) -> exit decided", trigger.block, trigger.drawdown, trigger.pnl));
     let closed = track.settle().await;
     let r = assert_exit_settled(&world, &engine, &closed, token);

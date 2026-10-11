@@ -57,6 +57,10 @@ pub const PONS_LAUNCH_TOPIC_HEX: &str = "0x8d4aad4953d0ca700d468f3753aa14432d1b3
 pub const PONS_SNIPE_TAX_BPS: u32 = 618;
 /// Base protocol fee on Pons bonding curve (1.00% = 100 bps)
 pub const PONS_BASE_FEE_BPS: u32 = 100;
+/// Ceiling of everything taken from a buy's quote (base fee + creator tax + launch snipe tax):
+/// 99%. In the launch second the 99% snipe tax alone reaches it, so the fee and creator tax add
+/// nothing more and ~1% of the quote is still priced: a buy never computes to zero or negative.
+pub const PONS_MAX_TOTAL_BUY_TAX_BPS: u32 = 9_900;
 /// Initial virtual ETH reserve on Pons bonding curve: 1.68 ETH (in wei)
 pub const PONS_INITIAL_ETH_RESERVE_WEI: u128 = 1_680_000_000_000_000_000;
 /// Real ETH raised (`ethReserve - initial virtual reserve`) at which the curve graduates
@@ -143,6 +147,7 @@ impl CalldataPayloadBuilder {
     /// units, it rises with L1 fees and falls with the L2 base fee). A tx whose limit is below
     /// `intrinsic + poster gas` is rejected by the sequencer ("intrinsic gas too low"). Unused gas
     /// is refunded, so the 1.5x margin only raises the balance needed to submit, not the cost.
+    /// Padded txs are also sized for the EIP-7623 calldata floor (see [`Self::gas_needed_without_l1`]).
     #[inline]
     pub fn gas_limit(calldata: &[u8], padding: usize, configured: u64, l1_component_gas: u64) -> u64 {
         Self::gas_limit_with_reserve(calldata, padding, configured, l1_component_gas, EXECUTION_GAS_RESERVE)
@@ -154,17 +159,24 @@ impl CalldataPayloadBuilder {
         Self::gas_limit_with_reserve(&[], padding, configured, l1_component_gas, CARRIER_GAS_RESERVE)
     }
 
-    /// `intrinsic + reserve + 1.5 x L1 poster gas`, never below `configured`.
+    /// `max(intrinsic + reserve, EIP-7623 floor) + 1.5 x L1 poster gas`, never below `configured`.
     ///
     /// An L1 estimate of 0 means "never measured", not "free": it is replaced by
     /// [`L1_COMPONENT_FALLBACK_GAS`] so a missing estimate cannot silently under-size the limit.
     #[inline]
     pub fn gas_limit_with_reserve(calldata: &[u8], padding: usize, configured: u64, l1_component_gas: u64, reserve: u64) -> u64 {
-        configured.max(
-            Self::intrinsic_gas(calldata, padding)
-                .saturating_add(reserve)
-                .saturating_add(Self::l1_margin(l1_component_gas)),
-        )
+        configured.max(Self::gas_needed_without_l1(calldata, padding, reserve).saturating_add(Self::l1_margin(l1_component_gas)))
+    }
+
+    /// Gas a tx needs besides the L1 poster component: intrinsic gas + `reserve`, and never less
+    /// than the EIP-7623 calldata floor. Whether the chain enforces that floor on L2 gas is not
+    /// established, so the first attempt is sized for it: unused gas is refunded (no extra cost,
+    /// only a higher balance needed to submit), and a pre-signed ~94.5 KB packet can never be
+    /// refused for it and re-signed on the hot path. For a 94.5 KB carrier this is
+    /// `21,000 + 10 x 94,500 = 966,000` (vs. 420,000 without the floor).
+    #[inline]
+    pub fn gas_needed_without_l1(calldata: &[u8], padding: usize, reserve: u64) -> u64 {
+        Self::intrinsic_gas(calldata, padding).saturating_add(reserve).max(Self::calldata_floor_gas(calldata, padding))
     }
 
     /// 1.5x the L1 poster component (fallback when unmeasured).
@@ -178,8 +190,8 @@ impl CalldataPayloadBuilder {
     /// `21000 + 10 x (zero bytes + 4 x non-zero bytes)`.
     ///
     /// Whether the chain enforces it on L2 user gas is NOT established (Arbitrum documents a
-    /// calldata floor as a batch-posting price parameter). It is only used as the lower bound of an
-    /// escalated retry after the sequencer rejected the first limit, never to size the first attempt.
+    /// calldata floor as a batch-posting price parameter). Every limit is sized to cover it anyway
+    /// ([`Self::gas_needed_without_l1`]), and it stays the lower bound of an escalated retry.
     #[inline]
     pub fn calldata_floor_gas(calldata: &[u8], padding: usize) -> u64 {
         let tokens: u64 = calldata.iter().map(|&b| if b == 0 { 1u64 } else { 4 }).sum::<u64>() + padding as u64;
@@ -558,7 +570,8 @@ impl CalldataPayloadBuilder {
         Some(Address::from(addr_bytes))
     }
 
-    /// Pons curve output for buying tokens with `eth_in`
+    /// Pons curve output for buying tokens with `eth_in`; the total tax is capped at
+    /// [`PONS_MAX_TOTAL_BUY_TAX_BPS`].
     pub fn calculate_pons_tokens_out(
         eth_reserve: U256,
         token_reserve: U256,
@@ -566,7 +579,7 @@ impl CalldataPayloadBuilder {
         fee_bps: u32,
         ctax_bps: u32,
     ) -> U256 {
-        let total_tax_bps = U256::from((fee_bps + ctax_bps) as u128);
+        let total_tax_bps = U256::from(fee_bps.saturating_add(ctax_bps).min(PONS_MAX_TOTAL_BUY_TAX_BPS));
         let tax = eth_in * total_tax_bps / U256::from(10_000);
         let e = eth_in.saturating_sub(tax);
         let denom = eth_reserve + e;

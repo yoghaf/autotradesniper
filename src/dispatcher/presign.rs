@@ -160,7 +160,8 @@ pub struct TxSpec {
     pub floor_with_l1: u64,
     /// Re-send the identical tx once after a 429 (primary only: carriers must not add load).
     pub retry_rate_limited: bool,
-    /// `intrinsic + execution reserve`: what the limit needs besides the L1 poster component.
+    /// `max(intrinsic + reserve, EIP-7623 calldata floor)`: what the limit needs besides the L1
+    /// poster component.
     pub gas_floor_without_l1: u64,
     /// `GAS_LIMIT` as configured when this spec was built.
     pub configured_gas_limit: u64,
@@ -187,10 +188,9 @@ impl TxSpec {
 
     /// The same tx (destination, value, calldata) re-sized for the fees and gas of `ctx`.
     pub fn refreshed(&self, ctx: &EntryCtx) -> TxSpec {
-        let reserve_and_intrinsic = self.gas_floor_without_l1;
         let gas_limit = self
             .configured_gas_limit
-            .max(reserve_and_intrinsic.saturating_add(CalldataPayloadBuilder::l1_margin(ctx.l1_component_gas)));
+            .max(self.gas_floor_without_l1.saturating_add(CalldataPayloadBuilder::l1_margin(ctx.l1_component_gas)));
         // `floor_with_l1` = calldata floor (unchanged) + the new L1 margin.
         let calldata_floor = self.floor_with_l1.saturating_sub(CalldataPayloadBuilder::l1_margin(self.l1_component_gas));
         TxSpec {
@@ -210,8 +210,9 @@ impl TxSpec {
         if self.max_fee_per_gas < scaled(now_max_fee) || self.max_priority_fee_per_gas < scaled(now_priority) {
             return Err(Invalidation::FeeDrift);
         }
-        // The limit must still cover intrinsic + reserve + the *current* L1 component (1.0x). The extra
-        // 0.5x the limit was built with is the slack that absorbs a rising L1 fee without re-signing.
+        // The limit must still cover max(intrinsic + reserve, calldata floor) + the *current* L1
+        // component (1.0x). The extra 0.5x the limit was built with is the slack that absorbs a
+        // rising L1 fee without re-signing.
         let l1 = if now_l1 == 0 { payload::L1_COMPONENT_FALLBACK_GAS } else { now_l1 };
         if self.gas_limit < self.gas_floor_without_l1.saturating_add(l1) {
             return Err(Invalidation::GasDrift);

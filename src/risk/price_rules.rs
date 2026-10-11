@@ -104,7 +104,7 @@ impl PriceRules {
             let peak_price = tracker.highest_price_eth;
             let drawdown_from_peak_pct = ((peak_price - current_spot_price) / peak_price) * 100.0;
 
-            // Liquidation: Pullback reaches >= 15% from peak
+            // Liquidation: pullback reaches the configured distance from the peak
             if drawdown_from_peak_pct >= config.trail_distance_percent {
                 return Some(ExitSignal {
                     position_id: tracker.position.id.clone(),
@@ -112,7 +112,7 @@ impl PriceRules {
                     pool_address: pool_addr,
                     reason: ExitReason::TrailingStop,
                     reason_description: format!(
-                        "Trailing Stop Triggered: {:.2}% pullback from peak ({:.6} ETH -> {:.6} ETH), Realized PnL: +{:.2}%",
+                        "Trailing Stop Triggered: {:.2}% pullback from peak ({:.6} ETH -> {:.6} ETH), Realized PnL: {:+.2}%",
                         drawdown_from_peak_pct, peak_price, current_spot_price, pnl_pct
                     ),
                     is_emergency: false,

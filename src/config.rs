@@ -1,4 +1,5 @@
 use crate::addr_set::AddressSet;
+use crate::risk::types::{DEFAULT_TRAILING_STOP_PERCENT, MAX_TRAILING_STOP_PERCENT, MIN_TRAILING_STOP_PERCENT};
 use crate::types::ExecutionMode;
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -17,6 +18,30 @@ fn default_prysm_exit_mode() -> crate::types::PrysmExitMode { crate::types::Prys
 fn default_prysm_max_mcap_usd() -> f64 { 8000.0 }
 fn default_prysm_min_block_delay() -> u64 { 1 }
 fn default_carrier_padding() -> bool { true }
+
+/// A trailing-stop distance clamped into `[MIN_TRAILING_STOP_PERCENT, MAX_TRAILING_STOP_PERCENT]`;
+/// `None` for NaN / infinity.
+pub fn clamp_trailing_stop_percent(pct: f64) -> Option<f64> {
+    pct.is_finite().then(|| pct.clamp(MIN_TRAILING_STOP_PERCENT, MAX_TRAILING_STOP_PERCENT))
+}
+
+/// `TRAILING_STOP_PERCENT` as written in `.env`: missing or blank -> the 10% default; unparsable or
+/// not finite -> the default; outside 3-30 -> clamped. The second value is a warning to log (the
+/// operator wrote something the engine did not take literally).
+pub fn parse_trailing_stop_percent(raw: Option<&str>) -> (f64, Option<String>) {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else { return (DEFAULT_TRAILING_STOP_PERCENT, None) };
+    let parsed = raw.trim_end_matches('%').trim().parse::<f64>().ok();
+    let Some((parsed, clamped)) = parsed.and_then(|p| clamp_trailing_stop_percent(p).map(|c| (p, c))) else {
+        return (
+            DEFAULT_TRAILING_STOP_PERCENT,
+            Some(format!("TRAILING_STOP_PERCENT={raw:?} is not a number: using the default {DEFAULT_TRAILING_STOP_PERCENT}%")),
+        );
+    };
+    let warning = (clamped != parsed).then(|| {
+        format!("TRAILING_STOP_PERCENT={raw} is outside {MIN_TRAILING_STOP_PERCENT}-{MAX_TRAILING_STOP_PERCENT}%: using {clamped}%")
+    });
+    (clamped, warning)
+}
 
 /// Persistent runtime state stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +74,10 @@ pub struct RuntimeState {
     /// files: on, the behaviour those files were written with.
     #[serde(default = "default_carrier_padding")]
     pub carrier_padding: bool,
+    /// Trailing-stop distance set at runtime (Telegram). Written only once it was changed there;
+    /// absent, `TRAILING_STOP_PERCENT` from `.env` applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailing_stop_percent: Option<f64>,
 }
 
 /// The watched-wallet set.
@@ -171,6 +200,13 @@ pub struct AppConfig {
     pub prysm_slippage_percent: Arc<RwLock<f64>>,
     pub prysm_target_mcap_usd: Arc<RwLock<f64>>,
     pub prysm_target_stop_loss_percent: Arc<RwLock<f64>>,
+    /// Trailing-stop distance from the high-water mark, in percent, within 3-30 (read by the risk
+    /// loop on every evaluation, so a change applies to open positions on the next tick).
+    pub trailing_stop_percent: Arc<RwLock<f64>>,
+    /// What `TRAILING_STOP_PERCENT` (or its default) gave at start: the value a reset returns to.
+    pub trailing_stop_from_env: f64,
+    /// The distance was set at runtime (or restored from the state file) and overrides `.env`.
+    pub trailing_stop_runtime: Arc<AtomicBool>,
     /// Launchpad factory contracts whose launch calldata may arm Pola A/B (`PRYSM_LAUNCHPAD_FACTORIES`).
     /// Empty = Pola A/B fail closed, so arbitrary contracts cannot spoof a launch.
     pub prysm_launchpads: Arc<HashSet<Address>>,
@@ -352,6 +388,11 @@ impl AppConfig {
             .parse::<f64>()
             .unwrap_or(0.015);
 
+        let (trailing_stop_percent, trailing_warning) = parse_trailing_stop_percent(std::env::var("TRAILING_STOP_PERCENT").ok().as_deref());
+        if let Some(warning) = trailing_warning {
+            tracing::warn!("{}", warning);
+        }
+
         let restore = state_file.is_some();
         let state_path = state_file.unwrap_or_else(scratch_state_path);
 
@@ -400,6 +441,9 @@ impl AppConfig {
             prysm_slippage_percent: Arc::new(RwLock::new(25.0)),
             prysm_target_mcap_usd: Arc::new(RwLock::new(10000.0)),
             prysm_target_stop_loss_percent: Arc::new(RwLock::new(30.0)),
+            trailing_stop_percent: Arc::new(RwLock::new(trailing_stop_percent)),
+            trailing_stop_from_env: trailing_stop_percent,
+            trailing_stop_runtime: Arc::new(AtomicBool::new(false)),
             prysm_launchpads: Arc::new(prysm_launchpads),
 
             _scratch: (!restore).then(|| Arc::new(ScratchFile(PathBuf::from(&state_path)))),
@@ -505,6 +549,13 @@ impl AppConfig {
         if let Ok(mut lock) = self.prysm_min_block_delay.try_write() {
             *lock = state.prysm_min_block_delay;
         }
+        // A runtime trailing distance overrides `.env`; a file without one leaves `.env` in force.
+        if let Some(pct) = state.trailing_stop_percent.and_then(clamp_trailing_stop_percent)
+            && let Ok(mut lock) = self.trailing_stop_percent.try_write()
+        {
+            *lock = pct;
+            self.trailing_stop_runtime.store(true, Ordering::SeqCst);
+        }
 
         Ok(())
     }
@@ -531,6 +582,7 @@ impl AppConfig {
         let prysm_exit_mode = *self.prysm_exit_mode.read().await;
         let prysm_max_mcap_usd = *self.prysm_max_mcap_usd.read().await;
         let prysm_min_block_delay = *self.prysm_min_block_delay.read().await;
+        let trailing_stop_percent = *self.trailing_stop_percent.read().await;
         let state = RuntimeState {
             mnemonic_phrase,
             watchlist_accounts,
@@ -551,6 +603,7 @@ impl AppConfig {
             prysm_max_mcap_usd,
             prysm_min_block_delay,
             carrier_padding: self.carrier_padding.load(Ordering::SeqCst),
+            trailing_stop_percent: self.trailing_stop_runtime.load(Ordering::SeqCst).then_some(trailing_stop_percent),
         };
 
         let json = serde_json::to_vec_pretty(&state)?;
@@ -705,6 +758,42 @@ impl AppConfig {
     pub async fn set_engine_running(&self, running: bool) {
         self.is_engine_active.store(running, Ordering::SeqCst);
         let _ = self.save_persisted_state().await;
+    }
+
+    /// Current trailing-stop distance (percent) and whether it was set at runtime (else `.env`).
+    pub async fn trailing_stop(&self) -> (f64, bool) {
+        (*self.trailing_stop_percent.read().await, self.trailing_stop_runtime.load(Ordering::SeqCst))
+    }
+
+    /// Set the trailing-stop distance at runtime and persist it (it then overrides `.env`).
+    /// Refused outside 3-30% or when not finite; returns the previous distance.
+    pub async fn set_trailing_stop_percent(&self, pct: f64) -> Result<f64, String> {
+        if !pct.is_finite() || !(MIN_TRAILING_STOP_PERCENT..=MAX_TRAILING_STOP_PERCENT).contains(&pct) {
+            return Err(format!("Trailing stop {pct}% di luar rentang {MIN_TRAILING_STOP_PERCENT}-{MAX_TRAILING_STOP_PERCENT}%"));
+        }
+        let old = {
+            let mut lock = self.trailing_stop_percent.write().await;
+            // Asking for the distance already in force changes nothing: in particular a value
+            // that comes from `.env` keeps coming from `.env` (it is not frozen into the state file).
+            if *lock == pct {
+                return Ok(pct);
+            }
+            self.trailing_stop_runtime.store(true, Ordering::SeqCst);
+            std::mem::replace(&mut *lock, pct)
+        };
+        let _ = self.save_persisted_state().await;
+        Ok(old)
+    }
+
+    /// Back to the `.env` value; the state file stops overriding it. Returns the previous distance.
+    pub async fn reset_trailing_stop_percent(&self) -> f64 {
+        let old = {
+            let mut lock = self.trailing_stop_percent.write().await;
+            self.trailing_stop_runtime.store(false, Ordering::SeqCst);
+            std::mem::replace(&mut *lock, self.trailing_stop_from_env)
+        };
+        let _ = self.save_persisted_state().await;
+        old
     }
 
     // =========================================================================

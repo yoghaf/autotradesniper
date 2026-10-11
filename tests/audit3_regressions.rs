@@ -527,19 +527,28 @@ fn a_missing_l1_estimate_is_never_treated_as_free() {
     let intrinsic = CalldataPayloadBuilder::intrinsic_gas(&[], 94_500);
     assert_eq!(intrinsic, 21_000 + 4 * 94_500);
 
+    // A padded payload is sized for the EIP-7623 calldata floor (it dominates intrinsic + reserve).
+    let floor = CalldataPayloadBuilder::calldata_floor_gas(&[], 94_500);
+    assert_eq!(floor, 966_000);
+    assert!(floor > intrinsic + payload::CARRIER_GAS_RESERVE);
+
     // Unmeasured (0): fall back to the generous assumption, not to "no poster gas".
     let unknown = CalldataPayloadBuilder::carrier_gas_limit(94_500, 0, 0);
-    assert_eq!(unknown, intrinsic + payload::CARRIER_GAS_RESERVE + payload::L1_COMPONENT_FALLBACK_GAS * 3 / 2);
+    assert_eq!(unknown, floor + payload::L1_COMPONENT_FALLBACK_GAS * 3 / 2);
 
     // Measured: exactly 1.5x the measurement, and the configured floor still wins when higher.
     let measured = CalldataPayloadBuilder::carrier_gas_limit(94_500, 0, 200_000);
-    assert_eq!(measured, intrinsic + payload::CARRIER_GAS_RESERVE + 300_000);
+    assert_eq!(measured, floor + 300_000);
     assert_eq!(CalldataPayloadBuilder::carrier_gas_limit(94_500, 9_000_000, 200_000), 9_000_000);
+    // 50k L1 (a typical reading): ~1.04M, the first attempt clears the floor.
+    assert_eq!(CalldataPayloadBuilder::carrier_gas_limit(94_500, 600_000, 50_000), 1_041_000);
 
-    // Master: execution reserve instead of the carrier slack.
+    // Master: the padded buy is also floor-bound; unpadded, intrinsic + execution reserve rules.
     let swap = CalldataPayloadBuilder::build_pons_buy_payload(U256::from(1u64), U256::from(1u64), Address::ZERO);
     let master = CalldataPayloadBuilder::gas_limit(&swap, 94_500, 0, 200_000);
-    assert_eq!(master, CalldataPayloadBuilder::intrinsic_gas(&swap, 94_500) + payload::EXECUTION_GAS_RESERVE + 300_000);
+    assert_eq!(master, CalldataPayloadBuilder::calldata_floor_gas(&swap, 94_500) + 300_000);
+    let unpadded = CalldataPayloadBuilder::gas_limit(&swap, 0, 0, 200_000);
+    assert_eq!(unpadded, CalldataPayloadBuilder::intrinsic_gas(&swap, 0) + payload::EXECUTION_GAS_RESERVE + 300_000);
 }
 
 #[test]

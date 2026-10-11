@@ -26,7 +26,7 @@
 use crate::config::AppConfig;
 use crate::dispatcher::{Dispatcher, PresignSnapshot, ReshapeReport};
 use crate::models::{PrysmEngine, PrysmMatchReport};
-use crate::payload::{DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
+use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
 use crate::risk::curve_mirror::{CurveMirror, MirrorRead, MirrorStatsSnapshot};
 use crate::risk::{PanicReport, RiskManager};
 use crate::stream::{FeedStatsSnapshot, StreamListener};
@@ -45,6 +45,25 @@ use tracing::{info, warn};
 
 /// Carrier counts offered by the keyboard (callback data is client-controlled: nothing else is accepted).
 pub const CARRIER_CHOICES: [usize; 4] = [1, 2, 3, 5];
+/// Trailing-stop distances offered as buttons, in percent (any value in 3-30 is accepted).
+pub const TRAILING_CHOICES: [u32; 4] = [5, 8, 10, 15];
+
+/// A trailing-stop button: `cfg_trail:<percent>` or `cfg_trail:env`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrailingCommand {
+    /// Set this distance (validated against 3-30% by the config).
+    Set(f64),
+    /// Back to `TRAILING_STOP_PERCENT` from `.env`.
+    ResetToEnv,
+}
+
+/// Parse a trailing-stop callback; `None` for anything else (or a malformed value).
+pub fn parse_trailing_callback(data: &str) -> Option<TrailingCommand> {
+    match data.strip_prefix("cfg_trail:")? {
+        "env" => Some(TrailingCommand::ResetToEnv),
+        pct => pct.parse::<f64>().ok().filter(|p| p.is_finite()).map(TrailingCommand::Set),
+    }
+}
 /// Balance reads for the dashboard give up after this.
 const BALANCE_BUDGET: Duration = Duration::from_secs(3);
 /// Nonce sync / balance check of carriers that start taking part gives up after this.
@@ -205,6 +224,10 @@ pub struct SettingsView {
     pub time_decay_exit_secs: u64,
     pub gas_limit: u64,
     pub trade_eth: f64,
+    /// Trailing-stop distance from the peak, in percent.
+    pub trailing_stop_percent: f64,
+    /// The distance was set at runtime (Telegram) and overrides `TRAILING_STOP_PERCENT`.
+    pub trailing_from_runtime: bool,
 }
 
 impl SettingsView {
@@ -338,6 +361,7 @@ async fn read_settings(c: &AppConfig) -> SettingsView {
     let time_decay_exit_secs = *c.time_decay_exit_seconds.read().await;
     let gas_limit = *c.gas_limit.read().await;
     let trade_eth = *c.default_trade_eth.read().await;
+    let (trailing_stop_percent, trailing_from_runtime) = c.trailing_stop().await;
     SettingsView {
         mode,
         carriers,
@@ -350,7 +374,23 @@ async fn read_settings(c: &AppConfig) -> SettingsView {
         time_decay_exit_secs,
         gas_limit,
         trade_eth,
+        trailing_stop_percent,
+        trailing_from_runtime,
     }
+}
+
+/// What a carrier must hold for the node to accept its packet right now: `(gas limit, max fee
+/// in gwei, gas limit x max fee in ETH)`, with the padding, gas limit and L1 estimate in force and
+/// the max fee a packet would be signed with (`MAX_FEE_GWEI` when no fee adjuster is wired).
+async fn carrier_submit_need(h: &EngineHandles) -> (u64, f64, f64) {
+    let size = *h.config.buffer_size.read().await;
+    let padding = CalldataPayloadBuilder::clamp_padding(0, if size > 0 { size } else { TARGET_CALLDATA_BUFFER_SIZE });
+    let configured = *h.config.gas_limit.read().await;
+    let l1 = h.fee.as_ref().map_or(0, |f| f.l1_component_gas());
+    let gas = CalldataPayloadBuilder::carrier_gas_limit(padding, configured, l1);
+    let (_, cap_gwei) = h.config.fee_caps().await;
+    let max_fee_gwei = h.fee.as_ref().map_or(cap_gwei, |f| f.capped_fees(cap_gwei).1 as f64 / 1e9);
+    (gas, max_fee_gwei, gas as f64 * max_fee_gwei * 1e-9)
 }
 
 /// Before a layout change is committed: derive the accounts of `carriers` (PBKDF2, blocking
@@ -387,8 +427,15 @@ async fn prepare_layout(h: &EngineHandles, carriers: usize, activate: RangeInclu
         return false;
     }
     let min_eth = *h.config.min_sub_account_eth.read().await;
+    // The node refuses a tx unless the sender holds `gas_limit x max_fee` (+ value) up front, so a
+    // carrier below that is turned away even when it is above the configured minimum.
+    let (gas, max_fee_gwei, need_eth) = carrier_submit_need(h).await;
     for ((index, _), balance) in joining.iter().zip(balances) {
         match balance {
+            Some(b) if b < need_eth => report.warnings.push(format!(
+                "Carrier #{} saldo {:.5} ETH < {:.5} ETH yang dibutuhkan untuk submit (gas limit {} x max fee {:.1} gwei): jalankan Rebalance",
+                index, b, need_eth, gas, max_fee_gwei
+            )),
             Some(b) if b < min_eth => {
                 report.warnings.push(format!("Carrier #{} saldo {:.5} ETH < minimum {:.4} ETH: jalankan Rebalance", index, b, min_eth))
             }
@@ -579,7 +626,8 @@ async fn wallet_blocked(h: &EngineHandles, rebalancing: &AtomicUsize) -> Option<
 async fn engine_snapshot(h: EngineHandles) -> (SystemSnapshot, Vec<(usize, String, Address)>, f64) {
     let c = &h.config;
     let settings = read_settings(c).await;
-    let min_carrier_eth = *c.min_sub_account_eth.read().await;
+    // "Low" = below the configured minimum or below what the node needs to accept a packet.
+    let min_carrier_eth = c.min_sub_account_eth.read().await.max(carrier_submit_need(&h).await.2);
     let accounts: Vec<(usize, String, Address)> = match h.wallet.get_all_accounts_shared().await {
         Ok(list) => list.iter().map(|a| (a.index, a.role.clone(), a.address)).collect(),
         Err(e) => {
@@ -787,6 +835,29 @@ impl ControlPlane {
         .await
     }
 
+    /// Trailing-stop distance from the peak in percent [3, 30]; persisted, it overrides `.env`
+    /// and applies to open positions on the risk loop's next tick.
+    pub async fn set_trailing_stop(&self, pct: f64) -> ApplyReport {
+        self.apply_with(move |h| async move {
+            match h.config.set_trailing_stop_percent(pct).await {
+                Ok(old) if (old - pct).abs() < 1e-9 => ApplyReport::unchanged(format!("Trailing stop: -{:.1}% dari puncak", pct)),
+                Ok(old) => ApplyReport { changes: vec![format!("Trailing stop: -{:.1}% → -{:.1}% dari puncak", old, pct)], ..ApplyReport::default() },
+                Err(why) => ApplyReport::refused(why),
+            }
+        })
+        .await
+    }
+
+    /// Back to `TRAILING_STOP_PERCENT` from `.env` (the runtime override is dropped).
+    pub async fn reset_trailing_stop(&self) -> ApplyReport {
+        self.apply_with(move |h| async move {
+            let env = h.config.trailing_stop_from_env;
+            let old = h.config.reset_trailing_stop_percent().await;
+            ApplyReport { changes: vec![format!("Trailing stop: -{:.1}% → -{:.1}% (nilai .env)", old, env)], ..ApplyReport::default() }
+        })
+        .await
+    }
+
     /// Time-decay exit in seconds [1, 3600].
     pub async fn set_time_decay(&self, secs: u64) -> ApplyReport {
         if !(1..=3600).contains(&secs) {
@@ -978,7 +1049,10 @@ impl ControlPlane {
                 }
             }
             let _done = Done(rebalancing);
-            h.wallet.rebalance_gas().await.map_err(|e| format!("{:#}", e))
+            // Top carriers up to what the node needs to accept their packets, not only to the
+            // configured minimum (a 94.5 KB packet's gas limit x max fee can exceed it).
+            let (_, _, need) = carrier_submit_need(&h).await;
+            h.wallet.rebalance_gas_for(need).await.map_err(|e| format!("{:#}", e))
         })
         .await
         .and_then(|r| r)

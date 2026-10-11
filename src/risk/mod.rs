@@ -511,7 +511,7 @@ impl RiskManager {
     /// Ingest mempool ERC-20 approval event (Layer 4 Anomaly Sensor)
     /// Triggers fast pre-emptive liquidation if concurrent approval spike detected
     pub async fn on_approval_event(&self, event: ApprovalEvent) {
-        let config = self.risk_config.read().await.clone();
+        let config = self.effective_risk_config().await;
         let mut exit_signal = None;
 
         {
@@ -937,6 +937,17 @@ impl RiskManager {
         tokio::spawn(async move { manager.execute_liquidation(signal).await });
     }
 
+    /// The risk parameters in force right now: the static layers plus everything the operator can
+    /// change at runtime (trailing-stop distance, Prysm Target take-profit and stop-loss), read on
+    /// every evaluation so a change applies to open positions on the next tick.
+    async fn effective_risk_config(&self) -> RiskConfig {
+        let mut config = self.risk_config.read().await.clone();
+        config.trail_distance_percent = *self.config.trailing_stop_percent.read().await;
+        config.prysm_target_mcap_usd = *self.config.prysm_target_mcap_usd.read().await;
+        config.prysm_target_stop_loss_percent = *self.config.prysm_target_stop_loss_percent.read().await;
+        config
+    }
+
     /// Approve the exit spender as soon as the entry fill is seen, so the exit is one tx.
     fn spawn_exit_preapproval(&self, token: Address, spender: Address) {
         let manager = self.clone_for_liquidation();
@@ -966,7 +977,7 @@ impl RiskManager {
             loop {
                 watchdog_interval.tick().await;
                 let now = Instant::now();
-                let config = watchdog_manager.risk_config.read().await.clone();
+                let config = watchdog_manager.effective_risk_config().await;
                 let mut signals_to_exit = Vec::new();
                 {
                     let trackers = watchdog_manager.trackers.read().await;
@@ -1016,9 +1027,7 @@ impl RiskManager {
             if mirror_gone {
                 changes = None;
             }
-            let mut config = self.risk_config.read().await.clone();
-            config.prysm_target_mcap_usd = *self.config.prysm_target_mcap_usd.read().await;
-            config.prysm_target_stop_loss_percent = *self.config.prysm_target_stop_loss_percent.read().await;
+            let config = self.effective_risk_config().await;
 
             // 1. Housekeeping + snapshot (short lock, no await inside).
             let requests: Vec<QuoteRequest> = {
@@ -1177,7 +1186,7 @@ impl RiskManager {
                             // Claimed here, under the trackers lock: the watchdog (which reads the same
                             // unconfirmed PnL) cannot slip an unconfirmed exit in before the check.
                             if let Some(flight) = ExitFlight::claim(&self.exits_in_flight, &tracker.position.id) {
-                                to_confirm.push((signal, tracker.clone(), unconfirmed.map(|s| s.as_of_block), config.clone(), flight));
+                                to_confirm.push((signal, tracker.clone(), unconfirmed.map(|s| s.as_of_block), flight));
                             }
                         } else {
                             signals.push(signal);
@@ -1201,8 +1210,8 @@ impl RiskManager {
             for signal in signals {
                 self.spawn_liquidation(signal);
             }
-            for (signal, tracker, block, config, flight) in to_confirm {
-                self.spawn_confirmed_liquidation(signal, tracker, block, config, flight);
+            for (signal, tracker, block, flight) in to_confirm {
+                self.spawn_confirmed_liquidation(signal, tracker, block, flight);
             }
 
             if let Some(mirror) = &self.mirror
@@ -1250,10 +1259,13 @@ impl RiskManager {
     /// The confirmed numbers are written back into the live tracker *before* the single-flight
     /// claim (taken by the caller) is released, so neither the loop nor the watchdog act on the
     /// unconfirmed figures afterwards.
-    fn spawn_confirmed_liquidation(&self, signal: ExitSignal, mut tracker: PositionTracker, at_block: Option<u64>, config: RiskConfig, flight: ExitFlight) {
+    fn spawn_confirmed_liquidation(&self, signal: ExitSignal, mut tracker: PositionTracker, at_block: Option<u64>, flight: ExitFlight) {
         let manager = self.clone_for_liquidation();
         tokio::spawn(async move {
             let Some(mirror) = manager.mirror.clone() else { return };
+            // Re-evaluated with the parameters in force now: an operator change (e.g. a wider
+            // trailing distance) made between the trigger and the exact reading is honoured.
+            let config = manager.effective_risk_config().await;
             let pool = signal.pool_address;
             let held = tracker.tokens_held;
             let mut fail_open = false;

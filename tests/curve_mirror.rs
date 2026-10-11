@@ -443,6 +443,62 @@ fn a_launch_window_buy_pays_the_snipe_tax_in_the_replay() {
     assert_eq!(fresh(&m), Some((e2, t2)));
 }
 
+#[test]
+fn the_total_buy_tax_is_capped_at_99_percent_never_zeroing_a_launch_second_buy() {
+    let c = launched(0.0);
+    let q = wei(0.05);
+    // Launch second: fee + creator tax (300) + snipe tax (9,900) = 10,200 bps -> capped at 9,900.
+    let (e, t, out) = curve_buy(c.e, c.t, q, DEFAULT_TRADE_BPS + snipe_tax_bps(0)).unwrap();
+    assert_eq!((e, t, out), curve_buy(c.e, c.t, q, payload::PONS_MAX_TOTAL_BUY_TAX_BPS).unwrap());
+    let one_percent = q / U256::from(100u64);
+    assert_eq!(out, c.t * one_percent / (c.e + one_percent), "~1% of the quote is priced");
+    assert!(out > U256::ZERO);
+    // The RPC-path formula agrees (and never goes negative or to zero either).
+    assert_eq!(out, CalldataPayloadBuilder::calculate_pons_tokens_out(c.e, c.t, q, 100, 200 + 9_900));
+    assert_eq!(out, CalldataPayloadBuilder::calculate_pons_tokens_out(c.e, c.t, q, 100, 9_900));
+    // Below the cap nothing changes.
+    let (_, _, at_618) = curve_buy(c.e, c.t, q, DEFAULT_TRADE_BPS + 618).unwrap();
+    assert_eq!(at_618, CalldataPayloadBuilder::calculate_pons_tokens_out(c.e, c.t, q, 100, 200 + 618));
+
+    // The replica replays a launch-second buy at the cap: reserves move by ~1% of the quote.
+    let trader = Trader::new();
+    let m = Arc::new(CurveMirror::new(MirrorPolicy { stale_after: Duration::from_secs(60), ..MirrorPolicy::default() }));
+    let t0 = unix_now();
+    m.begin_block(START, t0, true);
+    m.end_block(START);
+    m.note_launch(CURVE, START);
+    m.track(CURVE);
+    assert!(m.apply_anchor(CURVE, START, c.e, c.t));
+    m.ingest_l2_message(START + 1, t0, &batch(&[trader.buy(q, U256::from(1u64))]));
+    assert_eq!(fresh(&m), Some((e, t)), "applied, not predicted to revert on a zero fill");
+}
+
+#[test]
+fn launch_second_buys_alone_never_calibrate_the_fee() {
+    // At the 99% ceiling a buy is priced the same whatever the fee + creator tax: a window made of
+    // launch-second buys says nothing about the fee and must not "calibrate" it to 0 bps.
+    let trader = Trader::new();
+    let c = launched(0.0);
+    let m = Arc::new(CurveMirror::new(MirrorPolicy { stale_after: Duration::from_secs(60), ..MirrorPolicy::default() }));
+    let t0 = unix_now();
+    m.begin_block(START, t0, true);
+    m.end_block(START);
+    m.note_launch(CURVE, START);
+    m.track(CURVE);
+    assert!(m.apply_anchor(CURVE, START, c.e, c.t));
+    let (mut e, mut t) = (c.e, c.t);
+    let mut txs = Vec::new();
+    for q in [wei(0.2), wei(0.5)] {
+        let (e2, t2, _) = curve_buy(e, t, q, DEFAULT_TRADE_BPS + snipe_tax_bps(0)).unwrap();
+        (e, t) = (e2, t2);
+        txs.push(trader.buy(q, U256::from(1u64)));
+    }
+    m.ingest_l2_message(START + 1, t0, &batch(&txs));
+    assert!(m.apply_anchor(CURVE, START + 1, e, t));
+    assert_eq!(m.stats().calibrations, 0, "nothing to calibrate on");
+    assert_eq!(m.snapshot_any(&CURVE).unwrap().exit_fee_bps, DEFAULT_TRADE_BPS, "the fee model is untouched");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 2. Missed packets, reorgs, things the feed cannot show
 // ═══════════════════════════════════════════════════════════════════════════
@@ -856,6 +912,9 @@ async fn a_curve_whose_reserves_cannot_be_read_backs_off() {
 // 3. Zero-RPC risk loop, transitions on the replica, receipt-confirmed exits
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Trailing-stop distance of the risk-engine worlds below, in percent.
+const TRAIL_PERCENT: f64 = 15.0;
+
 struct World {
     chain: Arc<Mutex<Chain>>,
     mirror: Option<Arc<CurveMirror>>,
@@ -893,6 +952,8 @@ impl World {
         config.send_rpcs = vec![url.clone()];
         config.rpc_http_url = "http://127.0.0.1:1".to_string();
         *config.mnemonic_phrase.write().await = MNEMONIC.to_string();
+        // These scenarios were laid out for a 15% trailing distance (set explicitly: the default is 10%).
+        *config.trailing_stop_percent.write().await = TRAIL_PERCENT;
         *config.sub_account_count.write().await = 0;
         let wm = WalletManager::new(config.clone()).await.unwrap();
         let positions = Arc::new(RwLock::new(Vec::new()));
@@ -1079,7 +1140,7 @@ async fn the_trailing_stop_fires_on_the_exact_block_from_the_replica_with_zero_r
         let crossed_at = Instant::now();
         w.settle().await;
         let sent = w.chain.lock().unwrap().sells.len();
-        if drawdown >= 15.0 {
+        if drawdown >= TRAIL_PERCENT {
             // This very block: the loop was woken by the replica, valued, triggered and sold.
             wait_until("the trailing-stop sell", Duration::from_secs(2), || !w.chain.lock().unwrap().sells.is_empty()).await;
             trigger_block = Some(w.block);
@@ -1088,7 +1149,7 @@ async fn the_trailing_stop_fires_on_the_exact_block_from_the_replica_with_zero_r
             assert!(reads.is_empty(), "no RPC read between the trigger and the broadcast: {reads:?}");
             break;
         }
-        assert_eq!(sent, 0, "drawdown {drawdown:.2}% < 15%: no exit yet");
+        assert_eq!(sent, 0, "drawdown {drawdown:.2}% < {TRAIL_PERCENT}%: no exit yet");
     }
     let block = trigger_block.expect("the path crosses -15% from the peak");
 
@@ -1295,7 +1356,7 @@ async fn refuting_a_fake_peak_keeps_a_stop_armed_on_a_real_one() {
     w.sell_fraction(25, true);
     w.settle().await;
     let dd = (real_peak - w.value()) / real_peak * 100.0;
-    assert!((3.0..15.0).contains(&dd), "pullback {dd:.2}%");
+    assert!((3.0..TRAIL_PERCENT).contains(&dd), "pullback {dd:.2}%");
     assert!(w.chain.lock().unwrap().sells.is_empty());
 
     // 3. A fake pump raises the replica's peak; a re-anchor drops the value back: the drawdown from
@@ -1312,7 +1373,7 @@ async fn refuting_a_fake_peak_keeps_a_stop_armed_on_a_real_one() {
     for _ in 0..10 {
         w.sell_fraction(40, true);
         w.settle().await;
-        if (real_peak - w.value()) / real_peak * 100.0 >= 15.0 {
+        if (real_peak - w.value()) / real_peak * 100.0 >= TRAIL_PERCENT {
             crossed = true;
             break;
         }

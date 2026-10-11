@@ -131,7 +131,7 @@ impl TelegramBot {
     /// preset is recognised from its priority floor.
     pub fn settings_keyboard(mode: ExecutionMode, sub_count: usize, prio_fee: f64, buffer_size: usize) -> InlineKeyboardMarkup {
         let preset = FeePreset::ALL.into_iter().find(|p| (p.gwei().0 - prio_fee).abs() < 0.2);
-        screens::settings_keyboard_parts(mode, sub_count, preset, buffer_size > 0)
+        screens::settings_keyboard_parts(mode, sub_count, preset, buffer_size > 0, None)
     }
 
     /// Only the configured operator chat may control the engine. Anyone can message a bot, and
@@ -594,6 +594,14 @@ impl TelegramBot {
                 let report = match s["cfg_tp:".len()..].parse::<f64>() {
                     Ok(tp) => self.control.set_take_profit(tp).await,
                     Err(_) => control::ApplyReport { aborted: true, ..Default::default() },
+                };
+                self.show_settings(chat_id, edit, Some(&report)).await;
+            }
+            s if s.starts_with("cfg_trail:") => {
+                let report = match control::parse_trailing_callback(s) {
+                    Some(control::TrailingCommand::Set(pct)) => self.control.set_trailing_stop(pct).await,
+                    Some(control::TrailingCommand::ResetToEnv) => self.control.reset_trailing_stop().await,
+                    None => control::ApplyReport { aborted: true, ..Default::default() },
                 };
                 self.show_settings(chat_id, edit, Some(&report)).await;
             }

@@ -49,15 +49,34 @@ fn test_layer1_high_watermark_trailing() {
     assert!(tracker.high_watermark_activated);
     assert_eq!(tracker.highest_price_eth, 1.25);
 
-    // 3. Price pullbacks by 10% from peak (1.125 ETH) -> should NOT liquidate yet (threshold is 15%)
-    let signal = PriceRules::evaluate(&mut tracker, 1.125, &config);
+    // 3. Price pulls back 8% from the peak (1.15 ETH) -> should NOT liquidate yet (default distance 10%)
+    assert_eq!(config.trail_distance_percent, 10.0);
+    let signal = PriceRules::evaluate(&mut tracker, 1.15, &config);
     assert!(signal.is_none());
 
-    // 4. Price pullbacks by 16% from peak (1.05 ETH < 1.25 * 0.85 = 1.0625) -> MUST liquidate
-    let signal = PriceRules::evaluate(&mut tracker, 1.05, &config);
+    // 4. Price pulls back 12% from the peak (1.10 ETH < 1.25 * 0.90 = 1.125) -> MUST liquidate
+    let signal = PriceRules::evaluate(&mut tracker, 1.10, &config);
     assert!(signal.is_some());
     let sig = signal.unwrap();
     assert_eq!(sig.reason, ExitReason::TrailingStop);
+}
+
+#[test]
+fn test_layer1_trailing_distance_follows_the_configured_value() {
+    // After +40%, a 6% pullback: inside a 10% distance, beyond a 5% one.
+    for (distance, sells) in [(10.0, false), (5.0, true), (3.0, true), (30.0, false)] {
+        let config = RiskConfig { trail_distance_percent: distance, ..RiskConfig::default() };
+        let mut tracker = create_sample_tracker(1.0);
+        assert!(PriceRules::evaluate(&mut tracker, 1.40, &config).is_none());
+        let signal = PriceRules::evaluate(&mut tracker, 1.40 * 0.94, &config);
+        assert_eq!(signal.is_some(), sells, "distance {distance}%");
+    }
+    // Exactly at the distance (25% of 2.0 = 0.5, exact in binary): sells (>=, not >).
+    let config = RiskConfig { trail_distance_percent: 25.0, ..RiskConfig::default() };
+    let mut tracker = create_sample_tracker(1.0);
+    PriceRules::evaluate(&mut tracker, 2.0, &config);
+    assert!(PriceRules::evaluate(&mut tracker, 1.5000001, &config).is_none());
+    assert!(PriceRules::evaluate(&mut tracker, 1.5, &config).is_some());
 }
 
 #[test]

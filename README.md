@@ -17,7 +17,7 @@ flowchart TD
     end
 
     subgraph Layer1 [Lapis 1: Spot Price & High-Watermark Trailing]
-        L1A["Adaptive Trailing Stop (+20% aktifasi, -15% peak pullback)"]
+        L1A["Adaptive Trailing Stop (+20% aktifasi, pullback dari puncak = TRAILING_STOP_PERCENT, default 10%)"]
         L1B["Hard Stop-Loss (-20% dari modal beli)"]
     end
 
@@ -71,7 +71,7 @@ flowchart TD
 ### Rincian 6 Lapis Pertahanan:
 
 1. **Lapis 1: Aturan Harga Spot & High-Watermark Trailing (`src/risk/price_rules.rs`)**
-   - **Adaptive High-Watermark Trailing:** Terpicu otomatis saat harga spot posisi mencapai laba $\ge +20\%$ (`TRAIL_ACTIVATE = 20.0%`). Setelah aktif, sistem mencatat titik puncak tertinggi (*High-Water Mark*). Jika harga terkoreksi sebesar **$15\%$ dari titik puncak** (`TRAIL_DIST = 15.0%`), posisi seketika dilikuidasi untuk mengunci margin laba.
+   - **Adaptive High-Watermark Trailing:** Terpicu otomatis saat harga spot posisi mencapai laba $\ge +20\%$ (`TRAIL_ACTIVATE = 20.0%`). Setelah aktif, sistem mencatat titik puncak tertinggi (*High-Water Mark*). Jika harga terkoreksi sebesar jarak trailing dari titik puncak (**default $10\%$**, `TRAILING_STOP_PERCENT` 3–30%, bisa diubah dari Telegram *Settings → 📉 Trail* dan dikembalikan ke nilai `.env` dengan *↺ .env*), posisi seketika dilikuidasi untuk mengunci margin laba. Catatan: jarak di atas ~16,7% bisa menjual di bawah modal setelah aktivasi +20%.
    - **Hard Stop-Loss Otomatis:** Jika harga spot kurva menyentuh **$-20\%$** (`STOP_LOSS = 20.0%`) dari harga beli awal, posisi dilikuidasi seketika.
 
 2. **Lapis 2: Heuristik Aliran Dana & Momentum Pasar (`src/risk/flow_rules.rs`)**
@@ -131,7 +131,7 @@ flowchart TD
     GUARD -- Lolos Seluruh Filter --> DISPATCH[Batch-Sequencing Calldata Buffer Execution]
 
     subgraph EXITS [Pilihan Mode Exit]
-        MODE_SYS["Mode 'sistem': 6-Layer Multi-Defense (Trailing +20%/-15%, Quiet, Decay, Hard SL -20%)"]
+        MODE_SYS["Mode 'sistem': 6-Layer Multi-Defense (Trailing +20%/-10% default, Quiet, Decay, Hard SL -20%)"]
         MODE_TGT["Mode 'target': Take-Profit di MCap >= $10.000 USD | Strict Stop-Loss di -30%"]
     end
 
@@ -159,7 +159,7 @@ flowchart TD
 - **Max Usia Sinyal:** $\le 15\text{ detik}$ (menolak sinyal usang/stale).
 - **Market Cap Ceiling:** $\le \$8.000\text{ USD}$ saat pemicuan order.
 - **Dua Pilihan Mode Exit:**
-  - `sistem`: Memakai siklus proteksi 6 lapis standar (Trailing profit +20% act, -15% peak, Quiet market 30s <0.1 ETH, Inactivity decay 25s, Hard SL -20%).
+  - `sistem`: Memakai siklus proteksi 6 lapis standar (Trailing profit +20% act, pullback dari puncak `TRAILING_STOP_PERCENT` 3–30% (default 10%, bisa diubah dari Telegram), Quiet market 30s <0.1 ETH, Inactivity decay 25s, Hard SL -20%).
   - `target`: Take-profit otomatis saat kapitalisasi pasar menyentuh **$\ge \$10.000\text{ USD}$** atau proteksi *strict stop-loss* pada **$-30\%$**.
 
 ---
@@ -336,7 +336,8 @@ autotradesniper/
 │   ├── prysm_tests.rs          # Test suite komprehensif Pola A/B/C, Guardrails & Exit Mode Seri Prysm
 │   ├── presign_pipeline.rs     # Regresi AOT pre-signing: keabsahan paket, pembatalan aman, nonce lease, eksekusi instan
 │   ├── curve_mirror.rs         # Regresi mirror kurva: sinkronisasi, celah/reorg, loop risiko tanpa RPC, exit berbasis receipt
-│   └── feature_simulation_harness.rs # Dry-run deterministik per fitur + siklus hidup penuh (chain, node RPC & feed tersimulasi)
+│   ├── feature_simulation_harness.rs # Dry-run deterministik per fitur + siklus hidup penuh (chain, node RPC & feed tersimulasi)
+│   └── runtime_risk_and_gas.rs # Regresi: trailing stop via .env/Telegram, batas pajak 99%, gas floor EIP-7623
 └── src/
     ├── lib.rs                  # Root library & MinGW compatibility symbols
     ├── main.rs                 # Entry point & Tokio concurrent task supervisor

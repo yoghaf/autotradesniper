@@ -4,10 +4,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::Instant;
 
+/// Default trailing-stop distance from the high-water mark, in percent (`TRAILING_STOP_PERCENT`).
+pub const DEFAULT_TRAILING_STOP_PERCENT: f64 = 10.0;
+/// Accepted range of the trailing-stop distance, in percent. Tighter than 3% sells on ordinary
+/// curve noise; wider than 30% gives back most of a run-up.
+pub const MIN_TRAILING_STOP_PERCENT: f64 = 3.0;
+pub const MAX_TRAILING_STOP_PERCENT: f64 = 30.0;
+
 /// 6-Layer Defensive Exit Reasons
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExitReason {
-    /// Layer 1: High-Watermark Trailing (-15% from peak after +20% activated)
+    /// Layer 1: High-Watermark Trailing (configurable distance from the peak, default -10%, once +20% activated)
     TrailingStop,
     /// Layer 1: Hard Stop-Loss (-20% from entry price)
     StopLoss,
@@ -42,7 +49,7 @@ pub enum ExitReason {
 impl std::fmt::Display for ExitReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExitReason::TrailingStop => write!(f, "L1: Adaptive High-Watermark Trailing (-15% from peak)"),
+            ExitReason::TrailingStop => write!(f, "L1: Adaptive High-Watermark Trailing Stop"),
             ExitReason::StopLoss => write!(f, "L1: Hard Stop-Loss (-20% from entry)"),
             ExitReason::QuietMarket => write!(f, "L2: Quiet Market (< 0.1 ETH inflow at 30s)"),
             ExitReason::InactivityDecay => write!(f, "L2: Inactivity Decay (25s without outside buy)"),
@@ -66,7 +73,8 @@ impl std::fmt::Display for ExitReason {
 pub struct RiskConfig {
     /// L1: Trailing stop activation threshold (default +20% -> 0.20)
     pub trail_activate_percent: f64,
-    /// L1: Trailing stop drawdown distance from peak (default -15% -> 0.15)
+    /// L1: Trailing stop drawdown distance from peak in percent (default 10.0 -> -10%). At runtime
+    /// it follows `AppConfig::trailing_stop_percent` (`TRAILING_STOP_PERCENT`, Telegram).
     pub trail_distance_percent: f64,
     /// L1: Hard stop loss threshold from entry (default -20% -> 0.20)
     pub stop_loss_percent: f64,
@@ -107,7 +115,7 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             trail_activate_percent: 20.0,
-            trail_distance_percent: 15.0,
+            trail_distance_percent: DEFAULT_TRAILING_STOP_PERCENT,
             stop_loss_percent: 20.0,
 
             quiet_exit_seconds: 30,

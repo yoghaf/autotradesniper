@@ -35,7 +35,7 @@ use crate::addr_set::AddressSet;
 use crate::dispatcher::BroadcasterPool;
 use crate::payload::{
     CalldataPayloadBuilder, ERC20_APPROVE_SELECTOR, PONS_ASSUMED_CREATOR_TAX_BPS, PONS_BASE_FEE_BPS, PONS_BUY_SELECTOR,
-    PONS_INITIAL_TOKEN_RESERVE_WEI, PONS_SELL_SELECTOR,
+    PONS_INITIAL_TOKEN_RESERVE_WEI, PONS_MAX_TOTAL_BUY_TAX_BPS, PONS_SELL_SELECTOR,
 };
 use crate::stream::{l2_message_is_fully_visible, l2_message_is_valid, L2Txs, RawTxView};
 use alloy::primitives::{keccak256, Address, B256, U256};
@@ -167,11 +167,14 @@ pub const DEFAULT_TRADE_BPS: u32 = PONS_BASE_FEE_BPS + PONS_ASSUMED_CREATOR_TAX_
 
 /// One buy on `(eth, tok)`: `(eth', tok', tokens_out)`. Fees and taxes are taken from the quote
 /// before pricing and leave the reserves, so `eth * tok` is invariant (up to integer rounding).
-/// Same rounding as [`CalldataPayloadBuilder::calculate_pons_tokens_out`].
+/// Same rounding as [`CalldataPayloadBuilder::calculate_pons_tokens_out`], and the same 99% ceiling
+/// on the total tax ([`PONS_MAX_TOTAL_BUY_TAX_BPS`]): fee + creator tax + the 99% snipe tax of the
+/// launch second still price ~1% of the quote instead of nothing.
 ///
 /// Checked arithmetic throughout (`U256` operators wrap silently, and the amounts come from
 /// untrusted calldata): `None` when any step would overflow.
 pub fn curve_buy(eth: U256, tok: U256, quote_in: U256, total_bps: u32) -> Option<(U256, U256, U256)> {
+    let total_bps = total_bps.min(PONS_MAX_TOTAL_BUY_TAX_BPS);
     let tax = quote_in.checked_mul(U256::from(total_bps))? / U256::from(10_000u64);
     let net = quote_in.saturating_sub(tax);
     let denom = eth.checked_add(net)?;
@@ -1491,11 +1494,20 @@ fn s_suspect_free(slot: Option<&Slot>) -> bool {
 /// reserve after the window is monotonic in it, so a binary search finds it. `None` when the window
 /// holds no buy large enough to resolve 1 bps, or no value reproduces the reading within rounding.
 fn calibrate(old: Base, window: &[Trade], eth_actual: U256, snipe: &impl Fn(u64) -> u32, borderline: u32) -> Option<u32> {
-    let resolvable = window.iter().any(|t| matches!(t.kind, TradeKind::Buy { quote_in, .. } if quote_in >= U256::from(10u64).pow(U256::from(12u64))));
+    // A buy says something about the fee only when it is large enough to resolve 1 bps and its
+    // total tax is not pinned at the 99% ceiling (a launch-second buy is priced the same whatever
+    // the fee: calibrating on it alone would "find" 0 bps).
+    let resolvable = window.iter().any(|t| {
+        matches!(t.kind, TradeKind::Buy { quote_in, .. } if quote_in >= U256::from(10u64).pow(U256::from(12u64)))
+            && snipe(t.block) < PONS_MAX_TOTAL_BUY_TAX_BPS
+    });
     if !resolvable {
         return None;
     }
     let eth_at = |bps: u32| replay(old.eth, old.tok, window, bps, borderline, snipe).eth;
+    if eth_at(0) == eth_at(MAX_CALIBRATED_BPS) {
+        return None; // nothing in the window depends on the fee
+    }
     let (mut lo, mut hi) = (0u32, MAX_CALIBRATED_BPS);
     // eth_at is non-increasing in bps: find the smallest bps with eth_at(bps) <= actual.
     if eth_at(lo) < eth_actual || eth_at(hi) > eth_actual {

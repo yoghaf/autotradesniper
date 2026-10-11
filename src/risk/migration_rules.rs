@@ -84,7 +84,7 @@ impl MigrationRules {
                                 pool_address: pool_addr,
                                 reason: ExitReason::SecondaryPoolTrailing,
                                 reason_description: format!(
-                                    "Secondary Pool Trailing Triggered: {:.2}% pullback from peak, PnL: +{:.2}%",
+                                    "Secondary Pool Trailing Triggered: {:.2}% pullback from peak, PnL: {:+.2}%",
                                     drawdown_from_peak, pnl_pct
                                 ),
                                 is_emergency: false,

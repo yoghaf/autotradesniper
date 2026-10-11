@@ -628,11 +628,19 @@ impl WalletManager {
 
     /// Automated Gas Rebalancing: Master account funds sub-accounts whose balance is low
     pub async fn rebalance_gas(&self) -> Result<Vec<GasRebalanceResult>> {
+        self.rebalance_gas_for(0.0).await
+    }
+
+    /// [`Self::rebalance_gas`] that never leaves a carrier below what the node needs to accept its
+    /// packets: `submit_need_eth` (gas limit x the max fee signed). A carrier under 1.2x that is
+    /// topped up to at least 2x it, whatever `MIN_SUB_ACCOUNT_ETH` / `REBALANCE_TARGET_ETH` say.
+    pub async fn rebalance_gas_for(&self, submit_need_eth: f64) -> Result<Vec<GasRebalanceResult>> {
         info!("Initiating Automated Gas Rebalancing for Satellite Sub-Accounts...");
         let master = self.get_master_account().await?;
         let sub_accounts = self.get_sub_accounts().await?;
-        let min_balance_eth = *self.config.min_sub_account_eth.read().await;
-        let target_balance_eth = *self.config.rebalance_target_eth.read().await;
+        let need = if submit_need_eth.is_finite() { submit_need_eth.max(0.0) } else { 0.0 };
+        let min_balance_eth = self.config.min_sub_account_eth.read().await.max(need * 1.2);
+        let target_balance_eth = self.config.rebalance_target_eth.read().await.max(need * 2.0).max(min_balance_eth);
         let rpc_http = self.config.rpc_http_url.clone();
 
         // Every RPC below is time-bounded: a hung endpoint must not keep a rebalance (and the

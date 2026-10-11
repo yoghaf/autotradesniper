@@ -387,6 +387,8 @@ fn every_keyboard_button_fits_telegram_limits_and_state_buttons_are_whitelisted(
         time_decay_exit_secs: 45,
         gas_limit: 300_000,
         trade_eth: 0.01,
+        trailing_stop_percent: 10.0,
+        trailing_from_runtime: false,
     };
     let keyboards = [
         screens::main_menu_keyboard(true, None),
@@ -419,7 +421,13 @@ fn every_keyboard_button_fits_telegram_limits_and_state_buttons_are_whitelisted(
     // Selection marks follow the live state: exactly one carrier, one fee and one padding mark.
     let buttons: Vec<_> = screens::settings_keyboard(&view).inline_keyboard.into_iter().flatten().collect();
     let marked = |prefix: &str| buttons.iter().filter(|b| matches!(&b.kind, InlineKeyboardButtonKind::CallbackData(d) if d.starts_with(prefix)) && b.text.contains('✅')).count();
-    assert_eq!((marked("cfg_sub"), marked("cfg_fee"), marked("cfg_buffer")), (1, 1, 1));
+    assert_eq!((marked("cfg_sub"), marked("cfg_fee"), marked("cfg_buffer"), marked("cfg_trail")), (1, 1, 1, 1));
+    let custom = SettingsView { trailing_stop_percent: 7.5, ..view };
+    let buttons: Vec<_> = screens::settings_keyboard(&custom).inline_keyboard.into_iter().flatten().collect();
+    assert!(
+        !buttons.iter().any(|b| matches!(&b.kind, InlineKeyboardButtonKind::CallbackData(d) if d.starts_with("cfg_trail")) && b.text.contains('✅')),
+        "a distance without a button marks none"
+    );
     let off = SettingsView { padding_on: false, buffer_size: 0, preset: None, ..view };
     let buttons: Vec<_> = screens::settings_keyboard(&off).inline_keyboard.into_iter().flatten().collect();
     let zero = buttons.iter().find(|b| matches!(&b.kind, InlineKeyboardButtonKind::CallbackData(d) if d == "cfg_buffer:0")).unwrap();
@@ -1202,6 +1210,8 @@ fn hostile_snapshot(open_positions: usize) -> SystemSnapshot {
         time_decay_exit_secs: 45,
         gas_limit: 300_000,
         trade_eth: 0.01,
+        trailing_stop_percent: 10.0,
+        trailing_from_runtime: false,
     };
     let fresh = CurveSnapshot {
         curve: CURVE,
