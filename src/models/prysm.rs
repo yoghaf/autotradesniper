@@ -1,16 +1,17 @@
 use crate::config::AppConfig;
-use crate::dispatcher::BroadcasterPool;
+use crate::dispatcher::{BroadcasterPool, Dispatcher, StageOutcome};
 use crate::payload::{self, CalldataPayloadBuilder};
 use crate::types::{PrysmPattern, TradeSignal};
 use alloy::primitives::{address, Address, B256, U256};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tokio::sync::{mpsc, watch, RwLock};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, info, warn};
 
 /// Image URL substring characteristic of Prysm Series operator
 pub const PRYSMCLOUD_SUBSTRING: &str = "prysmcloud/token-images";
@@ -65,9 +66,16 @@ pub enum LaunchResolution {
 
 /// Receipt poll cadence of the background resolver. The feed is ahead of every RPC index, so
 /// the receipt of block L typically appears tens to hundreds of ms after L is seen.
+///
+/// The cadence is a fixed-rate [`tokio::time::interval`] (no drift from the request round trip) and a
+/// newly observed block cuts the wait short: see [`PrysmEngine::spawn_resolver`].
 const RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(60);
 /// Launch records (metadata, resolutions) are forgotten after this long.
 const LAUNCH_RECORD_TTL: Duration = Duration::from_secs(120);
+/// How often, and how long at most (retries x step = 100 ms), the primary staging waits for the
+/// carrier batch of its launch to be registered when the resolution overtook the arming task.
+const STAGE_ARM_RETRIES: u32 = 20;
+const STAGE_ARM_RETRY_STEP: Duration = Duration::from_millis(5);
 
 /// Read the launch outcome from a receipt. Only `T_LAUNCH` logs emitted by an allowlisted
 /// launchpad count; a reverted launch (status 0) resolves to `Failed`.
@@ -263,6 +271,18 @@ struct Inner {
     master_address: std::sync::RwLock<Option<Address>>,
     /// Highest block observed (feed or HTTP).
     last_block: AtomicU64,
+    /// Fires once per *new* highest block. Receipt resolvers wait on it next to their poll tick, so a
+    /// sealed block wakes them immediately instead of at the next `sleep` expiry.
+    block_tx: watch::Sender<u64>,
+    /// `pending_orders.len()`, kept under the same lock: lets the per-message block hook return
+    /// without touching a lock or awaiting a config `RwLock` while nothing is queued.
+    pending_count: AtomicUsize,
+    /// Receipt poll period in ms (see [`RECEIPT_POLL_INTERVAL`]).
+    poll_ms: AtomicU64,
+    /// AOT pre-signing pipeline (optional): staged transactions for orders that still wait.
+    presigner: OnceLock<Arc<Dispatcher>>,
+    /// One reserve refresh at a time.
+    refreshing: AtomicBool,
 }
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -285,6 +305,11 @@ impl PrysmEngine {
                 broadcaster: OnceLock::new(),
                 master_address: std::sync::RwLock::new(None),
                 last_block: AtomicU64::new(0),
+                block_tx: watch::channel(0).0,
+                pending_count: AtomicUsize::new(0),
+                poll_ms: AtomicU64::new(RECEIPT_POLL_INTERVAL.as_millis() as u64),
+                presigner: OnceLock::new(),
+                refreshing: AtomicBool::new(false),
             }),
         }
     }
@@ -292,6 +317,20 @@ impl PrysmEngine {
     /// RPC pool used to resolve launch receipts (and read curve reserves) in the background.
     pub fn with_broadcaster(self, broadcaster: Arc<BroadcasterPool>) -> Self {
         let _ = self.inner.broadcaster.set(broadcaster);
+        self
+    }
+
+    /// Enable the AOT pre-signing pipeline: entries that have to wait (for the launch receipt or for
+    /// their target block) get their transactions signed in the background, and the target block
+    /// only broadcasts stored bytes. Without it the engine behaves as before.
+    pub fn with_presigner(self, dispatcher: Arc<Dispatcher>) -> Self {
+        let _ = self.inner.presigner.set(dispatcher);
+        self
+    }
+
+    /// Override the receipt poll period (default 60 ms). Mostly for tests.
+    pub fn with_receipt_poll_interval(self, period: Duration) -> Self {
+        self.inner.poll_ms.store(period.as_millis().clamp(1, u64::MAX as u128) as u64, Ordering::Relaxed);
         self
     }
 
@@ -677,12 +716,24 @@ impl PrysmEngine {
     /// The former code fetched the receipt *inside* `process_new_block`, i.e. on the feed
     /// reader: each attempt stalled feed ingestion for an RPC round trip (2.5 s per endpoint on
     /// a dead one), and an RPC error dropped the order.
+    ///
+    /// Scheduling: the wait between two polls is `select!(interval tick, newer block)`.
+    /// - The tick is a fixed-rate interval, so the cadence no longer drifts by the round trip of
+    ///   every request (the former `sleep(60 ms)` after each poll made the real period 60 ms + RTT)
+    ///   and a slow answer is followed by an immediate poll instead of another full sleep.
+    /// - A newly observed block wakes the loop at once: once block L+1 is sealed the node that
+    ///   served L has almost certainly indexed L's receipt, so waiting out the rest of the tick
+    ///   would only add jitter.
     fn spawn_resolver(&self, launch_tx: B256) {
         let Some(reader) = self.inner.broadcaster.get().cloned() else { return };
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let budget = Duration::from_secs(*inner.config.prysm_max_signal_age_secs.read().await);
             let deadline = Instant::now() + budget;
+            let mut blocks = inner.block_tx.subscribe();
+            let mut tick = tokio::time::interval(Duration::from_millis(inner.poll_ms.load(Ordering::Relaxed).max(1)));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick is immediate: the first poll below is the "poll now"
             loop {
                 if let Ok(Some(receipt)) = reader.get_transaction_receipt(launch_tx).await {
                     let mut resolution = parse_launch_receipt(&receipt, &inner.config.prysm_launchpads);
@@ -699,9 +750,14 @@ impl PrysmEngine {
                 }
                 if Instant::now() >= deadline {
                     warn!("[Prysm] Launch {:?} unresolved after {:?}; its orders will expire", launch_tx, budget);
+                    inner.cancel_staged(launch_tx);
                     return;
                 }
-                tokio::time::sleep(RECEIPT_POLL_INTERVAL).await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    // `Err` = the sender is gone, which cannot happen while `inner` is alive.
+                    _ = blocks.changed() => {}
+                }
             }
         });
     }
@@ -731,7 +787,7 @@ impl PrysmEngine {
             // fire that entry now instead of entering twice.
             if report.pattern == PrysmPattern::PatternC && self.inner.expedite(meta.launch_tx_hash, current_block) {
                 info!("⚡ [Prysm Pola C] Companion confirmation: firing queued entry for launch {:?} now", meta.launch_tx_hash);
-                self.inner.last_block.fetch_max(current_block, Ordering::Relaxed);
+                self.inner.observe_block(current_block);
                 Inner::release_due(&self.inner, current_block, Some(meta.launch_tx_hash)).await;
             } else {
                 info!("[Prysm] Launch {:?} already queued/entered, skipping duplicate match", meta.launch_tx_hash);
@@ -757,27 +813,244 @@ impl PrysmEngine {
             dev_buy_eth: meta.dev_buy_eth,
             trigger_account,
         };
-        self.inner.last_block.fetch_max(current_block, Ordering::Relaxed);
+        self.inner.observe_block(current_block);
         info!(
             "⏳ [Prysm] Order armed: fire at Block #{} (lands #{}), current #{}, launch {:?}",
             order.scheduled_block, order.scheduled_block + 1, current_block, order.launch_tx_hash
         );
-        locked(&self.inner.pending_orders).push(order);
+        // AOT: an order that cannot fire right now (receipt or target block outstanding) gets its
+        // carriers signed in the background while it waits. One that can (Pola C on a resolved
+        // curve, the 0-delay profile) is not staged: signing it ahead would only compete for CPU
+        // with the dispatch that follows immediately.
+        if self.inner.presigner.get().is_some() && self.inner.must_wait(&order, current_block) {
+            let max_age = Duration::from_secs(*config.prysm_max_signal_age_secs.read().await);
+            Inner::spawn_arm(&self.inner, order.launch_tx_hash, order.created_at + max_age);
+        }
+        {
+            let mut pending = locked(&self.inner.pending_orders);
+            pending.push(order);
+            self.inner.pending_count.store(pending.len(), Ordering::Release);
+        }
         Inner::release_due(&self.inner, current_block, None).await;
     }
 
     /// On each new block, fire matured orders whose launch is resolved (no I/O on this path).
+    ///
+    /// Called for every L2 message of the feed, so everything here is event driven and lock-light:
+    /// no timer, no await while nothing is queued, and the once-per-block work (staged-packet
+    /// re-validation, quote refresh, record ageing) only runs when the block number really advanced.
     pub async fn process_new_block(&self, current_block: u64) {
         if !self.inner.config.is_prysm_enabled() {
+            // Switched off while orders are staged: their leased nonces must not stay held.
+            if let Some(dispatcher) = self.inner.presigner.get()
+                && dispatcher.has_staged()
+            {
+                dispatcher.cancel_all_presigned();
+            }
             return;
         }
-        self.inner.last_block.fetch_max(current_block, Ordering::Relaxed);
+        let advanced = self.inner.observe_block(current_block);
         Inner::release_due(&self.inner, current_block, None).await;
-        self.inner.forget_old_launches();
+        if advanced {
+            Inner::on_block_advanced(&self.inner);
+            self.inner.forget_old_launches();
+        }
+    }
+
+    /// Cancel everything pending for a launch: its queued orders are dropped and its staged
+    /// (pre-signed) packets are torn down, handing every leased nonce back. The entry slot of the
+    /// launch stays claimed, so the same launch is not re-entered. True if anything was cancelled.
+    ///
+    /// Safe against a concurrent dispatch: if the batch was already claimed by the dispatcher the
+    /// transactions are on their way and are not touched (exactly one of the two wins).
+    pub async fn cancel_launch(&self, launch_tx: B256) -> bool {
+        let dropped = {
+            let mut pending = locked(&self.inner.pending_orders);
+            let before = pending.len();
+            pending.retain(|o| o.launch_tx_hash != launch_tx);
+            self.inner.pending_count.store(pending.len(), Ordering::Release);
+            before != pending.len()
+        };
+        let torn_down = self.inner.cancel_staged(launch_tx);
+        if dropped || torn_down {
+            info!("[Prysm] Launch {:?} cancelled (orders dropped: {}, staged packets released: {})", launch_tx, dropped, torn_down);
+        }
+        dropped || torn_down
+    }
+
+    /// Feed a fresher `getReserves()` reading for a resolved launch (from a refresher or a curve
+    /// mirror). The next entry is quoted on it, and a staged primary whose Revert Guard moved beyond
+    /// the pre-signing tolerance is signed again right away, ahead of the target block.
+    pub fn update_reserves(&self, launch_tx: B256, eth_reserve: U256, token_reserve: U256) -> bool {
+        Inner::set_reserves(&self.inner, launch_tx, eth_reserve, token_reserve)
     }
 }
 
+/// The numbers an entry is built from: its signal plus what the guardrails need to judge it.
+struct EntryQuote {
+    signal: TradeSignal,
+    min_tokens_out: U256,
+    /// Market cap on the reserves used, if they allow one.
+    mcap_usd: Option<f64>,
+}
+
 impl Inner {
+    /// Record `block` as seen. True if it is a new highest block; that wakes every receipt resolver.
+    fn observe_block(&self, block: u64) -> bool {
+        let prev = self.last_block.fetch_max(block, Ordering::AcqRel);
+        if block > prev {
+            self.block_tx.send_replace(block);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Can `order` not be sent at `current_block` yet: target block still ahead, or launch unresolved?
+    fn must_wait(&self, order: &PendingPrysmOrder, current_block: u64) -> bool {
+        if order.scheduled_block > current_block {
+            return true;
+        }
+        if order.token_address != order.pool_address {
+            return false;
+        }
+        // A failed launch will be rejected, not waited for.
+        !locked(&self.resolutions).contains_key(&order.launch_tx_hash)
+    }
+
+    /// Tear down the staged packets of a launch (order rejected, cancelled, launch failed).
+    fn cancel_staged(&self, launch_tx: B256) -> bool {
+        self.presigner.get().is_some_and(|d| d.cancel_presigned(launch_tx))
+    }
+
+    /// Arm the staging batch of `launch_tx` in the background. Never on the feed path.
+    fn spawn_arm(inner: &Arc<Inner>, launch_tx: B256, hold_until: Instant) {
+        let Some(dispatcher) = inner.presigner.get().cloned() else { return };
+        tokio::spawn(async move {
+            dispatcher.arm_presign(launch_tx, hold_until).await;
+        });
+    }
+
+    /// Once per new block: re-validate staged packets against the live fees and, for orders that
+    /// are still waiting, refresh the curve reserves their Revert Guard was quoted on.
+    fn on_block_advanced(inner: &Arc<Inner>) {
+        let Some(dispatcher) = inner.presigner.get().cloned() else { return };
+        if dispatcher.has_staged() {
+            tokio::spawn(async move {
+                dispatcher.revalidate_presigned().await;
+            });
+        }
+        if inner.pending_count.load(Ordering::Acquire) > 0 {
+            Inner::refresh_waiting_reserves(inner);
+        }
+    }
+
+    /// Re-read `getReserves()` of every resolved launch whose order still waits for its block.
+    /// A single refresh runs at a time; the feed path only spawns it.
+    fn refresh_waiting_reserves(inner: &Arc<Inner>) {
+        let Some(reader) = inner.broadcaster.get().cloned() else { return };
+        let last = inner.last_block.load(Ordering::Acquire);
+        let targets: Vec<(B256, Address)> = {
+            let pending = locked(&inner.pending_orders);
+            let resolutions = locked(&inner.resolutions);
+            pending
+                .iter()
+                .filter(|o| o.scheduled_block > last)
+                .filter_map(|o| match resolutions.get(&o.launch_tx_hash) {
+                    Some((LaunchResolution::Resolved { curve, .. }, _)) => Some((o.launch_tx_hash, *curve)),
+                    _ => None,
+                })
+                .collect()
+        };
+        if targets.is_empty() || inner.refreshing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            let call = CalldataPayloadBuilder::build_pons_get_reserves_payload();
+            for (launch_tx, curve) in targets {
+                let reading = tokio::time::timeout(Duration::from_secs(1), reader.eth_call(curve, &call))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .and_then(|raw| CalldataPayloadBuilder::decode_get_reserves_output(&raw));
+                if let Some((eth, token)) = reading {
+                    Inner::set_reserves(&inner, launch_tx, eth, token);
+                }
+            }
+            inner.refreshing.store(false, Ordering::Release);
+        });
+    }
+
+    /// Store fresher reserves for a resolved launch and re-quote its staged primary.
+    fn set_reserves(inner: &Arc<Inner>, launch_tx: B256, eth: U256, token: U256) -> bool {
+        let found = match locked(&inner.resolutions).get_mut(&launch_tx) {
+            Some((LaunchResolution::Resolved { reserves, .. }, _)) => {
+                *reserves = Some((eth, token));
+                true
+            }
+            _ => false,
+        };
+        if found {
+            Inner::stage_waiting(inner, launch_tx);
+        }
+        found
+    }
+
+    /// Phase 2 of the AOT pipeline: the launch of a still-waiting order resolved (or its quote moved),
+    /// so sign its primary buy now. The staging call is idempotent: it keeps a staged primary whose
+    /// Revert Guard is still within tolerance and signs a new one, under the same nonce, otherwise.
+    fn stage_waiting(inner: &Arc<Inner>, launch_tx: B256) {
+        let Some(dispatcher) = inner.presigner.get().cloned() else { return };
+        let last = inner.last_block.load(Ordering::Acquire);
+        let job = {
+            let pending = locked(&inner.pending_orders);
+            let resolutions = locked(&inner.resolutions);
+            match (
+                pending.iter().find(|o| o.launch_tx_hash == launch_tx && o.scheduled_block > last),
+                resolutions.get(&launch_tx).map(|(r, _)| *r),
+            ) {
+                (Some(order), Some(LaunchResolution::Resolved { token, curve, reserves })) => Some((order.clone(), token, curve, reserves)),
+                _ => None,
+            }
+        };
+        let Some((order, token, curve, reserves)) = job else { return };
+        let inner = inner.clone();
+        tokio::spawn(async move {
+            let quote = inner.quote_entry(&order, token, curve, reserves, last).await;
+            // An entry the valuation guardrail will refuse is not worth a nonce.
+            let max_mcap_usd = *inner.config.prysm_max_mcap_usd.read().await;
+            if quote.mcap_usd.is_some_and(|m| m > max_mcap_usd) {
+                return;
+            }
+            // The resolution can overtake the (equally background) arming of the carrier batch when the
+            // runtime is busy: the batch is then not registered yet. Wait for it, a few short steps at
+            // most and only while the order still waits for its block; this is off the hot path.
+            let mut attempts = 0u32;
+            let outcome = loop {
+                let outcome = dispatcher.stage_primary(&quote.signal).await;
+                if matches!(outcome, StageOutcome::NotArmed)
+                    && attempts < STAGE_ARM_RETRIES
+                    && inner.last_block.load(Ordering::Acquire) < order.scheduled_block
+                {
+                    attempts += 1;
+                    tokio::time::sleep(STAGE_ARM_RETRY_STEP).await;
+                    continue;
+                }
+                break outcome;
+            };
+            match outcome {
+                StageOutcome::Staged { nonce } => {
+                    info!("🧾 [Prysm] Primary pre-signed for launch {:?} (nonce {}, minTokensOut {})", launch_tx, nonce, quote.min_tokens_out)
+                }
+                StageOutcome::Restaged { nonce } => {
+                    info!("🧾 [Prysm] Primary re-signed after a quote move for launch {:?} (nonce {})", launch_tx, nonce)
+                }
+                other => debug!("[Prysm] primary of {:?} not staged: {:?}", launch_tx, other),
+            }
+        });
+    }
+
     /// Make queued orders of `launch_tx` due at `current_block`; true if any was queued.
     fn expedite(&self, launch_tx: B256, current_block: u64) -> bool {
         let mut found = false;
@@ -802,15 +1075,31 @@ impl Inner {
                     recent.insert(token, meta);
                 }
             }
-            LaunchResolution::Failed => warn!("[Prysm] Launch {:?} reverted or emitted no launch event", launch_tx),
+            LaunchResolution::Failed => {
+                warn!("[Prysm] Launch {:?} reverted or emitted no launch event", launch_tx);
+                // Nothing will ever be bought: the staged carriers must not hold their nonces.
+                inner.cancel_staged(launch_tx);
+            }
         }
         // Orders already due fire now instead of waiting for the next block.
-        let current = inner.last_block.load(Ordering::Relaxed);
+        let current = inner.last_block.load(Ordering::Acquire);
         Inner::release_due(inner, current, Some(launch_tx)).await;
+        // Orders still waiting for their block get their primary signed while they wait.
+        if matches!(resolution, LaunchResolution::Resolved { .. }) {
+            Inner::stage_waiting(inner, launch_tx);
+        }
     }
 
     /// Take every due order (optionally only those of `only_launch`) that can be decided now.
+    ///
+    /// The `Pending -> Dispatched` transition happens here, under the `pending_orders` lock: an order
+    /// is removed from the queue in the same critical section in which it is judged, so concurrent
+    /// callers (feed blocks, the resolver, a companion confirmation) can never both release it.
     async fn release_due(inner: &Arc<Inner>, current_block: u64, only_launch: Option<B256>) {
+        // Nothing queued (the usual case: this runs for every feed message): no lock, no await.
+        if inner.pending_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
         let config = &inner.config;
         let max_age = Duration::from_secs(*config.prysm_max_signal_age_secs.read().await);
         let now = Instant::now();
@@ -849,6 +1138,7 @@ impl Inner {
                     Some(Err(reason)) => decided.push(Release::Reject(pending.swap_remove(i), reason)),
                 }
             }
+            inner.pending_count.store(pending.len(), Ordering::Release);
             decided
         };
 
@@ -857,6 +1147,7 @@ impl Inner {
                 Release::Ready(order, token, curve, reserves) => inner.fire(order, token, curve, reserves, current_block).await,
                 Release::Reject(mut order, reason) => {
                     warn!("⚠️ [Prysm Guardrail Rejection] {}: launch {:?}", reason, order.launch_tx_hash);
+                    inner.cancel_staged(order.launch_tx_hash);
                     order.report.rejection_reason = Some(reason);
                     inner.stats.record_match(order.report).await;
                 }
@@ -864,8 +1155,11 @@ impl Inner {
         }
     }
 
-    /// Build the Pons buy (Revert Guard quoted on the real post-launch reserves) and enqueue it.
-    async fn fire(&self, mut order: PendingPrysmOrder, token: Address, curve: Address, reserves: Option<(U256, U256)>, current_block: u64) {
+    /// Build the Pons buy (Revert Guard quoted on the real post-launch reserves) of `order`.
+    ///
+    /// Shared by the hot path ([`Self::fire`]) and the staging path, so a pre-signed primary and the
+    /// signal that later claims it are built by the very same code from the same numbers.
+    async fn quote_entry(&self, order: &PendingPrysmOrder, token: Address, curve: Address, reserves: Option<(U256, U256)>, current_block: u64) -> EntryQuote {
         let config = &self.config;
         let size_wei = U256::from((order.size_eth * 1e18) as u128);
         // Live reserves when the resolver got them; otherwise the initial curve plus the dev
@@ -873,22 +1167,7 @@ impl Inner {
         let (eth_reserve, token_reserve) = reserves.unwrap_or_else(|| {
             payload::pons_reserves_after_buy(U256::from((order.dev_buy_eth.max(0.0) * 1e18) as u128))
         });
-
-        // Valuation guardrail on real numbers (the detection-time figure is a placeholder).
-        let max_mcap_usd = *config.prysm_max_mcap_usd.read().await;
-        if let Some(mcap_eth) = payload::pons_mcap_eth(eth_reserve, token_reserve) {
-            order.report.market_cap_usd = mcap_eth * payload::eth_usd_reference();
-        }
-        if order.report.market_cap_usd > max_mcap_usd {
-            let reason = format!(
-                "Market Cap Ceiling Exceeded at release: ${:.2} > ${:.2}",
-                order.report.market_cap_usd, max_mcap_usd
-            );
-            warn!("⚠️ [Prysm Guardrail Rejection] {} for {:?}", reason, token);
-            order.report.rejection_reason = Some(reason);
-            self.stats.record_match(order.report).await;
-            return;
-        }
+        let mcap_usd = payload::pons_mcap_eth(eth_reserve, token_reserve).map(|mcap_eth| mcap_eth * payload::eth_usd_reference());
 
         let slippage = *config.prysm_slippage_percent.read().await;
         // Revert Guard: minTokensOut quoted for the Block +1 snipe tax (6.18% + 1% fee) plus
@@ -918,18 +1197,46 @@ impl Inner {
             block_number: current_block,
             strategy_tag: Some(format!("{}: {}", PRYSM_STRATEGY_TAG_PREFIX, order.report.pattern)),
         };
+        EntryQuote { signal, min_tokens_out, mcap_usd }
+    }
 
-        match self.signal_tx.try_send(signal) {
+    /// Enqueue the entry of a matured order. Its pre-signed packets (if any) are claimed by the
+    /// dispatcher that receives the signal.
+    async fn fire(&self, mut order: PendingPrysmOrder, token: Address, curve: Address, reserves: Option<(U256, U256)>, current_block: u64) {
+        let config = &self.config;
+        let quote = self.quote_entry(&order, token, curve, reserves, current_block).await;
+
+        // Valuation guardrail on real numbers (the detection-time figure is a placeholder).
+        let max_mcap_usd = *config.prysm_max_mcap_usd.read().await;
+        if let Some(mcap_usd) = quote.mcap_usd {
+            order.report.market_cap_usd = mcap_usd;
+        }
+        if order.report.market_cap_usd > max_mcap_usd {
+            let reason = format!(
+                "Market Cap Ceiling Exceeded at release: ${:.2} > ${:.2}",
+                order.report.market_cap_usd, max_mcap_usd
+            );
+            warn!("⚠️ [Prysm Guardrail Rejection] {} for {:?}", reason, token);
+            self.cancel_staged(order.launch_tx_hash);
+            order.report.rejection_reason = Some(reason);
+            self.stats.record_match(order.report).await;
+            return;
+        }
+
+        match self.signal_tx.try_send(quote.signal) {
             Ok(()) => {
                 info!(
                     "🚀 [Prysm Entry Fired at Block #{}] {} Token {:?} on Curve {:?}, {:.4} ETH, minTokensOut {}",
-                    current_block, order.report.pattern, token, curve, order.size_eth, min_tokens_out
+                    current_block, order.report.pattern, token, curve, order.size_eth, quote.min_tokens_out
                 );
                 order.report.token_address = token;
                 order.report.guardrails_passed = true;
                 self.stats.record_match(order.report).await;
             }
-            Err(e) => warn!("Failed to enqueue matured Prysm order: {}", e),
+            Err(e) => {
+                warn!("Failed to enqueue matured Prysm order: {}", e);
+                self.cancel_staged(order.launch_tx_hash);
+            }
         }
     }
 

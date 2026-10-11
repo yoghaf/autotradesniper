@@ -159,6 +159,58 @@ flowchart TD
 
 ---
 
+## 🧊 AOT PRE-SIGNING PIPELINE (ZERO-CRYPTO HOT PATH)
+
+Tanda tangan ECDSA + keccak atas tx berkalldata 94,5 KB (≈ **0,70 ms per tx** di rilis: 0,29 ms signature hash + 0,09 ms
+`sign_hash` + 0,28 ms hash envelope + 0,01 ms body hex/JSON) tidak lagi dibayar saat blok target tiba.
+
+**Dua fase staging** (`Dispatcher::arm_presign` / `stage_primary`):
+1. **Saat pola A/B cocok** - batch dibuat per launch; tiap akun satelit (carrier, `value = 0`, tidak butuh data launch) diberi
+   *NonceLease* dan ditandatangani di satu thread blocking. Bytes mentah EIP-2718 + body JSON-RPC (hex sekali) disimpan di memori.
+2. **Saat T_LAUNCH ter-resolve** dan order masih menunggu blok target - alamat kurva diketahui, jadi *primary* (master, beli kurva
+   Pons dengan Revert Guard `minTokensOut`) ikut ditandatangani dengan nonce master yang di-lease.
+
+**Dispatch** (`dispatch_signal`) meng-*claim* batch lewat compare-exchange (`Staged -> Claimed -> Dispatched`; hanya satu dari
+dispatch / cancel / expiry yang menang), memvalidasi tiap paket terhadap fee dan quote live, lalu `broadcast_body` menulis
+bytes tersimpan ke socket - tanpa signing. Paket yang basi ditandatangani ulang **dengan nonce yang sama** (tidak ada lubang nonce).
+
+| Invalidasi | Kondisi (default) | Tindakan |
+|---|---|---|
+| FeeDrift | fee cap staged < fee live x (1 - 10%) | re-sign proaktif tiap blok baru / saat claim |
+| GasDrift | gas limit < intrinsik + cadangan + komponen L1 saat ini | re-sign |
+| QuoteDrift | `minTokensOut` beda > 2% dari quote baru (hanya kata itu yang boleh beda) | re-stage primary, nonce sama |
+| TargetMismatch / ParamsChanged | token/kurva, ukuran buffer atau gas limit berubah | re-sign inline |
+| Expired | batch lebih tua dari `PRESIGN_MAX_HOLD_MS` (8 s) | janitor melepas lease |
+| NonceOvertaken | node melaporkan pending nonce > nonce lease | paket dibuang, nonce baru |
+| Cancel | order ditolak / launch gagal / mcap / stale / Prysm dimatikan / `cancel_launch` | semua lease dikembalikan |
+
+**Keamanan nonce:** nonce yang di-lease kebal terhadap `return_nonce`/`reconcile_nonce` (healing celah), sehingga tx yang sudah
+ditandatangani tidak pernah kehilangan nonce-nya; lease yang dilepas/di-drop mengembalikan nonce hanya bila belum terpakai di chain.
+
+**Penjadwalan deterministik** (`models/prysm.rs`): resolver receipt memakai `tokio::time::interval` laju-tetap
+(`MissedTickBehavior::Delay`) digabung `watch::changed()` yang berbunyi sekali per blok tertinggi baru, jadi tidak ada drift
+`sleep(60 ms) + RTT` dan resolver bangun seketika saat blok L+1 terbit. Transisi `Pending -> Dispatched` terjadi di bawah satu
+lock `pending_orders` (tepat sekali, thread-safe); jalur feed tanpa antrean hanya satu load atomik.
+
+**Batasan yang perlu diketahui:** (a) *primary* baru bisa di-pre-sign setelah T_LAUNCH ter-resolve; pada profil default
+`PRYSM_MIN_BLOCK_DELAY=1` order langsung jatuh tempo saat resolve, jadi yang terbantu hanya carrier (primary ditandatangani inline);
+(b) nonce yang ditahan menunda tx lain dari akun yang sama sampai batch dikirim/dibatalkan/kedaluwarsa (dibatasi `PRESIGN_MAX_HOLD_MS`);
+(c) polling receipt (rata-rata ~30 ms deteksi) tetap latensi dominan - langkah lanjut: `eth_subscribe logs` (push) menggantikan polling.
+
+**Hasil `cargo bench --bench presign_latency`** (container 2 core, loopback; angka absolut adalah batas bawah, selisih antar-mode
+adalah penghematan - jalankan ulang di mesin Anda):
+
+| Mode (4 tx, 2 worker) | Tx pertama tiba (median) | Tx terakhir tiba (median) |
+|---|---|---|
+| on-the-fly | 2,07 ms | 3,09 ms |
+| carrier staged (default Block +1) | 0,81 ms | 1,22 ms |
+| fully staged (order menunggu blok) | 0,49 ms | 0,67 ms |
+
+Dengan 8 tx pada 2 worker: 6,92 ms -> 1,34 ms (fully staged). Menandatangani N tx paralel di sedikit core menyerialisasi; staging
+menghilangkan kontensi itu.
+
+---
+
 ## ⚡ RINGKASAN OPTIMASI PERFORMA & LATENSI (< 100 µs TARGET)
 
 Pengujian micro-benchmark nyata dilakukan menggunakan harness **Criterion**:
@@ -196,10 +248,12 @@ autotradesniper/
 ├── runtime_config.json         # State konfigurasi dinamis yang dipersistensikan
 ├── README.md                   # Dokumentasi sistem & laporan audit performa
 ├── benches/
-│   └── latency_benchmark.rs    # Criterion microsecond latency benchmark suite
+│   ├── latency_benchmark.rs    # Criterion microsecond latency benchmark suite
+│   └── presign_latency.rs      # Pre-signed vs on-the-fly: biaya per tx & latensi dispatch end-to-end
 ├── tests/
 │   ├── risk_tests.rs           # Test suite komprehensif 6 lapis pertahanan risk engine
-│   └── prysm_tests.rs          # Test suite komprehensif Pola A/B/C, Guardrails & Exit Mode Seri Prysm
+│   ├── prysm_tests.rs          # Test suite komprehensif Pola A/B/C, Guardrails & Exit Mode Seri Prysm
+│   └── presign_pipeline.rs     # Regresi AOT pre-signing: keabsahan paket, pembatalan aman, nonce lease, eksekusi instan
 └── src/
     ├── lib.rs                  # Root library & MinGW compatibility symbols
     ├── main.rs                 # Entry point & Tokio concurrent task supervisor
@@ -209,6 +263,8 @@ autotradesniper/
     ├── wallet.rs               # BIP-39 HD Master, BIP-44 Sub-Accounts & Atomic Nonces
     ├── stream.rs               # Real-Time Arbitrum Nitro Sequencer Feed Streamer & L2 Unpacker
     ├── dispatcher.rs           # Direct Sequencer BroadcasterPool & Pipelined Parallel Signing
+    ├── dispatcher/
+    │   └── presign.rs          # AOT pre-signing: StagedBatch (state machine CAS), StagingBook, PresignPolicy
     ├── models/
     │   ├── mod.rs              # Entry point modul strategi mandiri
     │   └── prysm.rs            # Fast-Path Pattern Evaluator "Seri Prysm" (Pola A/B/C + Guardrails)
@@ -275,7 +331,7 @@ flowchart LR
 
 ## 🔨 PANDUAN PENGGUNAAN & PENGUJIAN
 
-### 1. Menjalankan Seluruh Unit Test (21 Pengujian)
+### 1. Menjalankan Seluruh Unit & Integration Test (148 Pengujian)
 ```powershell
 cargo test
 ```

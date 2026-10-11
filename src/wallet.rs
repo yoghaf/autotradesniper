@@ -32,17 +32,45 @@ pub enum NonceState {
 /// Nonces returned while a later nonce is already in flight. The cursor cannot move backwards past
 /// the later one without handing it out twice, so the returned nonce waits here and is the first one
 /// given out by the next allocation. Invariant: every entry is below the cursor.
+///
+/// The same shared object also carries the two facts the pre-signing pipeline needs to keep its
+/// nonces safe (see [`NonceLease`]): which nonces are *leased* by a staged, not yet broadcast
+/// packet, and the highest on-chain `pending` nonce any node answer has shown us.
 #[derive(Default)]
 pub struct NonceHoles {
     set: Mutex<BTreeSet<u64>>,
     /// Mirror of `set.len()` so the allocation fast path stays lock-free while nothing is parked.
     len: AtomicUsize,
+    /// Nonces held by staged (pre-signed, unsent) packets. Allocated and below the cursor, but
+    /// *not* leaked: gap healing must neither return nor re-issue them.
+    leased: Mutex<BTreeSet<u64>>,
+    /// Highest `pending` nonce a node has reported (monotone). A lease below it was overtaken.
+    chain_floor: AtomicU64,
 }
 
 impl NonceHoles {
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<u64>> {
         // A poisoned lock only means another thread panicked mid-insert; the set is still usable.
         self.set.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_leased(&self) -> std::sync::MutexGuard<'_, BTreeSet<u64>> {
+        self.leased.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// True while a staged packet holds `nonce`.
+    pub fn is_leased(&self, nonce: u64) -> bool {
+        self.lock_leased().contains(&nonce)
+    }
+
+    /// Leased nonces, lowest first.
+    pub fn leased_snapshot(&self) -> Vec<u64> {
+        self.lock_leased().iter().copied().collect()
+    }
+
+    /// Highest on-chain `pending` nonce observed so far (0 = never queried).
+    pub fn chain_floor(&self) -> u64 {
+        self.chain_floor.load(Ordering::Acquire)
     }
 
     fn insert(&self, nonce: u64) {
@@ -62,6 +90,8 @@ impl NonceHoles {
     }
 
     fn purge_below(&self, floor: u64) {
+        // Every caller passes a node's `pending` nonce: remember it before the early return.
+        self.chain_floor.fetch_max(floor, Ordering::AcqRel);
         if self.len.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -73,6 +103,10 @@ impl NonceHoles {
     /// Parked nonces, lowest first.
     pub fn snapshot(&self) -> Vec<u64> {
         self.lock().iter().copied().collect()
+    }
+
+    fn unlease(&self, nonce: u64) {
+        self.lock_leased().remove(&nonce);
     }
 }
 
@@ -107,10 +141,34 @@ impl TreasuryAccount {
         self.nonce_cursor.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Allocate the next nonce and *lease* it for a staged (pre-signed, not yet broadcast) packet.
+    ///
+    /// Allocation and registration happen under the lease lock, so no healing path can observe
+    /// the nonce as allocated-but-unaccounted. While leased, [`Self::return_nonce`] and
+    /// [`Self::reconcile_nonce`] leave it alone, which is what keeps a pre-signed packet valid
+    /// until its target block arrives.
+    pub fn lease_nonce(&self) -> NonceLease {
+        let nonce = {
+            let mut leased = self.nonce_holes.lock_leased();
+            let nonce = self.allocate_nonce();
+            leased.insert(nonce);
+            nonce
+        };
+        NonceLease { account: self.clone(), nonce, live: true }
+    }
+
     /// Give back a nonce whose tx was not sent. With nothing allocated after it the cursor simply
     /// steps back (one compare-exchange); otherwise it is parked and reused first, so neither a gap
     /// nor a duplicate can result. Never touches the network.
+    ///
+    /// A *leased* nonce is ignored: its staged packet still owns it, and only the lease may hand
+    /// it back ([`NonceLease::release`]). Without this, the gap healing in
+    /// [`Self::reconcile_nonce`] (which walks every nonce between the node's view and a failed
+    /// one) would give a not-yet-sent pre-signed nonce to the next transaction.
     pub fn return_nonce(&self, nonce: u64) {
+        if self.nonce_holes.is_leased(nonce) {
+            return;
+        }
         if self
             .nonce_cursor
             .compare_exchange(nonce.wrapping_add(1), nonce, Ordering::SeqCst, Ordering::SeqCst)
@@ -140,6 +198,75 @@ impl TreasuryAccount {
         for n in (lowest..=nonce).rev() {
             self.return_nonce(n);
         }
+    }
+}
+
+/// A nonce reserved for a staged transaction that exists as signed bytes but was not broadcast yet.
+///
+/// Exactly one of three things ends a lease, and it ends only once:
+/// - [`NonceLease::commit`]: the packet is about to be (or was) sent; the nonce now belongs to the
+///   normal settle path (`WalletManager::release_nonce_state` on failure);
+/// - [`NonceLease::release`] / drop: the packet was never sent (cancelled, expired, superseded), so
+///   the nonce is handed back, unless the chain already used it (see [`Self::is_overtaken`]);
+///
+/// Dropping a live lease releases it, so a staged packet that is dropped by a panic, a shutdown or a
+/// bug can never leak a nonce and stall every later transaction of the account.
+#[must_use = "a dropped lease hands its nonce back immediately"]
+pub struct NonceLease {
+    account: TreasuryAccount,
+    nonce: u64,
+    live: bool,
+}
+
+impl NonceLease {
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    pub fn account(&self) -> &TreasuryAccount {
+        &self.account
+    }
+
+    /// A node has since reported a `pending` nonce above this one: another transaction used it, so
+    /// anything signed for it can never be included.
+    pub fn is_overtaken(&self) -> bool {
+        self.nonce < self.account.nonce_holes.chain_floor()
+    }
+
+    /// The tx is being broadcast: stop protecting the nonce but do not return it.
+    pub fn commit(mut self) -> u64 {
+        self.live = false;
+        self.account.nonce_holes.unlease(self.nonce);
+        self.nonce
+    }
+
+    /// The tx will not be sent: hand the nonce back.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if !self.live {
+            return;
+        }
+        self.live = false;
+        self.account.nonce_holes.unlease(self.nonce);
+        // A nonce the chain already consumed must not re-enter the pool.
+        if !self.is_overtaken() {
+            self.account.return_nonce(self.nonce);
+        }
+    }
+}
+
+impl Drop for NonceLease {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+impl std::fmt::Debug for NonceLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NonceLease").field("account", &self.account.address).field("nonce", &self.nonce).field("live", &self.live).finish()
     }
 }
 
@@ -253,6 +380,9 @@ impl WalletManager {
             match provider.get_transaction_count(acc.address).pending().await {
                 Ok(on_chain_nonce) => {
                     acc.nonce_cursor.fetch_max(on_chain_nonce, Ordering::SeqCst);
+                    // Records the node's view (staged packets below it were overtaken) and drops
+                    // parked nonces the chain already used.
+                    acc.nonce_holes.purge_below(on_chain_nonce);
                     info!("Synced in-memory nonce cursor for {:?}: {}", acc.address, on_chain_nonce);
                 }
                 Err(e) => warn!("Nonce sync failed for {:?}: {}", acc.address, e),

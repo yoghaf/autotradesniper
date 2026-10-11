@@ -1,18 +1,23 @@
 use crate::config::AppConfig;
 use crate::models::prysm::is_prysm_tag;
-use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
+use crate::payload::{self, CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
 use crate::types::{DispatchReport, ExecutionMode, TradeSignal};
 use crate::wallet::{NonceState, TreasuryAccount, WalletManager};
-use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
-use alloy::eips::eip2718::Encodable2718;
-use alloy::primitives::{Address, Bytes, TxKind, U256};
-use alloy::signers::Signer;
+use alloy::consensus::TxEip1559;
+use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_TYPE;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+
+mod presign;
+
+pub use presign::{
+    sign_sync, Armed, BatchState, Claim, ClaimedSlot, EntryCtx, Invalidation, PresignPolicy, PresignSnapshot, PresignStats,
+    SignedBytes, SlotTicket, StagedBatch, StagingBook, Teardown, TxSpec,
+};
 
 /// Why a broadcast was not accepted.
 #[derive(Debug, Clone)]
@@ -141,7 +146,20 @@ impl BroadcasterPool {
                 rejected_everywhere: true,
             });
         }
-        let body = send_raw_tx_body(raw_tx);
+        self.broadcast_body(send_raw_tx_body(raw_tx), expected_hash).await
+    }
+
+    /// Fan out an already built `eth_sendRawTransaction` request body (see [`send_raw_tx_body`]).
+    ///
+    /// This is the zero-compute half of [`Self::broadcast_raw_tx`]: a pre-signed packet carries its
+    /// body, so the hot path is only the socket writes.
+    pub async fn broadcast_body(&self, body: bytes::Bytes, expected_hash: &str) -> Result<String, BroadcastError> {
+        if self.send_rpcs.is_empty() {
+            return Err(BroadcastError {
+                detail: "no SEND_RPCS endpoints configured".to_string(),
+                rejected_everywhere: true,
+            });
+        }
 
         let (tx, mut rx) = mpsc::channel(self.send_rpcs.len());
         for rpc in self.send_rpcs.iter().cloned() {
@@ -336,27 +354,32 @@ struct RetryPlan {
     retry_rate_limited: bool,
 }
 
-/// Sign `tx` and broadcast it; at most one retry, either
-/// - "gas too low": same nonce, escalated limit (the rejected tx can never execute, so there is no
-///   double-spend risk), or
-/// - rate limited: the identical bytes again after a short pause.
+/// Broadcast `tx`, signing it first unless `presigned` already holds its bytes; at most one retry,
+/// either
+/// - "gas too low": same nonce, escalated limit, signed again (the rejected tx can never execute,
+///   so there is no double-spend risk), or
+/// - rate limited: the identical bytes again after a short pause (no second signature).
+///
+/// With a pre-signed packet the first attempt does no cryptography at all: the stored JSON body goes
+/// straight to the sockets.
 async fn sign_and_broadcast(
     acc: &TreasuryAccount,
     mut tx: TxEip1559,
     broadcaster: &BroadcasterPool,
     plan: RetryPlan,
+    presigned: Option<SignedBytes>,
 ) -> Result<String, BroadcastError> {
     let mut gas_retry_left = true;
     let mut rate_retry_left = plan.retry_rate_limited;
+    let mut ready = presigned;
     loop {
-        let sig = match acc.signer.sign_hash(&tx.signature_hash()).await {
-            Ok(sig) => sig,
+        let signed = match ready.take() {
+            Some(signed) => signed,
             // Never signed, so never sent.
-            Err(e) => return Err(BroadcastError { detail: format!("signing failed: {}", e), rejected_everywhere: true }),
+            None => sign_sync(&acc.signer, tx.clone())
+                .map_err(|e| BroadcastError { detail: format!("signing failed: {}", e), rejected_everywhere: true })?,
         };
-        let envelope = TxEnvelope::Eip1559(tx.clone().into_signed(sig));
-        let hash = format!("{:?}", envelope.tx_hash());
-        match broadcaster.broadcast_raw_tx(&envelope.encoded_2718(), &hash).await {
+        match broadcaster.broadcast_body(signed.body.clone(), &signed.hash_hex).await {
             Err(e) if gas_retry_left && e.gas_too_low() => {
                 gas_retry_left = false;
                 let bumped = CalldataPayloadBuilder::escalated_gas_limit(tx.gas_limit, plan.floor_with_l1);
@@ -370,10 +393,82 @@ async fn sign_and_broadcast(
                 rate_retry_left = false;
                 warn!("[{}] rate limited ({}); retrying once", acc.role, e);
                 tokio::time::sleep(RATE_LIMIT_RETRY_DELAY).await;
+                ready = Some(signed);
             }
             other => return other,
         }
     }
+}
+
+/// What staging an entry's primary tx achieved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageOutcome {
+    /// Master nonce leased and the primary signed ahead of time.
+    Staged { nonce: u64 },
+    /// A staged primary no longer matched the fresh quote/fees: signed again under the same nonce.
+    Restaged { nonce: u64 },
+    /// The staged primary is still valid against the fresh numbers; nothing to do.
+    Unchanged,
+    /// No batch was armed for this launch (or it was already dispatched / cancelled).
+    NotArmed,
+    /// The batch left `Staged` while this call was working; nothing was leased.
+    Closed,
+    /// Pre-signing is switched off.
+    Disabled,
+    /// The signal cannot be pre-signed (unresolved target, zero size, calldata not re-targetable).
+    Refused(String),
+}
+
+/// The `TxSpec` of a satellite carrier: a zero-value call to its own EOA carrying the block-booking
+/// buffer. Independent of any launch, which is why carriers can be pre-signed before the curve is known.
+fn carrier_spec(ctx: &EntryCtx, acc: &TreasuryAccount) -> TxSpec {
+    let carrier_size = if ctx.buffer_size > 0 { ctx.buffer_size } else { TARGET_CALLDATA_BUFFER_SIZE };
+    let padding = CalldataPayloadBuilder::clamp_padding(0, carrier_size);
+    let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&[], padding);
+    TxSpec {
+        chain_id: ctx.chain_id,
+        // A zero-value call to the account itself (an EOA) runs no code, so it cannot revert.
+        to: acc.address,
+        value: U256::ZERO,
+        // Zero-copy: a refcounted view of the static zero page, shared by every carrier.
+        input: CalldataPayloadBuilder::zero_padding(padding),
+        gas_limit: CalldataPayloadBuilder::carrier_gas_limit(padding, ctx.configured_gas_limit, ctx.l1_component_gas),
+        max_fee_per_gas: ctx.max_fee_wei,
+        max_priority_fee_per_gas: ctx.priority_fee_wei,
+        floor_with_l1: floor_gas.saturating_add(CalldataPayloadBuilder::l1_margin(ctx.l1_component_gas)),
+        retry_rate_limited: false,
+        gas_floor_without_l1: CalldataPayloadBuilder::intrinsic_gas(&[], padding).saturating_add(payload::CARRIER_GAS_RESERVE),
+        configured_gas_limit: ctx.configured_gas_limit,
+        l1_component_gas: ctx.l1_component_gas,
+        swap: Vec::new(),
+    }
+}
+
+/// The `TxSpec` of the master tx that carries the real token purchase. Recipient, `ethIn` and the
+/// minimum output follow our own size (a copied trade was quoted for theirs).
+fn primary_spec(ctx: &EntryCtx, acc: &TreasuryAccount, signal: &TradeSignal, value_wei: U256, reference_value: U256) -> Result<TxSpec> {
+    let swap = CalldataPayloadBuilder::adapt_buy_calldata(&signal.swap_calldata, acc.address, value_wei, reference_value)
+        .context("calldata re-targeting failed")?;
+    // Padding never pushes the signed tx over the sequencer's size cap.
+    let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), ctx.buffer_size);
+    let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&swap, padding);
+    // One calloc'd buffer (zeroed pages, no memset) holding calldata + padding.
+    let input = Bytes::from(CalldataPayloadBuilder::build_calibrated_payload(&swap, padding));
+    Ok(TxSpec {
+        chain_id: ctx.chain_id,
+        to: signal.pool_or_router,
+        value: value_wei,
+        input,
+        gas_limit: CalldataPayloadBuilder::gas_limit(&swap, padding, ctx.configured_gas_limit, ctx.l1_component_gas),
+        max_fee_per_gas: ctx.max_fee_wei,
+        max_priority_fee_per_gas: ctx.priority_fee_wei,
+        floor_with_l1: floor_gas.saturating_add(CalldataPayloadBuilder::l1_margin(ctx.l1_component_gas)),
+        retry_rate_limited: true,
+        gas_floor_without_l1: CalldataPayloadBuilder::intrinsic_gas(&swap, padding).saturating_add(payload::EXECUTION_GAS_RESERVE),
+        configured_gas_limit: ctx.configured_gas_limit,
+        l1_component_gas: ctx.l1_component_gas,
+        swap,
+    })
 }
 
 /// High-Frequency Calldata Buffer Formatting & Concurrent Dispatcher Engine
@@ -383,6 +478,8 @@ pub struct Dispatcher {
     fee_adjuster: Arc<DynamicFeeAdjuster>,
     broadcaster: Arc<BroadcasterPool>,
     report_tx: mpsc::Sender<DispatchReport>,
+    policy: PresignPolicy,
+    staging: Arc<StagingBook>,
 }
 
 impl Dispatcher {
@@ -399,21 +496,321 @@ impl Dispatcher {
             fee_adjuster,
             broadcaster,
             report_tx,
+            policy: PresignPolicy::default(),
+            staging: Arc::new(StagingBook::default()),
         }
+    }
+
+    /// Replace the pre-signing policy (see [`PresignPolicy::from_env`]).
+    pub fn with_presign_policy(mut self, policy: PresignPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     pub fn broadcaster(&self) -> Arc<BroadcasterPool> {
         self.broadcaster.clone()
     }
 
+    pub fn presign_policy(&self) -> PresignPolicy {
+        self.policy
+    }
+
+    /// Lifetime counters of the pre-signing pipeline.
+    pub fn presign_snapshot(&self) -> PresignSnapshot {
+        self.staging.stats_ref().snapshot()
+    }
+
+    /// True while at least one batch is staged (lock-free; the per-block hooks use it to stay free).
+    pub fn has_staged(&self) -> bool {
+        self.staging.live_count() > 0
+    }
+
+    /// The live batch of a launch (inspection / tests).
+    pub fn staged_batch(&self, launch_tx: B256) -> Option<Arc<StagedBatch>> {
+        self.staging.live_batch(launch_tx)
+    }
+
+    // ── AOT pre-signing ─────────────────────────────────────────────────────
+
+    /// Fees and gas sizing of this very moment, read exactly as a dispatch would read them.
+    pub async fn entry_ctx(&self) -> EntryCtx {
+        let buffer_size = *self.config.buffer_size.read().await;
+        let configured_gas_limit = *self.config.gas_limit.read().await;
+        let max_fee_cap_gwei = *self.config.max_fee_gwei.read().await;
+        self.entry_ctx_with(buffer_size, configured_gas_limit, max_fee_cap_gwei).await
+    }
+
+    async fn entry_ctx_with(&self, buffer_size: usize, configured_gas_limit: u64, max_fee_cap_gwei: f64) -> EntryCtx {
+        // Adaptive fee (EMA), with the user-configured priority fee floor, capped by MAX_FEE_GWEI.
+        // The priority fee never exceeds max fee (invalid tx otherwise).
+        let (ema_priority_wei, max_fee_wei) = self.fee_adjuster.capped_fees(max_fee_cap_gwei);
+        let configured_prio_gwei = *self.config.max_priority_fee_gwei.read().await;
+        let configured_prio_wei = if configured_prio_gwei.is_finite() { (configured_prio_gwei.max(0.0) * 1e9) as u128 } else { 0 };
+        EntryCtx {
+            chain_id: self.config.chain_id,
+            buffer_size,
+            configured_gas_limit,
+            l1_component_gas: self.fee_adjuster.l1_component_gas(),
+            priority_fee_wei: ema_priority_wei.max(configured_prio_wei).min(max_fee_wei),
+            max_fee_wei,
+        }
+    }
+
+    /// Phase 1 of the AOT pipeline, called when an entry is armed (a Pola A/B match whose launch
+    /// receipt or target block is still outstanding).
+    ///
+    /// Creates the batch of `launch_tx`, leases a nonce for every satellite carrier and signs the
+    /// carriers on one blocking thread: a carrier does not depend on the launched token, so its bytes
+    /// can be ready long before `T_LAUNCH` resolves. The batch is torn down by the latest of
+    /// `hold_until` / the policy's `max_hold`.
+    ///
+    /// Returns false when pre-signing is off or the launch was already dispatched/cancelled.
+    pub async fn arm_presign(&self, launch_tx: B256, hold_until: Instant) -> bool {
+        if !self.policy.enabled {
+            return false;
+        }
+        let now = Instant::now();
+        let expires_at = (now + self.policy.max_hold).min(hold_until);
+        if expires_at <= now {
+            return false;
+        }
+        let exec_mode = *self.config.execution_mode.read().await;
+        let Ok(accounts) = self.wallet_manager.get_all_accounts_shared().await else { return false };
+        let account_count = match exec_mode {
+            ExecutionMode::Single => 1,
+            ExecutionMode::MultiAccount => accounts.len(),
+        };
+        let batch = match self.staging.arm(Arc::new(StagedBatch::new(launch_tx, account_count, now, expires_at))) {
+            Armed::New(batch) => batch,
+            Armed::Existing(_) => return true,
+            Armed::Refused => return false,
+        };
+        self.spawn_janitor(&batch);
+
+        let ctx = self.entry_ctx().await;
+        let tickets: Vec<_> = accounts
+            .iter()
+            .take(account_count)
+            .skip(1)
+            .filter_map(|acc| batch.lease_slot(acc.index, acc, carrier_spec(&ctx, acc)).map(|t| (acc.clone(), t)))
+            .collect();
+        debug!("[presign] armed {:?}: {} carrier packet(s), hold {:?}", launch_tx, tickets.len(), expires_at - now);
+        self.sign_tickets(&batch, tickets).await;
+        true
+    }
+
+    /// Phase 2: the launch resolved and the order still waits for its target block. Leases the master
+    /// nonce and signs the primary buy now, so the target block only needs a socket write.
+    ///
+    /// Idempotent and also the *re-quote* entry point: when called again with a fresher quote the
+    /// staged primary is kept if the Revert Guard moved within the policy's tolerance, and otherwise
+    /// signed again under the same leased nonce (no allocator churn, never two live txs per nonce
+    /// because the replaced bytes were never sent).
+    pub async fn stage_primary(&self, signal: &TradeSignal) -> StageOutcome {
+        if !self.policy.enabled {
+            return StageOutcome::Disabled;
+        }
+        if !is_prysm_tag(signal.strategy_tag.as_deref()) {
+            return StageOutcome::Refused("not a strategy entry".to_string());
+        }
+        if signal.target_token == signal.pool_or_router {
+            return StageOutcome::Refused("token address unresolved".to_string());
+        }
+        if signal.entry_amount_wei.is_zero() {
+            return StageOutcome::Refused("zero size".to_string());
+        }
+        let Some(batch) = self.staging.live_batch(signal.tx_hash) else { return StageOutcome::NotArmed };
+        let Ok(accounts) = self.wallet_manager.get_all_accounts_shared().await else {
+            return StageOutcome::Refused("accounts unavailable".to_string());
+        };
+        let Some(master) = accounts.first() else { return StageOutcome::Refused("no master account".to_string()) };
+        let ctx = self.entry_ctx().await;
+        let size = signal.entry_amount_wei;
+        let spec = match primary_spec(&ctx, master, signal, size, size) {
+            Ok(spec) => spec,
+            Err(e) => return StageOutcome::Refused(format!("{:#}", e)),
+        };
+
+        let existing = batch.slot_spec(0);
+        if let Some((staged, _)) = &existing
+            && staged.valid_against(&spec, &self.policy).is_ok()
+        {
+            return StageOutcome::Unchanged;
+        }
+        let Some(ticket) = batch.lease_slot(0, master, spec) else { return StageOutcome::Closed };
+        let nonce = ticket.nonce;
+        self.sign_tickets(&batch, vec![(master.clone(), ticket)]).await;
+        if existing.is_some() {
+            PresignStats::bump(&self.staging.stats_ref().primary_restaged);
+            StageOutcome::Restaged { nonce }
+        } else {
+            PresignStats::bump(&self.staging.stats_ref().primary_staged);
+            StageOutcome::Staged { nonce }
+        }
+    }
+
+    /// Proactive fee/gas re-validation, meant to run once per new block while anything is staged:
+    /// a staged packet whose fee cap fell below the live value (beyond tolerance) or whose gas limit
+    /// no longer covers the L1 poster component is signed again *now*, in the background, so the
+    /// target block still finds a valid packet. Returns how many packets were re-signed.
+    pub async fn revalidate_presigned(&self) -> usize {
+        if !self.policy.enabled || self.staging.live_count() == 0 {
+            return 0;
+        }
+        let ctx = self.entry_ctx().await;
+        let Ok(accounts) = self.wallet_manager.get_all_accounts_shared().await else { return 0 };
+        let mut resigned = 0;
+        for batch in self.staging.live_batches() {
+            let tickets: Vec<_> = batch
+                .slot_specs()
+                .into_iter()
+                .filter(|(_, spec, _)| {
+                    spec.fee_gas_check(ctx.max_fee_wei, ctx.priority_fee_wei, ctx.l1_component_gas, &self.policy).is_err()
+                })
+                .filter_map(|(idx, spec, _)| {
+                    let acc = accounts.get(idx)?;
+                    batch.lease_slot(idx, acc, spec.refreshed(&ctx)).map(|t| (acc.clone(), t))
+                })
+                .collect();
+            resigned += tickets.len();
+            self.sign_tickets(&batch, tickets).await;
+        }
+        if resigned > 0 {
+            self.staging.stats_ref().proactive_resigns.fetch_add(resigned as u64, std::sync::atomic::Ordering::Relaxed);
+            info!("[presign] re-signed {} staged packet(s) after a fee/gas change", resigned);
+        }
+        resigned
+    }
+
+    /// Tear down the staged batch of `launch_tx`: its order was rejected, cancelled or failed. Every
+    /// leased nonce goes back to the allocator. False if nothing live was staged (or a dispatch had
+    /// already claimed it: cancel and dispatch can never both win).
+    pub fn cancel_presigned(&self, launch_tx: B256) -> bool {
+        self.staging.teardown(launch_tx, Teardown::Cancelled)
+    }
+
+    /// Tear down every staged batch (engine switched off, shutdown).
+    pub fn cancel_all_presigned(&self) -> usize {
+        self.staging.teardown_all(Teardown::Cancelled)
+    }
+
+    /// Sign the given slots one after the other on a single blocking thread. Signing is CPU-bound and
+    /// runs next to the feed reader: one thread keeps the interference bounded, and the whole batch
+    /// is still ready within a few ms, far inside the receipt wait it hides behind.
+    async fn sign_tickets(&self, batch: &Arc<StagedBatch>, tickets: Vec<(TreasuryAccount, SlotTicket)>) {
+        if tickets.is_empty() {
+            return;
+        }
+        let batch = batch.clone();
+        let book = self.staging.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            for (acc, ticket) in tickets {
+                match sign_sync(&acc.signer, ticket.spec.to_tx(ticket.nonce)) {
+                    Ok(signed) => {
+                        if batch.install_signed(&ticket, signed) {
+                            PresignStats::bump(&book.stats_ref().packets_signed_ahead);
+                        } else {
+                            PresignStats::bump(&book.stats_ref().packets_discarded);
+                            if batch.state() != BatchState::Staged {
+                                // Claimed or torn down: the rest would be thrown away too.
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => warn!("[presign] signing slot {} failed: {}", ticket.index, e),
+                }
+            }
+        });
+        if let Err(e) = worker.await {
+            // Leases stay with the batch; dispatch signs those slots inline under the same nonces.
+            warn!("[presign] signer thread died: {}", e);
+        }
+    }
+
+    /// Per-batch deadline, off the hot path: tears the batch down at `expires_at` unless it was
+    /// claimed or cancelled first.
+    fn spawn_janitor(&self, batch: &Arc<StagedBatch>) {
+        let book = self.staging.clone();
+        let batch = batch.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(batch.expires_at())) => {
+                    // The sleep elapsed by construction; pass the deadline itself so the test of
+                    // "due" does not depend on which clock the runtime is using.
+                    if book.expire_if_due(batch.key(), batch.expires_at()) {
+                        warn!("[presign] batch {:?} expired unclaimed; nonces handed back", batch.key());
+                    }
+                }
+                _ = batch.closed() => {}
+            }
+        });
+    }
+
+    /// Settle one account's claimed slot against the tx a dispatch would build right now.
+    /// Returns the nonce to use and the bytes to send unchanged, if they are still valid.
+    fn settle_slot(&self, acc: &TreasuryAccount, slot: Option<ClaimedSlot>, spec_now: &TxSpec) -> (u64, Option<SignedBytes>) {
+        let stats = self.staging.stats_ref();
+        let Some(slot) = slot else {
+            PresignStats::bump(&stats.signed_inline_fresh);
+            return (acc.allocate_nonce(), None);
+        };
+        // A lease of another address (mnemonic swapped since staging), or one the chain has already
+        // consumed, is worthless: give it up and allocate normally.
+        if slot.lease.account().address != acc.address {
+            slot.lease.release();
+            PresignStats::bump(&stats.signed_inline_fresh);
+            return (acc.allocate_nonce(), None);
+        }
+        if slot.lease.is_overtaken() {
+            PresignStats::bump(&stats.leases_overtaken);
+            slot.lease.release();
+            return (acc.allocate_nonce(), None);
+        }
+        let ClaimedSlot { lease, spec, signed } = slot;
+        let nonce = lease.commit();
+        match signed {
+            Some(bytes) => match spec.valid_against(spec_now, &self.policy) {
+                Ok(()) => {
+                    PresignStats::bump(&stats.prebuilt_sent);
+                    (nonce, Some(bytes))
+                }
+                Err(why) => {
+                    debug!("[presign] [{}] staged packet unusable ({}); re-signing under nonce {}", acc.role, why, nonce);
+                    PresignStats::bump(&stats.resigned_stale);
+                    (nonce, None)
+                }
+            },
+            None => {
+                PresignStats::bump(&stats.signed_inline_leased);
+                (nonce, None)
+            }
+        }
+    }
+
+    // ── Dispatch ────────────────────────────────────────────────────────────
+
     /// Dispatch transactions with In-Memory Nonce Caching, EMA Fee Calibration,
     /// and Pipelined Parallel Signing directly to the Sequencer.
+    ///
+    /// A strategy entry first claims its staged batch (see [`Self::arm_presign`]): pre-signed packets
+    /// that are still valid are broadcast byte for byte, everything else is signed here exactly as
+    /// before, under the nonce the batch already holds.
     ///
     /// Returns `Err` unless at least one transaction was accepted by an endpoint, so callers
     /// never register a position for a buy that was never broadcast.
     pub async fn dispatch_signal(&self, signal: &TradeSignal) -> Result<DispatchReport> {
-        let start_time = Instant::now();
         let is_strategy = is_prysm_tag(signal.strategy_tag.as_deref());
+        let result = self.dispatch_inner(signal, is_strategy).await;
+        if is_strategy && result.is_err() {
+            // A refusal before the claim must not leave leased nonces waiting for the TTL
+            // (no-op when the batch was claimed).
+            self.staging.teardown(signal.tx_hash, Teardown::Cancelled);
+        }
+        result
+    }
+
+    async fn dispatch_inner(&self, signal: &TradeSignal, is_strategy: bool) -> Result<DispatchReport> {
+        let start_time = Instant::now();
 
         // A strategy entry must name a resolved token. Replaying a launch tx's calldata into
         // the launchpad would create a duplicate token, not buy the target.
@@ -424,10 +821,8 @@ impl Dispatcher {
             );
         }
 
-        let buffer_size = *self.config.buffer_size.read().await;
         let exec_mode = *self.config.execution_mode.read().await;
-        let configured_gas_limit = *self.config.gas_limit.read().await;
-        let max_fee_cap_gwei = *self.config.max_fee_gwei.read().await;
+        let ctx = self.entry_ctx().await;
 
         // Master size in wei. Strategy signals carry their exact size: a wei -> f64 -> wei round
         // trip can land 1 wei off the `ethIn` encoded in the Pons calldata (e.g. 0.0021 ETH).
@@ -449,14 +844,7 @@ impl Dispatcher {
             anyhow::bail!("Refusing signal: calldata cannot be re-targeted to our recipient and size");
         }
 
-        // Adaptive fee (EMA), with the user-configured priority fee floor, capped by MAX_FEE_GWEI.
-        // The priority fee never exceeds max fee (invalid tx otherwise).
-        let (ema_priority_wei, max_fee_wei) = self.fee_adjuster.capped_fees(max_fee_cap_gwei);
-        let configured_prio_gwei = *self.config.max_priority_fee_gwei.read().await;
-        let configured_prio_wei = if configured_prio_gwei.is_finite() { (configured_prio_gwei.max(0.0) * 1e9) as u128 } else { 0 };
-        let priority_fee_wei = ema_priority_wei.max(configured_prio_wei).min(max_fee_wei);
-        let priority_fee_gwei = priority_fee_wei as f64 / 1e9;
-        let l1_component_gas = self.fee_adjuster.l1_component_gas();
+        let priority_fee_gwei = ctx.priority_fee_wei as f64 / 1e9;
 
         let accounts = self.wallet_manager.get_all_accounts_shared().await?;
         let account_count = match exec_mode {
@@ -464,82 +852,75 @@ impl Dispatcher {
             ExecutionMode::MultiAccount => accounts.len(),
         };
 
-        if l1_component_gas == 0 {
+        if ctx.l1_component_gas == 0 {
             warn!(
                 "L1 poster-gas estimate unavailable (NodeInterface not answering?): gas limits use the {} fallback",
                 crate::payload::L1_COMPONENT_FALLBACK_GAS
             );
         }
 
+        // Exactly one dispatch can own a launch's staged batch (compare-exchange); later or racing
+        // cancels and expiries find it gone.
+        let (claimed_batch, mut claimed): (Option<Arc<StagedBatch>>, Vec<Option<ClaimedSlot>>) = if is_strategy && self.policy.enabled {
+            match self.staging.claim(signal.tx_hash) {
+                Some((batch, claim)) => (Some(batch), claim.slots),
+                None => (None, Vec::new()),
+            }
+        } else {
+            (None, Vec::new())
+        };
+
         let mut handles = Vec::with_capacity(account_count);
         let mut nonces = Vec::with_capacity(account_count);
         // Reported figures describe the master tx (the one that carries the position), not the last carrier.
         let mut calldata_len = 0;
-        let mut gas_limit_used = configured_gas_limit;
+        let mut gas_limit_used = ctx.configured_gas_limit;
         for acc in accounts.iter().take(account_count).cloned() {
             let is_master = acc.index == 0;
-            let (target_dest, acc_value_wei, input, gas_limit, floor_gas) = if is_master {
-                // Master account carries the real token purchase. Recipient, `ethIn` and the
-                // minimum output follow our own size (a copied trade was quoted for theirs).
-                let swap = CalldataPayloadBuilder::adapt_buy_calldata(&signal.swap_calldata, acc.address, value_wei, reference_value)
-                    .context("calldata re-targeting failed")?;
-                // Padding never pushes the signed tx over the sequencer's size cap.
-                let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
-                let gas_limit = CalldataPayloadBuilder::gas_limit(&swap, padding, configured_gas_limit, l1_component_gas);
-                let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&swap, padding);
-                // One calloc'd buffer (zeroed pages, no memset) holding calldata + padding.
-                let input = Bytes::from(CalldataPayloadBuilder::build_calibrated_payload(&swap, padding));
-                (signal.pool_or_router, value_wei, input, gas_limit, floor_gas)
+            let spec = if is_master {
+                primary_spec(&ctx, &acc, signal, value_wei, reference_value)?
             } else {
                 // Satellite child accounts act purely as carrier dispatchers carrying the 95 KB block-booking buffer:
                 // They do NOT buy tokens (value = 0 ETH), preserving 100% of token capital.
                 // Their only duty is transmitting the calibrated 94.5 KB buffer to reserve sequencer block capacity!
-                // A zero-value call to the account itself (an EOA) runs no code, so it cannot revert.
-                let carrier_size = if buffer_size > 0 { buffer_size } else { TARGET_CALLDATA_BUFFER_SIZE };
-                let padding = CalldataPayloadBuilder::clamp_padding(0, carrier_size);
-                let gas_limit = CalldataPayloadBuilder::carrier_gas_limit(padding, configured_gas_limit, l1_component_gas);
-                let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&[], padding);
-                // Zero-copy: a refcounted view of the static zero page, shared by every carrier.
-                (acc.address, U256::ZERO, CalldataPayloadBuilder::zero_padding(padding), gas_limit, floor_gas)
+                carrier_spec(&ctx, &acc)
             };
             if is_master {
-                calldata_len = input.len();
-                gas_limit_used = gas_limit;
+                calldata_len = spec.input.len();
+                gas_limit_used = spec.gas_limit;
             }
 
-            let plan = RetryPlan {
-                floor_with_l1: floor_gas.saturating_add(CalldataPayloadBuilder::l1_margin(l1_component_gas)),
-                retry_rate_limited: is_master,
-            };
+            let plan = RetryPlan { floor_with_l1: spec.floor_with_l1, retry_rate_limited: spec.retry_rate_limited };
             let broadcaster = self.broadcaster.clone();
             let wallet_manager = self.wallet_manager.clone();
-            let chain_id = self.config.chain_id;
 
-            // Atomic in-memory nonce allocation (< 10 ns); a parked nonce is reused first.
-            let nonce = acc.allocate_nonce();
+            // Atomic in-memory nonce allocation (< 10 ns), or the nonce the staged slot already holds.
+            // A parked nonce is reused first.
+            let slot = claimed.get_mut(acc.index).and_then(Option::take);
+            let (nonce, presigned) = self.settle_slot(&acc, slot, &spec);
             nonces.push(nonce);
 
             // Pipelined parallel dispatch worker. It settles its own nonce on failure, so the
             // rollbacks of several failed accounts run in parallel (not one 2 s lookup after the other),
             // never delay the report, and still happen if the caller of `dispatch_signal` is dropped.
             handles.push(tokio::spawn(async move {
-                let tx = TxEip1559 {
-                    chain_id,
-                    nonce,
-                    gas_limit,
-                    max_fee_per_gas: max_fee_wei,
-                    max_priority_fee_per_gas: priority_fee_wei,
-                    to: TxKind::Call(target_dest),
-                    value: acc_value_wei,
-                    input,
-                    access_list: Default::default(),
-                };
-                let result = sign_and_broadcast(&acc, tx, &broadcaster, plan).await;
+                let tx = spec.to_tx(nonce);
+                let result = sign_and_broadcast(&acc, tx, &broadcaster, plan, presigned).await;
                 if let Err(err) = &result {
                     wallet_manager.release_nonce_state(&acc, nonce, err.nonce_state()).await;
                 }
                 (acc, nonce, result)
             }));
+        }
+        // Slots of accounts that are not part of this dispatch (mode or count changed since staging).
+        let unused = claimed.iter().flatten().count();
+        if unused > 0 {
+            self.staging.stats_ref().leases_released_unused.fetch_add(unused as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(claimed); // dropping a lease hands its nonce back
+        if let Some(batch) = &claimed_batch {
+            // Every worker is spawned: Claimed -> Dispatched (the batch has left the book already).
+            batch.mark_dispatched();
         }
 
         let mut tx_hashes = Vec::new();

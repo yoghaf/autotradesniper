@@ -433,6 +433,47 @@ impl CalldataPayloadBuilder {
         payload
     }
 
+    /// Both are Pons buys that agree on every byte except (possibly) the `minTokensOut` word.
+    pub fn pons_buy_same_but_guard(a: &[u8], b: &[u8]) -> bool {
+        const GUARD: std::ops::Range<usize> = 4 + 32..4 + 32 * 2;
+        Self::pons_buy_min_tokens_out(a).is_some()
+            && Self::pons_buy_min_tokens_out(b).is_some()
+            && a.len() == b.len()
+            && a[..GUARD.start] == b[..GUARD.start]
+            && a[GUARD.end..] == b[GUARD.end..]
+    }
+
+    /// `minTokensOut` of a Pons `buy(ethIn, minTokensOut, recipient)` payload (the Revert Guard).
+    pub fn pons_buy_min_tokens_out(calldata: &[u8]) -> Option<U256> {
+        if calldata.len() < 4 + 32 * 3 || calldata[..4] != PONS_BUY_SELECTOR {
+            return None;
+        }
+        Some(U256::from_be_slice(&calldata[4 + 32..4 + 32 * 2]))
+    }
+
+    /// True when `staged` and `fresh` are the same Pons buy (same `ethIn`, same recipient) whose
+    /// Revert Guard differs by at most `tolerance_bps` of the fresh one.
+    ///
+    /// This is the pre-signed-packet validity test for a moved reserve estimate: the guard of a
+    /// signed tx cannot change, so a quote that drifted further than the configured slippage
+    /// budget tolerates means the packet has to be signed again. Anything that is not a pure
+    /// `minTokensOut` difference (other selector, other size, other recipient) never matches, unless
+    /// the two payloads are byte-identical (then the packet is trivially the same tx).
+    pub fn pons_buy_quote_compatible(staged: &[u8], fresh: &[u8], tolerance_bps: u32) -> bool {
+        if staged == fresh {
+            return true;
+        }
+        if !Self::pons_buy_same_but_guard(staged, fresh) {
+            return false;
+        }
+        let (Some(a), Some(b)) = (Self::pons_buy_min_tokens_out(staged), Self::pons_buy_min_tokens_out(fresh)) else {
+            return false;
+        };
+        let diff = if a > b { a - b } else { b - a };
+        // |a - b| * 10_000 <= tolerance * fresh  (U256: no overflow for any realistic amount)
+        diff.saturating_mul(U256::from(10_000u64)) <= b.saturating_mul(U256::from(tolerance_bps))
+    }
+
     /// Rewrite recipient of Pons curve buy calldata if selector matches PONS_BUY_SELECTOR
     pub fn retarget_pons_buy_recipient(calldata: &[u8], recipient: Address) -> Option<Vec<u8>> {
         if calldata.len() < 4 + 32 * 3 || calldata[..4] != PONS_BUY_SELECTOR {

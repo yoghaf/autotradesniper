@@ -1,5 +1,5 @@
 use autotradesniper::config::AppConfig;
-use autotradesniper::dispatcher::{BroadcasterPool, Dispatcher as EngineDispatcher};
+use autotradesniper::dispatcher::{BroadcasterPool, Dispatcher as EngineDispatcher, PresignPolicy};
 use autotradesniper::models::PrysmEngine;
 use autotradesniper::payload::DynamicFeeAdjuster;
 use autotradesniper::risk::types::ExitVenue;
@@ -77,12 +77,18 @@ async fn main() -> Result<()> {
     let (exit_alert_tx, mut exit_alert_rx) = mpsc::channel::<Position>(1000);
 
     // 5. Initialize Core Modules with Optimized Components
-    let dispatcher = Arc::new(EngineDispatcher::new(
-        config.clone(),
-        wallet_manager.clone(),
-        fee_adjuster.clone(),
-        report_tx,
-    ));
+    let presign_policy = PresignPolicy::from_env();
+    info!(
+        "AOT pre-signing: {} (hold <= {:?}, fee tolerance {} bps, quote tolerance {} bps)",
+        if presign_policy.enabled { "on" } else { "off" },
+        presign_policy.max_hold,
+        presign_policy.fee_tolerance_bps,
+        presign_policy.quote_tolerance_bps
+    );
+    let dispatcher = Arc::new(
+        EngineDispatcher::new(config.clone(), wallet_manager.clone(), fee_adjuster.clone(), report_tx)
+            .with_presign_policy(presign_policy),
+    );
     let broadcaster = dispatcher.broadcaster();
     let keep_warm = broadcaster.spawn_keep_warm(Duration::from_secs(20));
     // Reads (eth_call, receipts) go to RPC_HTTP_URL first: sequencer-only send endpoints
@@ -105,7 +111,8 @@ async fn main() -> Result<()> {
 
     let prysm_engine = Arc::new(
         PrysmEngine::new(config.clone(), signal_tx.clone())
-            .with_broadcaster(reader.clone()),
+            .with_broadcaster(reader.clone())
+            .with_presigner(dispatcher.clone()),
     );
     if let Ok(master_acc) = wallet_manager.derive_account(0).await {
         prysm_engine.set_master_address(master_acc.address).await;
@@ -155,6 +162,8 @@ async fn main() -> Result<()> {
             let queued = signal.detected_at.elapsed();
             if queued > MAX_SIGNAL_QUEUE_AGE {
                 warn!("Dropping stale signal {:?} ({:?} old)", signal.tx_hash, queued);
+                // Its pre-signed packets will never be claimed: hand their nonces back now.
+                dispatcher_clone.cancel_presigned(signal.tx_hash);
                 continue;
             }
             // One task per signal: a slow broadcast (Nitro answers only once the tx is
