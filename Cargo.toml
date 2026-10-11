@@ -55,6 +55,7 @@ base64 = "0.22"
 alloy-rlp = "0.3"
 bytes = "1"
 memchr = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
