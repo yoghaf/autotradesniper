@@ -106,8 +106,8 @@ fn answer(state: &NodeState, req: &serde_json::Value) -> serde_json::Value {
             }
         }
         "eth_getTransactionReceipt" => {
-            state.receipt_polls.fetch_add(1, Ordering::SeqCst);
             let receipt = state.receipt.lock().unwrap().clone().unwrap_or(serde_json::Value::Null);
+            state.receipt_polls.fetch_add(1, Ordering::SeqCst);
             serde_json::json!({"jsonrpc":"2.0","id":1,"result":receipt})
         }
         // getReserves() is not served: the engine then quotes on the post-dev-buy curve.
@@ -1153,6 +1153,7 @@ async fn a_new_block_wakes_the_receipt_resolver_instead_of_waiting_for_the_poll_
         .inspect_transaction(Address::repeat_byte(0x11), Some(LAUNCHPAD), U256::from(21_000_000_000_000_000u64), &spoof_calldata(), l, 100, Instant::now())
         .await;
     wait_until("the first poll", || node.receipt_polls.load(Ordering::SeqCst) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // The receipt appears on the node; the resolver is now asleep until the next 10 s tick.
     let topic = |a: Address| format!("0x{:0>64}", alloy::hex::encode(a.as_slice()));

@@ -335,7 +335,8 @@ autotradesniper/
 │   ├── risk_tests.rs           # Test suite komprehensif 6 lapis pertahanan risk engine
 │   ├── prysm_tests.rs          # Test suite komprehensif Pola A/B/C, Guardrails & Exit Mode Seri Prysm
 │   ├── presign_pipeline.rs     # Regresi AOT pre-signing: keabsahan paket, pembatalan aman, nonce lease, eksekusi instan
-│   └── curve_mirror.rs         # Regresi mirror kurva: sinkronisasi, celah/reorg, loop risiko tanpa RPC, exit berbasis receipt
+│   ├── curve_mirror.rs         # Regresi mirror kurva: sinkronisasi, celah/reorg, loop risiko tanpa RPC, exit berbasis receipt
+│   └── feature_simulation_harness.rs # Dry-run deterministik per fitur + siklus hidup penuh (chain, node RPC & feed tersimulasi)
 └── src/
     ├── lib.rs                  # Root library & MinGW compatibility symbols
     ├── main.rs                 # Entry point & Tokio concurrent task supervisor
@@ -419,7 +420,7 @@ flowchart LR
 
 ## 🔨 PANDUAN PENGGUNAAN & PENGUJIAN
 
-### 1. Menjalankan Seluruh Unit & Integration Test (223 Pengujian)
+### 1. Menjalankan Seluruh Unit & Integration Test (238 Pengujian)
 ```powershell
 cargo test
 ```
@@ -428,6 +429,11 @@ Seluruh 12 pengujian Seri Prysm & L2 message unpacker serta 9 pengujian mitigasi
 Untuk menjalankan spesifik test Seri Prysm:
 ```powershell
 cargo test --test prysm_tests
+```
+
+Harness simulasi per fitur (6 skenario + siklus hidup penuh, tanpa jaringan nyata). Klaim waktu (< 1 ms) hanya berlaku di build release:
+```powershell
+cargo test --release --test feature_simulation_harness -- --nocapture
 ```
 
 ### 2. Menjalankan Micro-Benchmark Criterion
