@@ -567,3 +567,36 @@ Test `scanning_a_block_for_candidate_txs_allocates_nothing` mengunci "nol alokas
 | `FEED_DATA_TIMEOUT_SECS` | Reconnect feed yang tidak mengirim **pesan** (ping tidak dihitung) selama N detik. 0 = mati (default); jangan dinyalakan di chain yang bisa legit sepi. |
 
 `AppConfig.watchlist_accounts` kini bertipe `Arc<Watchlist>` (API `read()/write()/try_write()` tetap sama; tulis menerbitkan ulang indeks saat guard dilepas). `StreamListener::run` kini menerima `self: Arc<Self>`; `main.rs` tidak perlu diubah.
+
+---
+
+## 10. Audit Putaran 4: `dispatcher.rs` + `payload.rs` (fan-out Primary + N carrier, nonce, gas)
+
+Seluruh klaim "terbukti" di bawah dikunci oleh `tests/audit3_regressions.rs` (15 tes, mock node JSON-RPC yang bisa diprogram). Tes paralelisme dan tes nonce sudah diuji dengan **mutasi** (worker diserialkan dengan mutex global → tes gagal 5,5 dtk; parkir nonce dimatikan → 3 tes nonce gagal), jadi tes itu memang bisa gagal.
+
+### 10.1 Temuan dan perbaikan
+
+| # | Temuan | Dampak | Status |
+|---|---|---|---|
+| N1 | `resync_nonce` memakai `store(on_chain)`: bisa **memundurkan kursor di bawah nonce yang masih in-flight** (kasus sisa yang dicatat §1b). Rollback CAS hanya berhasil bila tidak ada alokasi sesudahnya. | Nonce ganda → satu tx ditolak "nonce too low"; atau gap bila resync gagal (429). | ✅ `NonceHoles`: nonce yang dikembalikan saat nonce lebih baru in-flight **diparkir** dan dipakai lebih dulu oleh alokasi berikutnya (tanpa RPC, tanpa rewind). `resync` kini hanya maju. |
+| N2 | `release_nonce` dipanggil **serial** di loop join; tiap kegagalan ambigu menunggu sampai 2 dtk, menunda laporan master. | N carrier gagal → sampai N × 2 dtk sebelum `DispatchReport`. | ✅ Dilepas di dalam worker masing-masing (paralel), juga tetap jalan bila pemanggil di-drop. |
+| N3 | `handle.await.context(..)?` pada worker yang panik membuang hasil worker lain dan tidak melepas nonce yang panik. | Gap permanen + master yang sudah diterima tidak tercatat. | ✅ `JoinError` ditangani per worker (nonce dilepas sebagai `Unknown`). |
+| N4 | Klasifikasi error terlalu kasar: "nonce too low" / "replacement transaction underpriced" diperlakukan sama dengan kegagalan ambigu; 429 dengan body JSON kehilangan status. | Nonce terpakai bisa dikembalikan lalu dipakai ulang berulang. | ✅ `NonceState {Unused, Consumed, Unknown}`; pesan 4xx/5xx menyertakan `HTTP <status>`. |
+| G1 | Estimasi L1 `0` (belum terukur / RPC tanpa NodeInterface) diperlakukan sebagai "gratis". Carrier dibatasi 600k vs intrinsic 399k: sisa 201k untuk poster gas. | "intrinsic gas too low" di detik-detik pertama atau saat refresher gagal terus. | ✅ `0` → asumsi konservatif 500k (`L1_COMPONENT_FALLBACK_GAS`), plus `warn!` tiap dispatch. Formula carrier/master dipindah ke `payload.rs` (satu sumber). |
+| G2 | Tidak ada jalur pemulihan bila sequencer menolak batas gas. | Master gagal total pada satu penolakan. | ✅ Satu retry, **nonce sama**, batas ×2 (min. floor EIP-7623 + margin L1, plafon 8 juta). Aman: hanya satu tx per nonce yang bisa dieksekusi. |
+| R1 | 429 pada master berarti trade terlewat. | Peluang hilang karena rate limit sesaat. | ✅ Satu kirim ulang identik setelah 60 ms, **hanya master** (carrier tidak menambah beban limiter). |
+| P1 | Tiap carrier mengalokasikan + memset ±94,5 KB identik. | N alokasi/memset per sinyal. | ✅ `zero_padding()`: view `Bytes` refcount atas halaman nol statis (`.bss`): 0 alokasi, 0 salinan. Master: satu `calloc`. |
+| P2 | `DispatchReport.gas_limit` / `calldata_size_bytes` berisi nilai **akun terakhir** (carrier). | Laporan Telegram menyesatkan. | ✅ Berisi nilai tx master. |
+
+### 10.2 Jawaban
+
+1. **Antrean serial?** Tidak ada di kode: satu `tokio::spawn` per akun, tanpa `await` di antara spawn; persiapan carrier kini O(1). Terukur di mock (debug build): 5 tx tiba dalam jendela ±55 ms. **Batasan fisik yang tidak bisa diperbaiki di kode:** (N+1) tx × ±190 KB hex × E endpoint dikirim lewat satu uplink (N=5, E=5 ≈ 5,7 MB; ≈ 0,45 dtk pada 100 Mbps). *Urutan tiba di sequencer ditentukan jaringan, bukan urutan spawn*; kode ini tidak menjamin carrier tiba sebelum/sesudah master. Bila strategi memerlukan urutan, itu keputusan desain terpisah. Pertimbangkan membatasi fan-out carrier ke 1-2 endpoint.
+2. **Zero-revert / nol paparan?** Struktur carrier terbukti oleh tes: `value = 0`, `to = pengirim` (EOA, tanpa kode → tidak ada yang bisa revert), calldata nol semua, tx ≤ 95.000 B. Dua catatan jujur: (a) "nol paparan modal" benar, tetapi **gas tetap biaya nyata** (≈ 399k gas intrinsic + poster per carrier); (b) bila suatu akun pernah diberi delegasi EIP-7702, self-call bisa menjalankan kode. Kunci HD di sini tidak pernah mendelegasikan.
+3. **Gas 100% akurat?** **Tidak, dan tidak ada rumus statis yang bisa menjanjikannya**: komponen poster bergantung pada harga L1 dan base fee L2 saat inklusi, dan estimasi refresher dihitung untuk tx beli ±100 B (bukan 94,5 KB; aman untuk carrier karena nol-nol termampatkan, perkiraan untuk master). Yang kini dijamin: estimasi hilang tidak lagi dianggap gratis (G1), margin 1,5× tetap, dan satu retry berbatas (G2). **Belum terverifikasi:** apakah chain menegakkan floor EIP-7623 pada gas tx L2 (dokumentasi Arbitrum hanya menyebutnya sebagai parameter harga batch-posting, ArbOS 51). Karena itu floor hanya dipakai sebagai batas bawah retry, bukan untuk ukuran percobaan pertama (menaikkannya menaikkan saldo minimum tiap carrier ±2×).
+
+### 10.3 Tidak dilakukan / terbuka
+
+- **Atomisitas lintas akun tidak mungkin di EVM.** Yang dijamin: setiap nonce yang dialokasikan berakhir *diterima* atau *dikembalikan* (invarian diuji acak: nonce diterima ∪ nonce terparkir = `[0, cursor)`, tanpa duplikat). Bila master ditolak sementara carrier sudah diterima, carrier tetap terkirim (biaya gas saja); `dispatch_signal` mengembalikan `Err`.
+- Kegagalan ambigu saat RPC baca mati: nonce dikembalikan (asumsi tx tidak mendarat). Bila ternyata mendarat, pemakaian ulang ditolak "nonce too low" dan sembuh pada sinkronisasi berikutnya (≤ 1 tx hilang).
+- Pemanasan koneksi: `spawn_keep_warm` hanya memanaskan 1 koneksi per endpoint. Dengan HTTP/1.1 (N+1 request bersamaan) burst pertama membayar handshake TLS dingin untuk koneksi ekstra; dengan h2 semua request berbagi satu koneksi TCP. Ukur sebelum mengubah.
+- Batas 95.000 B (`MAX_SEQUENCER_TX_BYTES`) adalah default Nitro; bila operator chain mengubahnya, konstanta ini harus disesuaikan.

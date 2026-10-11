@@ -13,6 +13,20 @@ pub const MAX_SEQUENCER_TX_BYTES: usize = 95_000;
 pub const TX_ENVELOPE_OVERHEAD: usize = 256;
 /// Gas kept for swap execution on top of intrinsic calldata gas (Arbitrum also adds L1 poster gas).
 pub const EXECUTION_GAS_RESERVE: u64 = 300_000;
+/// Gas kept by a carrier: a zero-value self-call to an EOA runs no code, so this is only slack.
+pub const CARRIER_GAS_RESERVE: u64 = 21_000;
+/// L1 poster-gas assumption while no `NodeInterface` estimate exists yet (0 = never measured, e.g. the
+/// first seconds after start, or a read RPC without the NodeInterface precompile). Deliberately generous:
+/// unused gas is refunded, so a high guess only raises the balance a tx needs in order to be submitted.
+pub const L1_COMPONENT_FALLBACK_GAS: u64 = 500_000;
+/// Hard ceiling for an escalated retry limit (a retry that needs more than this is not a rounding error).
+pub const MAX_ESCALATED_GAS_LIMIT: u64 = 8_000_000;
+/// EIP-7623 floor price per calldata token (zero byte = 1 token, non-zero byte = 4 tokens).
+pub const CALLDATA_FLOOR_GAS_PER_TOKEN: u64 = 10;
+
+/// Pre-zeroed backing store for padding-only payloads. A zero-initialised static lives in `.bss`:
+/// no binary size, no allocation, no memset; every carrier borrows a slice of it.
+static ZERO_PAD: [u8; MAX_SEQUENCER_TX_BYTES] = [0; MAX_SEQUENCER_TX_BYTES];
 /// Fast exit payload size for a 2-hop path: selector + 5 head words + path length + 2 addresses
 pub const FAST_EXIT_CALLDATA_SIZE: usize = 4 + 32 * 5 + 32 + 32 * 2;
 /// swapExactTokensForETH(uint256,uint256,address[],address,uint256)
@@ -131,12 +145,62 @@ impl CalldataPayloadBuilder {
     /// is refunded, so the 1.5x margin only raises the balance needed to submit, not the cost.
     #[inline]
     pub fn gas_limit(calldata: &[u8], padding: usize, configured: u64, l1_component_gas: u64) -> u64 {
-        let l1 = l1_component_gas.saturating_add(l1_component_gas / 2);
+        Self::gas_limit_with_reserve(calldata, padding, configured, l1_component_gas, EXECUTION_GAS_RESERVE)
+    }
+
+    /// Gas limit of a zero-value carrier: `padding` zero bytes sent to the sender itself.
+    #[inline]
+    pub fn carrier_gas_limit(padding: usize, configured: u64, l1_component_gas: u64) -> u64 {
+        Self::gas_limit_with_reserve(&[], padding, configured, l1_component_gas, CARRIER_GAS_RESERVE)
+    }
+
+    /// `intrinsic + reserve + 1.5 x L1 poster gas`, never below `configured`.
+    ///
+    /// An L1 estimate of 0 means "never measured", not "free": it is replaced by
+    /// [`L1_COMPONENT_FALLBACK_GAS`] so a missing estimate cannot silently under-size the limit.
+    #[inline]
+    pub fn gas_limit_with_reserve(calldata: &[u8], padding: usize, configured: u64, l1_component_gas: u64, reserve: u64) -> u64 {
         configured.max(
             Self::intrinsic_gas(calldata, padding)
-                .saturating_add(EXECUTION_GAS_RESERVE)
-                .saturating_add(l1),
+                .saturating_add(reserve)
+                .saturating_add(Self::l1_margin(l1_component_gas)),
         )
+    }
+
+    /// 1.5x the L1 poster component (fallback when unmeasured).
+    #[inline]
+    pub fn l1_margin(l1_component_gas: u64) -> u64 {
+        let l1 = if l1_component_gas == 0 { L1_COMPONENT_FALLBACK_GAS } else { l1_component_gas };
+        l1.saturating_add(l1 / 2)
+    }
+
+    /// EIP-7623 floor for `calldata` followed by `padding` zero bytes:
+    /// `21000 + 10 x (zero bytes + 4 x non-zero bytes)`.
+    ///
+    /// Whether the chain enforces it on L2 user gas is NOT established (Arbitrum documents a
+    /// calldata floor as a batch-posting price parameter). It is only used as the lower bound of an
+    /// escalated retry after the sequencer rejected the first limit, never to size the first attempt.
+    #[inline]
+    pub fn calldata_floor_gas(calldata: &[u8], padding: usize) -> u64 {
+        let tokens: u64 = calldata.iter().map(|&b| if b == 0 { 1u64 } else { 4 }).sum::<u64>() + padding as u64;
+        21_000u64.saturating_add(CALLDATA_FLOOR_GAS_PER_TOKEN.saturating_mul(tokens))
+    }
+
+    /// Limit for the single retry after a "gas too low" rejection: at least double the rejected limit,
+    /// and at least the calldata floor plus the L1 margin; capped at [`MAX_ESCALATED_GAS_LIMIT`].
+    /// Doubling is cheap: unused gas is refunded.
+    pub fn escalated_gas_limit(rejected_limit: u64, floor_with_l1: u64) -> u64 {
+        rejected_limit.saturating_mul(2).max(floor_with_l1).min(MAX_ESCALATED_GAS_LIMIT)
+    }
+
+    /// Zero-copy, allocation-free carrier payload: a refcounted view over the static zero page.
+    /// `len` above the static page (never produced by `clamp_padding`) falls back to one allocation.
+    #[inline]
+    pub fn zero_padding(len: usize) -> alloy::primitives::Bytes {
+        match ZERO_PAD.get(..len) {
+            Some(pad) => alloy::primitives::Bytes::from_static(pad),
+            None => alloy::primitives::Bytes::from(vec![0u8; len]),
+        }
     }
 
     /// Re-target a copied or strategy buy for one of our accounts sending `value` wei.

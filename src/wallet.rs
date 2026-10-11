@@ -8,12 +8,80 @@ use alloy::signers::local::PrivateKeySigner;
 use anyhow::{Context, Result};
 use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+
+/// How far below a failed nonce a "nonce too high" heal may reach back.
+const MAX_NONCE_HEAL_SPAN: u64 = 16;
+
+/// What is known about a nonce whose broadcast did not succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceState {
+    /// Every endpoint turned the tx away: the nonce was never consumed.
+    Unused,
+    /// The node says the nonce is already used ("nonce too low"): never hand it out again.
+    Consumed,
+    /// Timeout / 5xx / mixed answers: the tx may or may not have been forwarded.
+    Unknown,
+}
+
+/// Nonces returned while a later nonce is already in flight. The cursor cannot move backwards past
+/// the later one without handing it out twice, so the returned nonce waits here and is the first one
+/// given out by the next allocation. Invariant: every entry is below the cursor.
+#[derive(Default)]
+pub struct NonceHoles {
+    set: Mutex<BTreeSet<u64>>,
+    /// Mirror of `set.len()` so the allocation fast path stays lock-free while nothing is parked.
+    len: AtomicUsize,
+}
+
+impl NonceHoles {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<u64>> {
+        // A poisoned lock only means another thread panicked mid-insert; the set is still usable.
+        self.set.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn insert(&self, nonce: u64) {
+        let mut set = self.lock();
+        set.insert(nonce);
+        self.len.store(set.len(), Ordering::Release);
+    }
+
+    fn pop_lowest(&self) -> Option<u64> {
+        if self.len.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut set = self.lock();
+        let nonce = set.pop_first();
+        self.len.store(set.len(), Ordering::Release);
+        nonce
+    }
+
+    fn purge_below(&self, floor: u64) {
+        if self.len.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut set = self.lock();
+        *set = set.split_off(&floor);
+        self.len.store(set.len(), Ordering::Release);
+    }
+
+    /// Parked nonces, lowest first.
+    pub fn snapshot(&self) -> Vec<u64> {
+        self.lock().iter().copied().collect()
+    }
+}
+
+/// Cursor + parked nonces of one address; shared by every `TreasuryAccount` clone of it.
+#[derive(Clone, Default)]
+struct NonceLane {
+    cursor: Arc<AtomicU64>,
+    holes: Arc<NonceHoles>,
+}
 
 /// Account definition in Treasury with cached in-memory Atomic Nonce Cursor
 #[derive(Clone)]
@@ -25,6 +93,54 @@ pub struct TreasuryAccount {
     pub signer: PrivateKeySigner,
     /// Atomic Nonce Cursor: eliminates repeated RPC `eth_getTransactionCount` latency
     pub nonce_cursor: Arc<AtomicU64>,
+    /// Returned-out-of-order nonces waiting to be reused (see [`NonceHoles`]).
+    pub nonce_holes: Arc<NonceHoles>,
+}
+
+impl TreasuryAccount {
+    /// Next nonce: the lowest parked one if any, else the cursor (one atomic add when nothing is parked).
+    #[inline]
+    pub fn allocate_nonce(&self) -> u64 {
+        if let Some(nonce) = self.nonce_holes.pop_lowest() {
+            return nonce;
+        }
+        self.nonce_cursor.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Give back a nonce whose tx was not sent. With nothing allocated after it the cursor simply
+    /// steps back (one compare-exchange); otherwise it is parked and reused first, so neither a gap
+    /// nor a duplicate can result. Never touches the network.
+    pub fn return_nonce(&self, nonce: u64) {
+        if self
+            .nonce_cursor
+            .compare_exchange(nonce.wrapping_add(1), nonce, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+        // Only a nonce this cursor has handed out can be parked (keeps "every hole < cursor").
+        if nonce < self.nonce_cursor.load(Ordering::SeqCst) {
+            self.nonce_holes.insert(nonce);
+        }
+    }
+
+    /// Fold the node's `pending` nonce into the local state after an ambiguous failure of `nonce`.
+    ///
+    /// - The cursor only ever moves forward to the node's view, so a nonce in flight is never re-issued.
+    /// - Parked nonces the chain already used are dropped.
+    /// - If the node has not seen `nonce` (pending <= nonce), it and any unaccounted nonces between
+    ///   the node's view and it are returned, closing a "nonce too high" gap.
+    pub fn reconcile_nonce(&self, nonce: u64, on_chain_pending: u64) {
+        self.nonce_cursor.fetch_max(on_chain_pending, Ordering::SeqCst);
+        self.nonce_holes.purge_below(on_chain_pending);
+        if nonce < on_chain_pending {
+            return;
+        }
+        let lowest = on_chain_pending.max(nonce.saturating_sub(MAX_NONCE_HEAL_SPAN));
+        for n in (lowest..=nonce).rev() {
+            self.return_nonce(n);
+        }
+    }
 }
 
 /// Hierarchical Deterministic (HD) Treasury Manager
@@ -32,7 +148,7 @@ pub struct TreasuryAccount {
 pub struct WalletManager {
     config: AppConfig,
     mnemonic: Arc<RwLock<String>>,
-    nonce_cache: Arc<RwLock<HashMap<Address, Arc<AtomicU64>>>>,
+    nonce_cache: Arc<RwLock<HashMap<Address, NonceLane>>>,
     /// Derived accounts (index 0 = master). BIP-39 seed stretching is 2048 rounds of
     /// PBKDF2-HMAC-SHA512, so it runs once per mnemonic / sub-account count, never per trade.
     accounts_cache: Arc<RwLock<Option<Arc<Vec<TreasuryAccount>>>>>,
@@ -101,17 +217,25 @@ impl WalletManager {
         self.mnemonic.read().await.clone()
     }
 
-    /// Retrieve or create the atomic nonce cursor for an address
-    async fn get_or_create_nonce_cursor(&self, address: Address) -> Arc<AtomicU64> {
-        if let Some(cursor) = self.nonce_cache.read().await.get(&address) {
-            return cursor.clone();
+    /// Retrieve or create the nonce lane (cursor + parked nonces) for an address
+    async fn get_or_create_nonce_lane(&self, address: Address) -> NonceLane {
+        if let Some(lane) = self.nonce_cache.read().await.get(&address) {
+            return lane.clone();
         }
-        self.nonce_cache
-            .write()
+        self.nonce_cache.write().await.entry(address).or_default().clone()
+    }
+
+    /// The node's `pending` nonce for `address`.
+    async fn pending_nonce(&self, address: Address) -> Result<u64> {
+        let provider = ProviderBuilder::new()
+            .connect(&self.config.rpc_http_url)
             .await
-            .entry(address)
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone()
+            .context("Nonce lookup: RPC connect failed")?;
+        provider
+            .get_transaction_count(address)
+            .pending()
+            .await
+            .context("Nonce lookup: eth_getTransactionCount failed")
     }
 
     /// Synchronize on-chain nonces (`pending` tag) into the in-memory cursors.
@@ -137,53 +261,65 @@ impl WalletManager {
         Ok(())
     }
 
-    /// Re-anchor one account's cursor to the node's `pending` nonce.
+    /// Pull one account's cursor forward to the node's `pending` nonce.
     ///
-    /// Called after a broadcast that no endpoint accepted: the allocated nonce was burned, and
-    /// without a resync every later transaction from this account would sit behind a nonce gap.
+    /// Never rewinds: a lower node view usually means a lagging endpoint or a nonce still in flight,
+    /// and re-issuing an in-flight nonce is worse than a gap. Gaps are closed per failed nonce by
+    /// [`Self::release_nonce`] / [`TreasuryAccount::reconcile_nonce`].
     pub async fn resync_nonce(&self, address: Address) -> Result<u64> {
-        let provider = ProviderBuilder::new()
-            .connect(&self.config.rpc_http_url)
-            .await
-            .context("Nonce resync: RPC connect failed")?;
-        let on_chain = provider
-            .get_transaction_count(address)
-            .pending()
-            .await
-            .context("Nonce resync: eth_getTransactionCount failed")?;
-        self.get_or_create_nonce_cursor(address).await.store(on_chain, Ordering::SeqCst);
-        warn!("Nonce cursor for {:?} re-synced to {}", address, on_chain);
+        let on_chain = self.pending_nonce(address).await?;
+        let lane = self.get_or_create_nonce_lane(address).await;
+        lane.cursor.fetch_max(on_chain, Ordering::SeqCst);
+        lane.holes.purge_below(on_chain);
+        info!("Nonce cursor for {:?} synced forward to at least {}", address, on_chain);
         Ok(on_chain)
     }
 
-    /// Hand back a nonce whose transaction no endpoint accepted.
-    ///
-    /// When the rejection is definitive (`nonce_unused`) and nothing was allocated after it,
-    /// the cursor is rolled back with one compare-exchange: no RPC round trip, and it still
-    /// works while the read RPC is rate-limiting us (a failed re-sync would otherwise leave a
-    /// permanent gap until the next failure). In every other case (timeouts, "nonce too
-    /// low/high", a later nonce already in flight) the cursor is re-anchored from the node.
+    /// Hand back a nonce whose transaction no endpoint accepted (`nonce_unused`) or whose fate is unknown.
     pub async fn release_nonce(&self, acc: &TreasuryAccount, nonce: u64, nonce_unused: bool) {
-        if nonce_unused
-            && acc
-                .nonce_cursor
-                .compare_exchange(nonce.wrapping_add(1), nonce, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        {
-            warn!("Nonce cursor for {:?} rolled back to {} (tx rejected everywhere)", acc.address, nonce);
+        let state = if nonce_unused { NonceState::Unused } else { NonceState::Unknown };
+        self.release_nonce_state(acc, nonce, state).await;
+    }
+
+    /// Settle a nonce after a failed broadcast.
+    ///
+    /// - `Unused`: returned locally (cursor step-back, or parked when a later nonce is in flight).
+    ///   No RPC, so it works while the read RPC is rate-limiting us.
+    /// - `Consumed` ("nonce too low"): never returned; the cursor is pulled forward from the node.
+    /// - `Unknown` (timeout, 5xx, mixed): ask the node (2 s budget) and reconcile. If the node cannot
+    ///   answer, the nonce is returned anyway: a re-used nonce can only be rejected as "nonce too low"
+    ///   and heals on the next sync, while a leaked one blocks every later tx of the account.
+    pub async fn release_nonce_state(&self, acc: &TreasuryAccount, nonce: u64, state: NonceState) {
+        if state == NonceState::Unused {
+            acc.return_nonce(nonce);
+            warn!("Nonce {} of {:?} returned (tx rejected everywhere)", nonce, acc.address);
             return;
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(2), self.resync_nonce(acc.address)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => error!("Nonce resync for {:?} failed: {:#}", acc.address, e),
-            Err(_) => error!("Nonce resync for {:?} timed out", acc.address),
+        let lookup = tokio::time::timeout(std::time::Duration::from_secs(2), self.pending_nonce(acc.address)).await;
+        match lookup {
+            Ok(Ok(on_chain)) => acc.reconcile_nonce(nonce, on_chain),
+            Ok(Err(e)) => {
+                error!("Nonce lookup for {:?} failed: {:#}", acc.address, e);
+                if state == NonceState::Unknown {
+                    acc.return_nonce(nonce);
+                }
+            }
+            Err(_) => {
+                error!("Nonce lookup for {:?} timed out", acc.address);
+                if state == NonceState::Unknown {
+                    acc.return_nonce(nonce);
+                }
+            }
         }
     }
 
     /// Instant lock-free atomic nonce allocation (< 10 nanoseconds)
     pub async fn next_nonce_atomic(&self, address: Address) -> u64 {
-        let cursor = self.get_or_create_nonce_cursor(address).await;
-        cursor.fetch_add(1, Ordering::SeqCst)
+        let lane = self.get_or_create_nonce_lane(address).await;
+        if let Some(nonce) = lane.holes.pop_lowest() {
+            return nonce;
+        }
+        lane.cursor.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Derive an account at index using BIP-44: m/44'/60'/0'/0/{index}
@@ -207,13 +343,15 @@ impl WalletManager {
         } else {
             format!("Sub-Account #{} (Satellite Dispatcher)", index)
         };
+        let lane = self.get_or_create_nonce_lane(address).await;
         TreasuryAccount {
             role,
             index,
             derivation_path,
             address,
             signer,
-            nonce_cursor: self.get_or_create_nonce_cursor(address).await,
+            nonce_cursor: lane.cursor,
+            nonce_holes: lane.holes,
         }
     }
 
@@ -331,7 +469,7 @@ impl WalletManager {
                     sub.address, current_balance_f, min_balance_eth, deficit_eth
                 );
 
-                let next_nonce = self.next_nonce_atomic(master.address).await;
+                let next_nonce = master.allocate_nonce();
                 // No fixed 21000 gas limit: on Arbitrum the limit must also cover the L1 poster
                 // component, so a bare transfer needs more. The provider's gas filler estimates it.
                 let tx = TransactionRequest::default()
@@ -352,8 +490,9 @@ impl WalletManager {
                     }
                     Err(e) => {
                         error!("Failed to rebalance gas for {:?}: {}", sub.address, e);
-                        // The allocated nonce was not consumed on-chain; re-anchor the cursor.
-                        let _ = self.resync_nonce(master.address).await;
+                        // The send may or may not have reached a node: settle the nonce against the
+                        // node's view instead of rewinding the shared cursor blindly.
+                        self.release_nonce(&master, next_nonce, false).await;
                         results.push(GasRebalanceResult {
                             sub_account_address: format!("{:?}", sub.address),
                             amount_eth: deficit_eth,

@@ -2,14 +2,13 @@ use crate::config::AppConfig;
 use crate::models::prysm::is_prysm_tag;
 use crate::payload::{CalldataPayloadBuilder, DynamicFeeAdjuster, TARGET_CALLDATA_BUFFER_SIZE};
 use crate::types::{DispatchReport, ExecutionMode, TradeSignal};
-use crate::wallet::WalletManager;
+use crate::wallet::{NonceState, TreasuryAccount, WalletManager};
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::primitives::{Address, Bytes, TxKind, U256};
 use alloy::signers::Signer;
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_TYPE;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -28,7 +27,38 @@ impl BroadcastError {
     /// The nonce is provably unused: safe to hand it back without asking a node.
     /// "nonce too low/high" means our cursor is wrong, so it must be re-synced instead.
     pub fn nonce_unused(&self) -> bool {
-        self.rejected_everywhere && !self.detail.contains("nonce")
+        self.nonce_state() == NonceState::Unused
+    }
+
+    /// What the failure proves about the nonce.
+    /// - any endpoint reporting the nonce (or a same-nonce replacement) as taken: `Consumed`;
+    /// - every endpoint turned the tx away for a reason unrelated to the nonce: `Unused`;
+    /// - anything else (timeouts, 5xx, mixed answers, "nonce too high"): `Unknown`.
+    pub fn nonce_state(&self) -> NonceState {
+        let detail = self.detail.to_lowercase();
+        if detail.contains("nonce too low")
+            || detail.contains("replacement transaction underpriced")
+            || detail.contains("nonce has already been used")
+        {
+            NonceState::Consumed
+        } else if self.rejected_everywhere && !detail.contains("nonce") {
+            NonceState::Unused
+        } else {
+            NonceState::Unknown
+        }
+    }
+
+    /// The sequencer refused the gas limit (intrinsic / poster / floor gas). The nonce is untouched,
+    /// so re-signing the same nonce with a higher limit is safe: only one tx per nonce can execute.
+    pub fn gas_too_low(&self) -> bool {
+        let detail = self.detail.to_lowercase();
+        detail.contains("intrinsic gas") || detail.contains("gas too low") || detail.contains("floor data gas")
+    }
+
+    /// Turned away by a rate limiter (HTTP 429 or JSON-RPC -32005).
+    pub fn rate_limited(&self) -> bool {
+        let detail = self.detail.to_lowercase();
+        detail.contains("http 429") || detail.contains("too many requests") || detail.contains("rate limit") || detail.contains("-32005")
     }
 }
 
@@ -164,7 +194,9 @@ impl BroadcasterPool {
             if err_msg.contains("already known") || err_msg.contains("known transaction") {
                 return Ok(expected.to_owned());
             }
-            return Err(EndpointError { definitive: true, message: err_msg });
+            // Keep the status: a 429 with a JSON-RPC error body must stay recognisable as rate limiting.
+            let message = if status.is_success() { err_msg } else { format!("HTTP {}: {}", status, err_msg) };
+            return Err(EndpointError { definitive: true, message });
         }
         match json.get("result").and_then(|r| r.as_str()) {
             Some(h) if h.eq_ignore_ascii_case(expected) => Ok(h.to_owned()),
@@ -291,10 +323,63 @@ impl BroadcasterPool {
     }
 }
 
+/// Pause before the single re-broadcast of a rate-limited master tx.
+const RATE_LIMIT_RETRY_DELAY: Duration = Duration::from_millis(60);
+
+/// What one dispatch worker may do after its first broadcast is refused.
+#[derive(Clone, Copy)]
+struct RetryPlan {
+    /// Lower bound for an escalated gas limit: calldata floor + 1.5x L1 component.
+    floor_with_l1: u64,
+    /// Re-send the identical tx once after a 429 (master only: carriers must not add load to a
+    /// limiter that is already pushing back).
+    retry_rate_limited: bool,
+}
+
+/// Sign `tx` and broadcast it; at most one retry, either
+/// - "gas too low": same nonce, escalated limit (the rejected tx can never execute, so there is no
+///   double-spend risk), or
+/// - rate limited: the identical bytes again after a short pause.
+async fn sign_and_broadcast(
+    acc: &TreasuryAccount,
+    mut tx: TxEip1559,
+    broadcaster: &BroadcasterPool,
+    plan: RetryPlan,
+) -> Result<String, BroadcastError> {
+    let mut gas_retry_left = true;
+    let mut rate_retry_left = plan.retry_rate_limited;
+    loop {
+        let sig = match acc.signer.sign_hash(&tx.signature_hash()).await {
+            Ok(sig) => sig,
+            // Never signed, so never sent.
+            Err(e) => return Err(BroadcastError { detail: format!("signing failed: {}", e), rejected_everywhere: true }),
+        };
+        let envelope = TxEnvelope::Eip1559(tx.clone().into_signed(sig));
+        let hash = format!("{:?}", envelope.tx_hash());
+        match broadcaster.broadcast_raw_tx(&envelope.encoded_2718(), &hash).await {
+            Err(e) if gas_retry_left && e.gas_too_low() => {
+                gas_retry_left = false;
+                let bumped = CalldataPayloadBuilder::escalated_gas_limit(tx.gas_limit, plan.floor_with_l1);
+                if bumped <= tx.gas_limit {
+                    return Err(e);
+                }
+                warn!("[{}] gas limit {} refused ({}); retrying with {}", acc.role, tx.gas_limit, e, bumped);
+                tx.gas_limit = bumped;
+            }
+            Err(e) if rate_retry_left && e.rate_limited() => {
+                rate_retry_left = false;
+                warn!("[{}] rate limited ({}); retrying once", acc.role, e);
+                tokio::time::sleep(RATE_LIMIT_RETRY_DELAY).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// High-Frequency Calldata Buffer Formatting & Concurrent Dispatcher Engine
 pub struct Dispatcher {
     config: AppConfig,
-    wallet_manager: WalletManager,
+    wallet_manager: Arc<WalletManager>,
     fee_adjuster: Arc<DynamicFeeAdjuster>,
     broadcaster: Arc<BroadcasterPool>,
     report_tx: mpsc::Sender<DispatchReport>,
@@ -310,7 +395,7 @@ impl Dispatcher {
         let broadcaster = Arc::new(BroadcasterPool::new(config.send_rpcs.clone()));
         Self {
             config,
-            wallet_manager,
+            wallet_manager: Arc::new(wallet_manager),
             fee_adjuster,
             broadcaster,
             report_tx,
@@ -379,12 +464,21 @@ impl Dispatcher {
             ExecutionMode::MultiAccount => accounts.len(),
         };
 
+        if l1_component_gas == 0 {
+            warn!(
+                "L1 poster-gas estimate unavailable (NodeInterface not answering?): gas limits use the {} fallback",
+                crate::payload::L1_COMPONENT_FALLBACK_GAS
+            );
+        }
+
         let mut handles = Vec::with_capacity(account_count);
+        let mut nonces = Vec::with_capacity(account_count);
+        // Reported figures describe the master tx (the one that carries the position), not the last carrier.
         let mut calldata_len = 0;
         let mut gas_limit_used = configured_gas_limit;
         for acc in accounts.iter().take(account_count).cloned() {
             let is_master = acc.index == 0;
-            let (target_dest, acc_value_wei, payload, gas_limit) = if is_master {
+            let (target_dest, acc_value_wei, input, gas_limit, floor_gas) = if is_master {
                 // Master account carries the real token purchase. Recipient, `ethIn` and the
                 // minimum output follow our own size (a copied trade was quoted for theirs).
                 let swap = CalldataPayloadBuilder::adapt_buy_calldata(&signal.swap_calldata, acc.address, value_wei, reference_value)
@@ -392,31 +486,42 @@ impl Dispatcher {
                 // Padding never pushes the signed tx over the sequencer's size cap.
                 let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), buffer_size);
                 let gas_limit = CalldataPayloadBuilder::gas_limit(&swap, padding, configured_gas_limit, l1_component_gas);
-                (signal.pool_or_router, value_wei, CalldataPayloadBuilder::with_padding(swap, padding), gas_limit)
+                let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&swap, padding);
+                // One calloc'd buffer (zeroed pages, no memset) holding calldata + padding.
+                let input = Bytes::from(CalldataPayloadBuilder::build_calibrated_payload(&swap, padding));
+                (signal.pool_or_router, value_wei, input, gas_limit, floor_gas)
             } else {
                 // Satellite child accounts act purely as carrier dispatchers carrying the 95 KB block-booking buffer:
                 // They do NOT buy tokens (value = 0 ETH), preserving 100% of token capital.
                 // Their only duty is transmitting the calibrated 94.5 KB buffer to reserve sequencer block capacity!
+                // A zero-value call to the account itself (an EOA) runs no code, so it cannot revert.
                 let carrier_size = if buffer_size > 0 { buffer_size } else { TARGET_CALLDATA_BUFFER_SIZE };
                 let padding = CalldataPayloadBuilder::clamp_padding(0, carrier_size);
-                // Intrinsic (incl. 21k base) + 21k reserve + the L1 poster component.
-                let gas_limit = configured_gas_limit.max(
-                    CalldataPayloadBuilder::intrinsic_gas(&[], padding)
-                        .saturating_add(21_000)
-                        .saturating_add(l1_component_gas.saturating_add(l1_component_gas / 2)),
-                );
-                (acc.address, U256::ZERO, CalldataPayloadBuilder::with_padding(Vec::new(), padding), gas_limit)
+                let gas_limit = CalldataPayloadBuilder::carrier_gas_limit(padding, configured_gas_limit, l1_component_gas);
+                let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&[], padding);
+                // Zero-copy: a refcounted view of the static zero page, shared by every carrier.
+                (acc.address, U256::ZERO, CalldataPayloadBuilder::zero_padding(padding), gas_limit, floor_gas)
             };
-            calldata_len = payload.len();
-            gas_limit_used = gas_limit;
+            if is_master {
+                calldata_len = input.len();
+                gas_limit_used = gas_limit;
+            }
 
+            let plan = RetryPlan {
+                floor_with_l1: floor_gas.saturating_add(CalldataPayloadBuilder::l1_margin(l1_component_gas)),
+                retry_rate_limited: is_master,
+            };
             let broadcaster = self.broadcaster.clone();
+            let wallet_manager = self.wallet_manager.clone();
             let chain_id = self.config.chain_id;
 
-            // Atomic in-memory nonce allocation (< 10 ns)
-            let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst);
+            // Atomic in-memory nonce allocation (< 10 ns); a parked nonce is reused first.
+            let nonce = acc.allocate_nonce();
+            nonces.push(nonce);
 
-            // Pipelined parallel dispatch worker
+            // Pipelined parallel dispatch worker. It settles its own nonce on failure, so the
+            // rollbacks of several failed accounts run in parallel (not one 2 s lookup after the other),
+            // never delay the report, and still happen if the caller of `dispatch_signal` is dropped.
             handles.push(tokio::spawn(async move {
                 let tx = TxEip1559 {
                     chain_id,
@@ -426,19 +531,13 @@ impl Dispatcher {
                     max_priority_fee_per_gas: priority_fee_wei,
                     to: TxKind::Call(target_dest),
                     value: acc_value_wei,
-                    input: Bytes::from(payload),
+                    input,
                     access_list: Default::default(),
                 };
-
-                let result = match acc.signer.sign_hash(&tx.signature_hash()).await {
-                    Ok(sig) => {
-                        let envelope = TxEnvelope::Eip1559(tx.into_signed(sig));
-                        let hash = format!("{:?}", envelope.tx_hash());
-                        broadcaster.broadcast_raw_tx(&envelope.encoded_2718(), &hash).await
-                    }
-                    // Never signed, so never sent.
-                    Err(e) => Err(BroadcastError { detail: format!("signing failed: {}", e), rejected_everywhere: true }),
-                };
+                let result = sign_and_broadcast(&acc, tx, &broadcaster, plan).await;
+                if let Err(err) = &result {
+                    wallet_manager.release_nonce_state(&acc, nonce, err.nonce_state()).await;
+                }
                 (acc, nonce, result)
             }));
         }
@@ -447,8 +546,19 @@ impl Dispatcher {
         let mut account_roles = Vec::new();
         let mut failures = Vec::new();
         let mut master_accepted = false;
-        for handle in handles {
-            let (acc, nonce, result) = handle.await.context("dispatch worker panicked")?;
+        for (i, handle) in handles.into_iter().enumerate() {
+            let (acc, nonce, result) = match handle.await {
+                Ok(done) => done,
+                Err(join_err) => {
+                    // A panicking worker never reached its own release: settle the nonce here, and keep
+                    // collecting the other workers instead of abandoning their results.
+                    let acc = &accounts[i];
+                    error!("dispatch worker for [{}] died: {}", acc.role, join_err);
+                    self.wallet_manager.release_nonce_state(acc, nonces[i], NonceState::Unknown).await;
+                    failures.push(format!("[{}] worker died: {}", acc.role, join_err));
+                    continue;
+                }
+            };
             match result {
                 Ok(hash) => {
                     info!("✅ [{}] TX Broadcast: {} (Nonce: {})", acc.role, hash, nonce);
@@ -458,9 +568,6 @@ impl Dispatcher {
                 }
                 Err(err) => {
                     warn!("Broadcast failed for [{}] (nonce {}): {}", acc.role, nonce, err);
-                    // The nonce was allocated but (most likely) never used: hand it back, or
-                    // every later tx from this account would wait behind a nonce gap.
-                    self.wallet_manager.release_nonce(&acc, nonce, err.nonce_unused()).await;
                     failures.push(format!("[{}] {}", acc.role, err));
                 }
             }

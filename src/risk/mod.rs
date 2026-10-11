@@ -607,7 +607,7 @@ impl RiskManager {
         };
         let gas_limit = CalldataPayloadBuilder::gas_limit(&data, 0, configured_gas_limit, l1_gas);
 
-        let nonce = acc.nonce_cursor.fetch_add(1, Ordering::SeqCst);
+        let nonce = acc.allocate_nonce();
         let tx = TxEip1559 {
             chain_id: self.config.chain_id,
             nonce,
@@ -631,7 +631,7 @@ impl RiskManager {
         match broadcaster.broadcast_raw_tx(&envelope.encoded_2718(), &hash).await {
             Ok(accepted) => Ok(accepted),
             Err(e) => {
-                self.wallet_manager.release_nonce(acc, nonce, e.nonce_unused()).await;
+                self.wallet_manager.release_nonce_state(acc, nonce, e.nonce_state()).await;
                 Err(anyhow!("broadcast failed: {}", e))
             }
         }
