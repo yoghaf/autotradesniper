@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -16,6 +16,7 @@ fn default_prysm_size_eth() -> f64 { 0.01 }
 fn default_prysm_exit_mode() -> crate::types::PrysmExitMode { crate::types::PrysmExitMode::System }
 fn default_prysm_max_mcap_usd() -> f64 { 8000.0 }
 fn default_prysm_min_block_delay() -> u64 { 1 }
+fn default_carrier_padding() -> bool { true }
 
 /// Persistent runtime state stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +45,10 @@ pub struct RuntimeState {
     pub prysm_max_mcap_usd: f64,
     #[serde(default = "default_prysm_min_block_delay")]
     pub prysm_min_block_delay: u64,
+    /// Block-booking padding on (satellite carriers + master padding). Missing in older state
+    /// files: on, the behaviour those files were written with.
+    #[serde(default = "default_carrier_padding")]
+    pub carrier_padding: bool,
 }
 
 /// The watched-wallet set.
@@ -144,6 +149,17 @@ pub struct AppConfig {
     pub min_sub_account_eth: Arc<RwLock<f64>>,
     pub rebalance_target_eth: Arc<RwLock<f64>>,
     pub is_engine_active: Arc<AtomicBool>,
+    /// Calldata padding master switch: off = no ~94.5 KB carriers and no master padding at all.
+    pub carrier_padding: Arc<AtomicBool>,
+    /// Circuit-breaker latch, `(epoch << 1) | engaged`: set by the panic sell (a new epoch each
+    /// time), cleared only by an explicit release naming that epoch. While set, intake is off
+    /// whatever `is_engine_active` says, and an entry that was already in flight when the breaker
+    /// fired is liquidated as soon as it is registered. Not persisted (a restart comes up with
+    /// intake paused, which is persisted).
+    breaker: Arc<AtomicU64>,
+    /// Even while `max_priority_fee_gwei` / `max_fee_gwei` are consistent; bumped around a preset
+    /// change so [`AppConfig::fee_caps`] never returns one old and one new value.
+    fee_epoch: Arc<AtomicU64>,
 
     // Prysm Series Strategy Dedicated Configuration
     pub prysm_enabled: Arc<AtomicBool>,
@@ -160,13 +176,47 @@ pub struct AppConfig {
     pub prysm_launchpads: Arc<HashSet<Address>>,
 
     state_path: String,
+    /// Deletes the scratch state file of a hermetic configuration when its last clone is dropped.
+    _scratch: Option<Arc<ScratchFile>>,
     /// Serializes state file writes so concurrent saves cannot interleave.
     save_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Scratch state file of a hermetic configuration, removed with it.
+struct ScratchFile(PathBuf);
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Private state file of a hermetic configuration (see `Default for AppConfig`).
+fn scratch_state_path() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir()
+        .join(format!("autotradesniper-hermetic-{}-{}.json", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)))
+        .to_string_lossy()
+        .into_owned()
+}
+
 impl AppConfig {
+    /// The daemon's configuration: `.env`, the process environment and the persisted runtime
+    /// state (`runtime_config.json`), which every runtime change is written back to.
     pub fn load_from_env() -> Result<Self> {
         let _ = dotenvy::dotenv();
+        Self::from_environment(Some("runtime_config.json".to_string()))
+    }
+
+    /// Where runtime changes are persisted.
+    pub fn state_path(&self) -> &str {
+        &self.state_path
+    }
+
+    /// Built from the process environment and defaults. With `state_file`, the persisted state is
+    /// restored from it and changes are saved to it; without, nothing is read and changes go to a
+    /// private scratch file.
+    fn from_environment(state_file: Option<String>) -> Result<Self> {
 
         let feed_url = std::env::var("FEED_URL")
             .or_else(|_| std::env::var("RPC_WS_URL"))
@@ -302,7 +352,8 @@ impl AppConfig {
             .parse::<f64>()
             .unwrap_or(0.015);
 
-        let state_path = "runtime_config.json".to_string();
+        let restore = state_file.is_some();
+        let state_path = state_file.unwrap_or_else(scratch_state_path);
 
         let config = Self {
             rpc_http_url,
@@ -330,6 +381,9 @@ impl AppConfig {
             min_sub_account_eth: Arc::new(RwLock::new(min_sub_account_eth)),
             rebalance_target_eth: Arc::new(RwLock::new(rebalance_target_eth)),
             is_engine_active: Arc::new(AtomicBool::new(true)),
+            carrier_padding: Arc::new(AtomicBool::new(true)),
+            breaker: Arc::new(AtomicU64::new(0)),
+            fee_epoch: Arc::new(AtomicU64::new(0)),
 
             // Prysm Strategy defaults
             prysm_enabled: Arc::new(AtomicBool::new(false)),
@@ -348,6 +402,7 @@ impl AppConfig {
             prysm_target_stop_loss_percent: Arc::new(RwLock::new(30.0)),
             prysm_launchpads: Arc::new(prysm_launchpads),
 
+            _scratch: (!restore).then(|| Arc::new(ScratchFile(PathBuf::from(&state_path)))),
             state_path,
             save_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
@@ -355,17 +410,23 @@ impl AppConfig {
         // Restore persisted runtime state. A state file that exists but cannot be parsed is fatal:
         // silently continuing would make WalletManager generate a fresh mnemonic and overwrite
         // the only copy of the old one.
-        config
-            .load_persisted_state()
-            .with_context(|| format!("Refusing to start: '{}' exists but is unreadable", config.state_path))?;
+        if restore {
+            config
+                .load_persisted_state()
+                .with_context(|| format!("Refusing to start: '{}' exists but is unreadable", config.state_path))?;
+        }
 
         Ok(config)
     }
 }
 
 impl Default for AppConfig {
+    /// Hermetic configuration (tests, benches, tools): defaults and the process environment only.
+    /// It reads neither `.env` nor the operator's `runtime_config.json`, and persists into a
+    /// private scratch file, so a runtime change made by a test can never overwrite the
+    /// operator's state file (and the mnemonic in it) or depend on it.
     fn default() -> Self {
-        Self::load_from_env().expect("Default AppConfig should always load")
+        Self::from_environment(None).expect("Default AppConfig should always load")
     }
 }
 
@@ -428,6 +489,7 @@ impl AppConfig {
             *lock = state.sub_account_count;
         }
         self.is_engine_active.store(state.is_engine_active, Ordering::SeqCst);
+        self.carrier_padding.store(state.carrier_padding, Ordering::SeqCst);
 
         // Restore Prysm Series Strategy configuration
         self.prysm_enabled.store(state.prysm_enabled, Ordering::SeqCst);
@@ -449,39 +511,50 @@ impl AppConfig {
 
     /// Persist current runtime configuration to disk
     pub async fn save_persisted_state(&self) -> Result<()> {
-        let watchlist_strs: Vec<String> = self
-            .watchlist_accounts
-            .read()
-            .await
-            .iter()
-            .map(|a| format!("{:?}", a))
-            .collect();
-
+        // Snapshot under the lock: two saves racing (two buttons pressed in a row) must land in
+        // the order their snapshots were taken, or the older one overwrites the newer on disk.
+        let _guard = self.save_lock.lock().await;
+        // One value per statement: no read guard is held while waiting for the next lock, so a
+        // save never makes a writer (and the readers queued behind it) wait on another lock.
+        let watchlist_accounts: Vec<String> = self.watchlist_accounts.read().await.iter().map(|a| format!("{:?}", a)).collect();
+        let mnemonic_phrase = self.mnemonic_phrase.read().await.clone();
+        let buffer_size = *self.buffer_size.read().await;
+        let gas_limit = *self.gas_limit.read().await;
+        let (max_priority_fee_gwei, max_fee_gwei) = self.fee_caps().await;
+        let default_trade_eth = *self.default_trade_eth.read().await;
+        let slippage_percent = *self.slippage_percent.read().await;
+        let target_profit_percent = *self.target_profit_percent.read().await;
+        let time_decay_exit_seconds = *self.time_decay_exit_seconds.read().await;
+        let execution_mode = *self.execution_mode.read().await;
+        let sub_account_count = *self.sub_account_count.read().await;
+        let prysm_size_eth = *self.prysm_size_eth.read().await;
+        let prysm_exit_mode = *self.prysm_exit_mode.read().await;
+        let prysm_max_mcap_usd = *self.prysm_max_mcap_usd.read().await;
+        let prysm_min_block_delay = *self.prysm_min_block_delay.read().await;
         let state = RuntimeState {
-            mnemonic_phrase: self.mnemonic_phrase.read().await.clone(),
-            watchlist_accounts: watchlist_strs,
-            buffer_size: *self.buffer_size.read().await,
-            gas_limit: *self.gas_limit.read().await,
-            max_priority_fee_gwei: *self.max_priority_fee_gwei.read().await,
-            max_fee_gwei: *self.max_fee_gwei.read().await,
-            default_trade_eth: *self.default_trade_eth.read().await,
-            slippage_percent: *self.slippage_percent.read().await,
-            target_profit_percent: *self.target_profit_percent.read().await,
-            time_decay_exit_seconds: *self.time_decay_exit_seconds.read().await,
-            execution_mode: *self.execution_mode.read().await,
-            sub_account_count: *self.sub_account_count.read().await,
+            mnemonic_phrase,
+            watchlist_accounts,
+            buffer_size,
+            gas_limit,
+            max_priority_fee_gwei,
+            max_fee_gwei,
+            default_trade_eth,
+            slippage_percent,
+            target_profit_percent,
+            time_decay_exit_seconds,
+            execution_mode,
+            sub_account_count,
             is_engine_active: self.is_engine_active.load(Ordering::SeqCst),
-
             prysm_enabled: self.prysm_enabled.load(Ordering::SeqCst),
-            prysm_size_eth: *self.prysm_size_eth.read().await,
-            prysm_exit_mode: *self.prysm_exit_mode.read().await,
-            prysm_max_mcap_usd: *self.prysm_max_mcap_usd.read().await,
-            prysm_min_block_delay: *self.prysm_min_block_delay.read().await,
+            prysm_size_eth,
+            prysm_exit_mode,
+            prysm_max_mcap_usd,
+            prysm_min_block_delay,
+            carrier_padding: self.carrier_padding.load(Ordering::SeqCst),
         };
 
         let json = serde_json::to_vec_pretty(&state)?;
         let path = PathBuf::from(&self.state_path);
-        let _guard = self.save_lock.lock().await;
         tokio::task::spawn_blocking(move || write_private_atomic(&path, &json))
             .await
             .context("State writer task failed")??;
@@ -514,22 +587,124 @@ impl AppConfig {
         self.watchlist_accounts.contains(address)
     }
 
+    /// Intake as the engine applies it: on, and no circuit breaker latched.
     pub fn is_engine_running(&self) -> bool {
-        self.is_engine_active.load(Ordering::SeqCst)
+        self.is_engine_active.load(Ordering::SeqCst) && !self.breaker_engaged()
+    }
+
+    /// Engage the circuit breaker: latch (new epoch) first, then intake off (atomics only, no
+    /// await). Returns the epoch; only a release naming it can clear this latch.
+    pub fn engage_breaker(&self) -> u64 {
+        let prev = self
+            .breaker
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| Some((((s >> 1) + 1) << 1) | 1))
+            .unwrap_or_default();
+        self.is_engine_active.store(false, Ordering::SeqCst);
+        (prev >> 1) + 1
+    }
+
+    pub fn breaker_engaged(&self) -> bool {
+        self.breaker.load(Ordering::SeqCst) & 1 == 1
+    }
+
+    /// Epoch of the latched breaker, if one is latched.
+    pub fn breaker_epoch(&self) -> Option<u64> {
+        let s = self.breaker.load(Ordering::SeqCst);
+        (s & 1 == 1).then_some(s >> 1)
+    }
+
+    /// Clear the latch of breaker `epoch` (intake stays as it is: resuming is a separate step).
+    /// False if that breaker is not the one latched (released already, or a newer one fired):
+    /// a stale release can never undo a newer breaker.
+    pub fn release_breaker(&self, epoch: u64) -> bool {
+        self.breaker.compare_exchange((epoch << 1) | 1, epoch << 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
+    // =========================================================================
+    // RUNTIME PARAMETERS CHANGED FROM THE CONTROL PLANE (Telegram)
+    // =========================================================================
+
+    /// `(priority fee floor, max fee cap)` in Gwei, read as one consistent pair: never the old
+    /// priority with the new cap (or the reverse) while a preset is being applied.
+    pub async fn fee_caps(&self) -> (f64, f64) {
+        loop {
+            let before = self.fee_epoch.load(Ordering::Acquire);
+            if before & 1 == 1 {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let prio = *self.max_priority_fee_gwei.read().await;
+            let max = *self.max_fee_gwei.read().await;
+            if self.fee_epoch.load(Ordering::Acquire) == before {
+                return (prio, max);
+            }
+        }
+    }
+
+    /// Apply a fee preset atomically (see [`Self::fee_caps`]) and persist it.
+    pub async fn set_fee_preset(&self, priority_gwei: f64, max_fee_gwei: f64) {
+        {
+            // Writers take both locks in this order; readers never hold both.
+            let mut prio = self.max_priority_fee_gwei.write().await;
+            let mut max = self.max_fee_gwei.write().await;
+            self.fee_epoch.fetch_add(1, Ordering::AcqRel);
+            *prio = priority_gwei;
+            *max = max_fee_gwei;
+            self.fee_epoch.fetch_add(1, Ordering::AcqRel);
+        }
+        let _ = self.save_persisted_state().await;
+    }
+
+    /// Block-booking padding master switch.
+    pub fn carrier_padding_enabled(&self) -> bool {
+        self.carrier_padding.load(Ordering::SeqCst)
+    }
+
+    /// Padding on: carriers carry `padding_bytes` and the master is padded to it too; off: no
+    /// padding anywhere (and no carriers, they have nothing to carry). Ordered so that a reader
+    /// in between sees either the old or a smaller padding, never a padded master without the switch.
+    pub async fn set_carrier_padding(&self, on: bool, padding_bytes: usize) {
+        if on {
+            *self.buffer_size.write().await = padding_bytes;
+            self.carrier_padding.store(true, Ordering::SeqCst);
+        } else {
+            self.carrier_padding.store(false, Ordering::SeqCst);
+            *self.buffer_size.write().await = 0;
+        }
+        let _ = self.save_persisted_state().await;
+    }
+
+    /// Number of satellite carriers (switches to multi-account execution) and persist it.
+    pub async fn set_carrier_count(&self, count: usize) {
+        *self.sub_account_count.write().await = count;
+        *self.execution_mode.write().await = ExecutionMode::MultiAccount;
+        let _ = self.save_persisted_state().await;
+    }
+
+    /// Single / multi-account execution and persist it.
+    pub async fn set_execution_mode(&self, mode: ExecutionMode) {
+        *self.execution_mode.write().await = mode;
+        let _ = self.save_persisted_state().await;
+    }
+
+    /// Flip single / multi-account execution and persist it; returns the new mode.
+    pub async fn toggle_execution_mode(&self) -> ExecutionMode {
+        let next = {
+            let mut mode = self.execution_mode.write().await;
+            *mode = match *mode {
+                ExecutionMode::Single => ExecutionMode::MultiAccount,
+                ExecutionMode::MultiAccount => ExecutionMode::Single,
+            };
+            *mode
+        };
+        let _ = self.save_persisted_state().await;
+        next
     }
 
     /// Idempotent engine intake switch (use instead of `toggle_engine` when the target state matters)
     pub async fn set_engine_running(&self, running: bool) {
         self.is_engine_active.store(running, Ordering::SeqCst);
         let _ = self.save_persisted_state().await;
-    }
-
-    pub async fn toggle_engine(&self) -> bool {
-        let current = self.is_engine_active.load(Ordering::SeqCst);
-        let new_state = !current;
-        self.is_engine_active.store(new_state, Ordering::SeqCst);
-        let _ = self.save_persisted_state().await;
-        new_state
     }
 
     // =========================================================================

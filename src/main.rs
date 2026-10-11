@@ -6,7 +6,7 @@ use autotradesniper::risk::curve_mirror::{CurveMirror, MirrorPolicy};
 use autotradesniper::risk::types::ExitVenue;
 use autotradesniper::risk::RiskManager;
 use autotradesniper::stream::{PoolBuy, StreamListener};
-use autotradesniper::telegram::TelegramBot;
+use autotradesniper::telegram::{self, screens, EngineHandles, Notifier, OutboxPolicy};
 use autotradesniper::types::{DispatchReport, Position, TradeSignal};
 use autotradesniper::wallet::WalletManager;
 
@@ -17,7 +17,6 @@ use std::time::Duration;
 
 /// A signal that waited this long in the queue (dispatch backlog, stalled task) is stale.
 const MAX_SIGNAL_QUEUE_AGE: Duration = Duration::from_secs(3);
-use teloxide::prelude::*;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -152,28 +151,41 @@ async fn main() -> Result<()> {
     let authorized_chat_id = config.telegram_authorized_chat_id;
     let bot_token = config.telegram_bot_token.clone();
 
-    // 6. Initialize Telegram Bot Controller (if configured)
-    let telegram_bot = if !bot_token.is_empty() && !bot_token.contains("Example") {
+    // 6. Telegram control plane (if configured): polling, handlers and the alert outbox run on a
+    // thread of their own; the engine only ever does a non-blocking `try_send` into the outbox.
+    let telegram_service = if !bot_token.is_empty() && !bot_token.contains("Example") {
         if authorized_chat_id == 0 {
             warn!("TELEGRAM_AUTHORIZED_CHAT_ID is not set: the bot will ignore every chat.");
         }
-        Some(Arc::new(TelegramBot::new(
-            bot_token.clone(),
-            config.clone(),
-            wallet_manager.clone(),
-            risk_manager.clone(),
-            prysm_engine.clone(),
-            positions.clone(),
-        )))
+        let handles = EngineHandles {
+            config: config.clone(),
+            wallet: wallet_manager.clone(),
+            risk: risk_manager.clone(),
+            prysm: prysm_engine.clone(),
+            positions: positions.clone(),
+            dispatcher: Some(dispatcher.clone()),
+            fee: Some(fee_adjuster.clone()),
+            stream: Some(stream_listener.clone()),
+            mirror: Some(curve_mirror.clone()),
+            engine: tokio::runtime::Handle::current(),
+        };
+        match telegram::start_control_plane(bot_token.clone(), handles, OutboxPolicy::default()) {
+            Ok(service) => Some(service),
+            Err(e) => {
+                error!("Telegram control plane could not start: {}. Running headless.", e);
+                None
+            }
+        }
     } else {
         warn!("Telegram Bot token not provided or is example. Running in terminal headless mode.");
         None
     };
+    let notifier: Option<Notifier> = telegram_service.as_ref().map(|s| s.notifier.clone());
 
     // Task A: Signal Consumer & Pipelined Dispatch Executor Loop
     let dispatcher_clone = dispatcher.clone();
     let risk_clone = risk_manager.clone();
-    let telegram_clone = telegram_bot.clone();
+    let notifier_signal = notifier.clone();
 
     let signal_task = tokio::spawn(async move {
         while let Some(signal) = signal_rx.recv().await {
@@ -189,13 +201,16 @@ async fn main() -> Result<()> {
             // Nonces are atomic per account, so concurrent dispatches never share one.
             let dispatcher = dispatcher_clone.clone();
             let risk = risk_clone.clone();
-            let telegram = telegram_clone.clone();
+            let notifier = notifier_signal.clone();
             tokio::spawn(async move {
+                // In flight until the position is registered: the circuit breaker and the wallet
+                // guard see an entry that has left but is not a position yet.
+                let _in_flight = dispatcher.entry_guard();
                 // Dispatch first: logging and the Telegram alert stay off the hot path.
                 let dispatch = dispatcher.dispatch_signal(&signal).await;
                 info!("Signal from {:?} dispatched in {:?}", signal.monitored_account, signal.detected_at.elapsed());
-                if let Some(ref bot_ctrl) = telegram {
-                    bot_ctrl.broadcast_signal_detected(authorized_chat_id, &signal).await;
+                if let Some(n) = &notifier {
+                    n.notify(authorized_chat_id, screens::signal_alert(&signal));
                 }
                 match dispatch {
                     Ok(report) => {
@@ -212,7 +227,7 @@ async fn main() -> Result<()> {
     });
 
     // Task B: Dispatch Report Broadcaster Loop
-    let telegram_report_clone = telegram_bot.clone();
+    let notifier_report = notifier.clone();
     tokio::spawn(async move {
         while let Some(report) = report_rx.recv().await {
             info!(
@@ -221,14 +236,14 @@ async fn main() -> Result<()> {
                 report.block_number,
                 report.latency_micros
             );
-            if let Some(ref bot_ctrl) = telegram_report_clone {
-                bot_ctrl.broadcast_dispatch_success(authorized_chat_id, &report).await;
+            if let Some(n) = &notifier_report {
+                n.notify(authorized_chat_id, screens::dispatch_alert(&report));
             }
         }
     });
 
     // Task C: Position Exit / Realization Broadcaster Loop
-    let telegram_exit_clone = telegram_bot.clone();
+    let notifier_exit = notifier.clone();
     tokio::spawn(async move {
         while let Some(pos) = exit_alert_rx.recv().await {
             info!(
@@ -237,8 +252,13 @@ async fn main() -> Result<()> {
                 pos.pnl_percent,
                 pos.exit_reason.as_deref().unwrap_or("Exit")
             );
-            if let Some(ref bot_ctrl) = telegram_exit_clone {
-                bot_ctrl.broadcast_position_realized(authorized_chat_id, &pos).await;
+            if let Some(n) = &notifier_exit {
+                // A failed exit (token still in the wallet) must not queue behind routine alerts.
+                if pos.is_open {
+                    n.notify_critical(authorized_chat_id, screens::position_alert(&pos));
+                } else {
+                    n.notify(authorized_chat_id, screens::position_alert(&pos));
+                }
             }
         }
     });
@@ -261,47 +281,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Task F: Telegram Bot Polling (if bot is configured)
-    if let Some(bot_ctrl) = telegram_bot {
-        let bot_instance = Bot::new(bot_token);
-        let bot_ctrl_for_msg = bot_ctrl.clone();
-        let bot_ctrl_for_cb = bot_ctrl.clone();
-
-        info!("Starting interactive Telegram Bot listener (Non-Blocking UI)...");
-
-        let handler = dptree::entry()
-            .branch(
-                Update::filter_message().endpoint(move |msg: Message| {
-                    let ctrl = bot_ctrl_for_msg.clone();
-                    async move {
-                        if let Err(e) = ctrl.handle_message(msg).await {
-                            error!("Error handling message: {}", e);
-                        }
-                        respond(())
-                    }
-                }),
-            )
-            .branch(
-                Update::filter_callback_query().endpoint(move |q: CallbackQuery| {
-                    let ctrl = bot_ctrl_for_cb.clone();
-                    async move {
-                        if let Err(e) = ctrl.handle_callback(q).await {
-                            error!("Error handling callback: {}", e);
-                        }
-                        respond(())
-                    }
-                }),
-            );
-
-        teloxide::dispatching::Dispatcher::builder(bot_instance, handler)
-            .enable_ctrlc_handler()
-            .build()
-            .dispatch()
-            .await;
+    if telegram_service.is_some() {
+        info!("Engine running; Telegram control plane on its own thread. Press Ctrl+C to terminate.");
     } else {
         info!("Running in headless server mode. Press Ctrl+C to terminate.");
-        tokio::signal::ctrl_c().await?;
     }
+    tokio::signal::ctrl_c().await?;
 
     info!("Shutting down engine gracefully.");
     config.is_engine_active.store(false, std::sync::atomic::Ordering::SeqCst);

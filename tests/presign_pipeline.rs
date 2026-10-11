@@ -1022,6 +1022,8 @@ async fn a_resolution_that_overtakes_the_arming_task_still_gets_its_primary_stag
     for &l in &launches {
         wait_until("carrier and primary pre-signed", || signed_slots(&e.r.dispatcher.staged_batch(l)) == 2).await;
     }
+    // The counter is bumped after the signer thread has installed the bytes: wait for it too.
+    wait_until("every primary counted once", || e.r.dispatcher.presign_snapshot().primary_staged >= launches.len() as u64).await;
     assert_eq!(e.r.dispatcher.presign_snapshot().primary_staged, launches.len() as u64);
 }
 

@@ -276,9 +276,14 @@ pub struct WalletManager {
     config: AppConfig,
     mnemonic: Arc<RwLock<String>>,
     nonce_cache: Arc<RwLock<HashMap<Address, NonceLane>>>,
-    /// Derived accounts (index 0 = master). BIP-39 seed stretching is 2048 rounds of
-    /// PBKDF2-HMAC-SHA512, so it runs once per mnemonic / sub-account count, never per trade.
-    accounts_cache: Arc<RwLock<Option<Arc<Vec<TreasuryAccount>>>>>,
+    /// Derived account layouts (index 0 = master), one per sub-account count used so far. BIP-39
+    /// seed stretching is 2048 rounds of PBKDF2-HMAC-SHA512, so it runs once per mnemonic /
+    /// sub-account count, never per trade. Several layouts are kept so that a new count can be
+    /// derived *before* it is switched on (see [`WalletManager::prepare_accounts`]).
+    accounts_cache: Arc<RwLock<Vec<Arc<Vec<TreasuryAccount>>>>>,
+    /// Bumped (under the cache write lock) whenever the mnemonic changes: a derivation that started
+    /// under the old phrase is not cached.
+    generation: Arc<AtomicU64>,
 }
 
 impl WalletManager {
@@ -309,24 +314,43 @@ impl WalletManager {
             config,
             mnemonic: Arc::new(RwLock::new(mnemonic_phrase)),
             nonce_cache: Arc::new(RwLock::new(HashMap::new())),
-            accounts_cache: Arc::new(RwLock::new(None)),
+            accounts_cache: Arc::new(RwLock::new(Vec::new())),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    /// Update mnemonic phrase (e.g. from Telegram import or new wallet generation)
+    /// Update mnemonic phrase (e.g. from Telegram import or new wallet generation).
+    ///
+    /// Persisted first: if the state file cannot be written the old wallet stays in force,
+    /// untouched (a phrase that only lives in memory is lost at the next restart, with whatever
+    /// was sent to it). The swap itself — phrase, derived layouts, nonce lanes — happens in one
+    /// critical section under the layout-cache lock, so no derivation can mix the two phrases.
     pub async fn set_mnemonic(&self, phrase: &str) -> Result<()> {
         let normalized = phrase.trim();
         let _ = Mnemonic::parse_normalized(normalized)
             .context("Invalid 12-word BIP-39 mnemonic phrase")?;
 
-        *self.mnemonic.write().await = normalized.to_string();
-        *self.config.mnemonic_phrase.write().await = normalized.to_string();
-        self.config.save_persisted_state().await?;
-        self.nonce_cache.write().await.clear();
-        *self.accounts_cache.write().await = None;
+        let previous = std::mem::replace(&mut *self.config.mnemonic_phrase.write().await, normalized.to_string());
+        if let Err(e) = self.config.save_persisted_state().await {
+            *self.config.mnemonic_phrase.write().await = previous;
+            return Err(e.context("New mnemonic not persisted: the current wallet stays in force"));
+        }
+        {
+            let mut cache = self.accounts_cache.write().await;
+            *self.mnemonic.write().await = normalized.to_string();
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            cache.clear();
+            // Inside the same section: a lane created for the new accounts after this point is the
+            // only lane of its address.
+            self.nonce_cache.write().await.clear();
+        }
         info!("Updated Master Mnemonic Phrase in treasury");
 
-        let _ = self.sync_initial_nonces().await;
+        match tokio::time::timeout(std::time::Duration::from_secs(10), self.sync_initial_nonces()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("Nonce sync after mnemonic change failed: {:#}", e),
+            Err(_) => warn!("Nonce sync after mnemonic change timed out"),
+        }
         Ok(())
     }
 
@@ -485,29 +509,51 @@ impl WalletManager {
         }
     }
 
-    /// Cached master + sub-accounts. Re-derives only when the mnemonic or the configured
-    /// sub-account count changes; the hot path clones an `Arc`.
+    /// Cached master + sub-accounts for the configured count. Re-derives only when the mnemonic or
+    /// the configured sub-account count changes to one never derived; the hot path clones an `Arc`.
     pub async fn get_all_accounts_shared(&self) -> Result<Arc<Vec<TreasuryAccount>>> {
         let count = *self.config.sub_account_count.read().await;
-        if let Some(cached) = self.accounts_cache.read().await.as_ref().filter(|c| c.len() == count + 1) {
-            return Ok(cached.clone());
-        }
+        self.accounts_for(count).await
+    }
 
-        let mut cache = self.accounts_cache.write().await;
-        if let Some(cached) = cache.as_ref().filter(|c| c.len() == count + 1) {
-            return Ok(cached.clone());
+    /// Is the layout for `sub_count` carriers already derived (no derivation on next use)?
+    pub async fn has_layout(&self, sub_count: usize) -> bool {
+        self.accounts_cache.read().await.iter().any(|c| c.len() == sub_count + 1)
+    }
+
+    /// Derive (and cache) the layout for `sub_count` carriers without switching to it. Called by
+    /// the control plane before a new carrier count is committed, so the first dispatch under the
+    /// new count finds its accounts ready instead of paying the derivation.
+    pub async fn prepare_accounts(&self, sub_count: usize) -> Result<Arc<Vec<TreasuryAccount>>> {
+        self.accounts_for(sub_count).await
+    }
+
+    async fn accounts_for(&self, sub_count: usize) -> Result<Arc<Vec<TreasuryAccount>>> {
+        loop {
+            if let Some(cached) = self.accounts_cache.read().await.iter().find(|c| c.len() == sub_count + 1) {
+                return Ok(cached.clone());
+            }
+            // Derive without holding the cache lock: dispatches of the current layout keep reading it.
+            let generation = self.generation.load(Ordering::SeqCst);
+            let phrase = self.mnemonic.read().await.clone();
+            let derived = tokio::task::spawn_blocking(move || derive_signers(&phrase, 0..=sub_count))
+                .await
+                .context("Key derivation task failed")??;
+            let mut accounts = Vec::with_capacity(derived.len());
+            for (index, (path, signer)) in derived.into_iter().enumerate() {
+                accounts.push(self.make_account(index, path, signer).await);
+            }
+            let mut cache = self.accounts_cache.write().await;
+            if self.generation.load(Ordering::SeqCst) != generation {
+                continue; // the mnemonic changed while deriving: these keys belong to the old one
+            }
+            if let Some(cached) = cache.iter().find(|c| c.len() == sub_count + 1) {
+                return Ok(cached.clone()); // derived concurrently: keep the one already handed out
+            }
+            let accounts = Arc::new(accounts);
+            cache.push(accounts.clone());
+            return Ok(accounts);
         }
-        let phrase = self.mnemonic.read().await.clone();
-        let derived = tokio::task::spawn_blocking(move || derive_signers(&phrase, 0..=count))
-            .await
-            .context("Key derivation task failed")??;
-        let mut accounts = Vec::with_capacity(derived.len());
-        for (index, (path, signer)) in derived.into_iter().enumerate() {
-            accounts.push(self.make_account(index, path, signer).await);
-        }
-        let accounts = Arc::new(accounts);
-        *cache = Some(accounts.clone());
-        Ok(accounts)
     }
 
     /// Get the Master Account (Index 0)
@@ -554,6 +600,32 @@ impl WalletManager {
         Ok(summaries)
     }
 
+    /// ETH balance of every derived account, read concurrently, each within `budget`
+    /// (`None` = no answer: shown as unknown, never as 0 ETH).
+    pub async fn balances(&self, budget: std::time::Duration) -> Result<Vec<(TreasuryAccount, Option<f64>)>> {
+        let accounts = self.get_all_accounts().await?;
+        let addresses: Vec<Address> = accounts.iter().map(|a| a.address).collect();
+        let balances = self.balances_of(&addresses, budget).await;
+        Ok(accounts.into_iter().zip(balances).collect())
+    }
+
+    /// ETH balance of each address (same order), read concurrently over one connection, each within
+    /// `budget`. `None` = no answer.
+    pub async fn balances_of(&self, addresses: &[Address], budget: std::time::Duration) -> Vec<Option<f64>> {
+        let provider = tokio::time::timeout(budget, ProviderBuilder::new().connect(&self.config.rpc_http_url))
+            .await
+            .ok()
+            .and_then(|p| p.ok());
+        let reads = addresses.iter().map(|addr| {
+            let provider = provider.as_ref();
+            async move {
+                let p = provider?;
+                tokio::time::timeout(budget, p.get_balance(*addr)).await.ok()?.ok().map(wei_to_eth)
+            }
+        });
+        futures_util::future::join_all(reads).await
+    }
+
     /// Automated Gas Rebalancing: Master account funds sub-accounts whose balance is low
     pub async fn rebalance_gas(&self) -> Result<Vec<GasRebalanceResult>> {
         info!("Initiating Automated Gas Rebalancing for Satellite Sub-Accounts...");
@@ -563,25 +635,28 @@ impl WalletManager {
         let target_balance_eth = *self.config.rebalance_target_eth.read().await;
         let rpc_http = self.config.rpc_http_url.clone();
 
+        // Every RPC below is time-bounded: a hung endpoint must not keep a rebalance (and the
+        // master's nonce it holds) waiting forever.
+        const STEP: std::time::Duration = std::time::Duration::from_secs(10);
         let master_wallet = EthereumWallet::from(master.signer.clone());
-        let provider_res = ProviderBuilder::new()
-            .wallet(master_wallet)
-            .connect(&rpc_http)
-            .await;
-
-        let provider = match provider_res {
-            Ok(p) => p,
-            Err(e) => anyhow::bail!("Gas rebalance provider connect failed: {}", e),
+        let provider = match tokio::time::timeout(STEP, ProviderBuilder::new().wallet(master_wallet).connect(&rpc_http)).await {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => anyhow::bail!("Gas rebalance provider connect failed: {}", e),
+            Err(_) => anyhow::bail!("Gas rebalance provider connect timed out"),
         };
 
         let mut results = Vec::new();
 
         for sub in sub_accounts {
             // A failed balance read must not be treated as "0 ETH" (that would trigger a top-up).
-            let current_balance_wei = match provider.get_balance(sub.address).await {
-                Ok(b) => b,
-                Err(e) => {
+            let current_balance_wei = match tokio::time::timeout(STEP, provider.get_balance(sub.address)).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
                     warn!("Skipping rebalance for {:?}: balance query failed: {}", sub.address, e);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("Skipping rebalance for {:?}: balance query timed out", sub.address);
                     continue;
                 }
             };
@@ -607,7 +682,12 @@ impl WalletManager {
                     .with_value(amount_wei)
                     .with_nonce(next_nonce);
 
-                match provider.send_transaction(tx).await {
+                // A timed-out send is settled like any send of unknown fate (nonce reconciled).
+                let sent = match tokio::time::timeout(STEP, provider.send_transaction(tx)).await {
+                    Ok(r) => r.map_err(|e| e.to_string()),
+                    Err(_) => Err("send timed out".to_string()),
+                };
+                match sent {
                     Ok(pending) => {
                         let tx_hash = format!("{:?}", pending.tx_hash());
                         info!("Rebalance dispatched for {:?}: {}", sub.address, tx_hash);

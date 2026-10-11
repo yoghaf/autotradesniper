@@ -888,6 +888,29 @@ impl PrysmEngine {
         dropped || torn_down
     }
 
+    /// Circuit breaker: drop every queued order and tear down every staged batch (leased nonces go
+    /// back). Entry slots stay claimed, so none of these launches is re-entered. Returns how many
+    /// orders were dropped.
+    pub fn cancel_all_pending(&self) -> usize {
+        let dropped = {
+            let mut pending = locked(&self.inner.pending_orders);
+            let n = pending.len();
+            pending.clear();
+            self.inner.pending_count.store(0, Ordering::Release);
+            n
+        };
+        let released = self.inner.presigner.get().map_or(0, |d| d.cancel_all_presigned());
+        if dropped + released > 0 {
+            warn!("[Prysm] Circuit breaker: {} queued order(s) dropped, {} staged batch(es) released", dropped, released);
+        }
+        dropped
+    }
+
+    /// Orders waiting for their block or their launch receipt.
+    pub fn pending_count(&self) -> usize {
+        self.inner.pending_count.load(Ordering::Acquire)
+    }
+
     /// Feed a fresher `getReserves()` reading for a resolved launch (from a refresher or a curve
     /// mirror). The next entry is quoted on it, and a staged primary whose Revert Guard moved beyond
     /// the pre-signing tolerance is signed again right away, ahead of the target block.

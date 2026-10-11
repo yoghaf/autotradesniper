@@ -617,7 +617,11 @@ impl StreamListener {
                             let hex_clean = res_str.trim_start_matches("0x");
                             if let Ok(val) = u128::from_str_radix(hex_clean, 16) {
                                 let gwei = val as f64 / 1e9;
-                                fee_adjuster.update_block_fees(gwei, 2.5);
+                                // eth_gasPrice carries no tip information and Nitro orders
+                                // first-come-first-served: no observed tip, so the tip is the
+                                // operator's preset (it used to be a fixed 2.5 Gwei here, which
+                                // pinned every preset below 2.5 G at 2.5 x multiplier).
+                                fee_adjuster.update_block_fees(gwei, 0.0);
                             }
                         }
                     }

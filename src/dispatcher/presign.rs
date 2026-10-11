@@ -135,7 +135,10 @@ impl std::fmt::Display for Invalidation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntryCtx {
     pub chain_id: u64,
+    /// Master padding (0 when the padding switch is off).
     pub buffer_size: usize,
+    /// Padding switch: satellite carriers take part in an entry only while it is on.
+    pub carriers_enabled: bool,
     pub configured_gas_limit: u64,
     /// Latest `NodeInterface.gasEstimateL1Component` (0 = never measured).
     pub l1_component_gas: u64,
@@ -509,6 +512,35 @@ impl StagedBatch {
     /// `(spec, has signed bytes)` of one slot, for idempotent re-staging decisions.
     pub fn slot_spec(&self, index: usize) -> Option<(Arc<TxSpec>, bool)> {
         self.lock().get(index).and_then(Option::as_ref).map(|s| (s.spec.clone(), s.signed.is_some()))
+    }
+
+    /// Number of account slots (the account layout this batch was shaped for).
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// The account layout changed while staged (carrier count, single/multi mode, padding switch):
+    /// keep slots `[0, accounts)` and drop the rest, handing their leased nonces back. Returns how
+    /// many leased slots were dropped. A no-op once the batch left `Staged`.
+    pub fn resize(&self, accounts: usize) -> usize {
+        let dropped: Vec<Slot> = {
+            let mut slots = self.lock();
+            if self.state.load(Ordering::Acquire) != STAGED {
+                return 0;
+            }
+            if accounts < slots.len() {
+                slots.drain(accounts..).flatten().collect()
+            } else {
+                slots.resize_with(accounts, || None);
+                Vec::new()
+            }
+        };
+        // Dropping a slot drops its lease, which returns the never-broadcast nonce.
+        dropped.len()
     }
 
     /// `(index, spec, has signed bytes)` of every filled slot.

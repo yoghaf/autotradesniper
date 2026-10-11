@@ -7,6 +7,7 @@ use alloy::consensus::TxEip1559;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_TYPE;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -517,14 +518,20 @@ fn carrier_spec(ctx: &EntryCtx, acc: &TreasuryAccount) -> TxSpec {
 fn primary_spec(ctx: &EntryCtx, acc: &TreasuryAccount, signal: &TradeSignal, value_wei: U256, reference_value: U256) -> Result<TxSpec> {
     let swap = CalldataPayloadBuilder::adapt_buy_calldata(&signal.swap_calldata, acc.address, value_wei, reference_value)
         .context("calldata re-targeting failed")?;
+    Ok(primary_spec_for(ctx, signal.pool_or_router, value_wei, swap))
+}
+
+/// The primary's `TxSpec` from its already re-targeted swap calldata (also used to rebuild a staged
+/// primary for new padding / fees without the original signal).
+fn primary_spec_for(ctx: &EntryCtx, to: Address, value_wei: U256, swap: Vec<u8>) -> TxSpec {
     // Padding never pushes the signed tx over the sequencer's size cap.
     let padding = CalldataPayloadBuilder::clamp_padding(swap.len(), ctx.buffer_size);
     let floor_gas = CalldataPayloadBuilder::calldata_floor_gas(&swap, padding);
     // One calloc'd buffer (zeroed pages, no memset) holding calldata + padding.
     let input = Bytes::from(CalldataPayloadBuilder::build_calibrated_payload(&swap, padding));
-    Ok(TxSpec {
+    TxSpec {
         chain_id: ctx.chain_id,
-        to: signal.pool_or_router,
+        to,
         value: value_wei,
         input,
         gas_limit: CalldataPayloadBuilder::gas_limit(&swap, padding, ctx.configured_gas_limit, ctx.l1_component_gas),
@@ -536,7 +543,29 @@ fn primary_spec(ctx: &EntryCtx, acc: &TreasuryAccount, signal: &TradeSignal, val
         configured_gas_limit: ctx.configured_gas_limit,
         l1_component_gas: ctx.l1_component_gas,
         swap,
-    })
+    }
+}
+
+/// Accounts taking part in an entry: the master alone in single mode or with the padding switch
+/// off (carriers exist only to carry the padding), master + every carrier otherwise.
+fn active_accounts(mode: ExecutionMode, carriers_enabled: bool, derived: usize) -> usize {
+    match mode {
+        ExecutionMode::MultiAccount if carriers_enabled => derived,
+        _ => 1.min(derived),
+    }
+}
+
+/// What [`Dispatcher::reshape_presigned`] changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReshapeReport {
+    /// Live batches looked at.
+    pub batches: usize,
+    /// Carrier slots dropped (their nonces handed back): fewer carriers, single mode, padding off.
+    pub slots_released: usize,
+    /// Carrier slots added (nonce leased, signed in the background): more carriers.
+    pub slots_added: usize,
+    /// Existing slots signed again under their nonce: new padding or fee parameters.
+    pub slots_resigned: usize,
 }
 
 /// High-Frequency Calldata Buffer Formatting & Concurrent Dispatcher Engine
@@ -548,6 +577,19 @@ pub struct Dispatcher {
     report_tx: mpsc::Sender<DispatchReport>,
     policy: PresignPolicy,
     staging: Arc<StagingBook>,
+    /// Entries between the intake check and the end of their dispatch (plus whatever the caller
+    /// covers with an [`EntryGuard`], e.g. the position registration that follows).
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Marks an entry as in flight while alive (see [`Dispatcher::entry_guard`]).
+#[must_use]
+pub struct EntryGuard(Arc<AtomicUsize>);
+
+impl Drop for EntryGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Dispatcher {
@@ -566,7 +608,21 @@ impl Dispatcher {
             report_tx,
             policy: PresignPolicy::default(),
             staging: Arc::new(StagingBook::default()),
+            in_flight: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Count an entry as in flight until the guard is dropped. `dispatch_signal` holds one; the
+    /// caller holds another across the dispatch *and* the position registration, so the circuit
+    /// breaker and the wallet guard can see an entry that has left but is not registered yet.
+    pub fn entry_guard(&self) -> EntryGuard {
+        self.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        EntryGuard(self.in_flight.clone())
+    }
+
+    /// Entries currently in flight (see [`Self::entry_guard`]).
+    pub fn entries_in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Replace the pre-signing policy (see [`PresignPolicy::from_env`]).
@@ -588,6 +644,11 @@ impl Dispatcher {
         self.staging.stats_ref().snapshot()
     }
 
+    /// Batches currently staged.
+    pub fn staged_count(&self) -> usize {
+        self.staging.live_count()
+    }
+
     /// True while at least one batch is staged (lock-free; the per-block hooks use it to stay free).
     pub fn has_staged(&self) -> bool {
         self.staging.live_count() > 0
@@ -602,21 +663,20 @@ impl Dispatcher {
 
     /// Fees and gas sizing of this very moment, read exactly as a dispatch would read them.
     pub async fn entry_ctx(&self) -> EntryCtx {
-        let buffer_size = *self.config.buffer_size.read().await;
+        // The padding switch gates every byte of padding (the operator's "0 KB" mode).
+        let carriers_enabled = self.config.carrier_padding_enabled();
+        let buffer_size = if carriers_enabled { *self.config.buffer_size.read().await } else { 0 };
         let configured_gas_limit = *self.config.gas_limit.read().await;
-        let max_fee_cap_gwei = *self.config.max_fee_gwei.read().await;
-        self.entry_ctx_with(buffer_size, configured_gas_limit, max_fee_cap_gwei).await
-    }
-
-    async fn entry_ctx_with(&self, buffer_size: usize, configured_gas_limit: u64, max_fee_cap_gwei: f64) -> EntryCtx {
+        // One consistent pair, even while a fee preset is being applied.
+        let (configured_prio_gwei, max_fee_cap_gwei) = self.config.fee_caps().await;
         // Adaptive fee (EMA), with the user-configured priority fee floor, capped by MAX_FEE_GWEI.
         // The priority fee never exceeds max fee (invalid tx otherwise).
         let (ema_priority_wei, max_fee_wei) = self.fee_adjuster.capped_fees(max_fee_cap_gwei);
-        let configured_prio_gwei = *self.config.max_priority_fee_gwei.read().await;
         let configured_prio_wei = if configured_prio_gwei.is_finite() { (configured_prio_gwei.max(0.0) * 1e9) as u128 } else { 0 };
         EntryCtx {
             chain_id: self.config.chain_id,
             buffer_size,
+            carriers_enabled,
             configured_gas_limit,
             l1_component_gas: self.fee_adjuster.l1_component_gas(),
             priority_fee_wei: ema_priority_wei.max(configured_prio_wei).min(max_fee_wei),
@@ -642,17 +702,23 @@ impl Dispatcher {
         if expires_at <= now {
             return false;
         }
+        if !self.config.is_engine_running() {
+            return false; // intake paused: nothing new is staged
+        }
         let exec_mode = *self.config.execution_mode.read().await;
         let Ok(accounts) = self.wallet_manager.get_all_accounts_shared().await else { return false };
-        let account_count = match exec_mode {
-            ExecutionMode::Single => 1,
-            ExecutionMode::MultiAccount => accounts.len(),
-        };
+        let account_count = active_accounts(exec_mode, self.config.carrier_padding_enabled(), accounts.len());
         let batch = match self.staging.arm(Arc::new(StagedBatch::new(launch_tx, account_count, now, expires_at))) {
             Armed::New(batch) => batch,
             Armed::Existing(_) => return true,
             Armed::Refused => return false,
         };
+        // Paused (circuit breaker) while we were awaiting above: its teardown may have run before
+        // this batch was registered, so take it down ourselves rather than hold nonces for nothing.
+        if !self.config.is_engine_running() {
+            self.staging.teardown(launch_tx, Teardown::Cancelled);
+            return false;
+        }
         self.spawn_janitor(&batch);
 
         let ctx = self.entry_ctx().await;
@@ -748,6 +814,71 @@ impl Dispatcher {
             info!("[presign] re-signed {} staged packet(s) after a fee/gas change", resigned);
         }
         resigned
+    }
+
+    /// Bring every staged batch in line with runtime parameters the operator just changed (carrier
+    /// count, single/multi mode, padding switch / size, fee preset), *before* the target block:
+    ///
+    /// * slots of accounts no longer in the layout are dropped and their nonces handed back;
+    /// * carriers that joined the layout get a nonce leased and are signed in the background;
+    /// * slots whose padding or fees no longer match the current parameters (beyond the fee
+    ///   tolerance, in either direction: an operator lowering the cap wants a lower cap) are signed
+    ///   again under the nonce they hold.
+    ///
+    /// Without this a change only reached the next batch, and the claiming dispatch had to sign
+    /// the mismatching slots inline on the hot path.
+    pub async fn reshape_presigned(&self) -> ReshapeReport {
+        let mut report = ReshapeReport::default();
+        if !self.policy.enabled || self.staging.live_count() == 0 {
+            return report;
+        }
+        let exec_mode = *self.config.execution_mode.read().await;
+        // May derive new carriers (PBKDF2, blocking pool): here, not in the next dispatch.
+        let Ok(accounts) = self.wallet_manager.get_all_accounts_shared().await else { return report };
+        let ctx = self.entry_ctx().await;
+        let count = active_accounts(exec_mode, ctx.carriers_enabled, accounts.len());
+        let tol = self.policy.fee_tolerance_bps as u128;
+        let fee_off = |staged: u128, now: u128| staged.abs_diff(now) * 10_000 > now * tol;
+        for batch in self.staging.live_batches() {
+            report.batches += 1;
+            report.slots_released += batch.resize(count);
+            let mut tickets = Vec::new();
+            for (idx, acc) in accounts.iter().enumerate().take(count) {
+                let fresh = if idx == 0 {
+                    // The primary is rebuilt from its own (already re-targeted) swap.
+                    match batch.slot_spec(0) {
+                        Some((spec, _)) => primary_spec_for(&ctx, spec.to, spec.value, spec.swap.clone()),
+                        None => continue, // staged at resolution, not yet: nothing to reshape
+                    }
+                } else {
+                    carrier_spec(&ctx, acc)
+                };
+                let needs = match batch.slot_spec(idx) {
+                    None => {
+                        report.slots_added += 1;
+                        true
+                    }
+                    Some((staged, _)) => {
+                        let stale = staged.valid_against(&fresh, &self.policy).is_err()
+                            || fee_off(staged.max_fee_per_gas, fresh.max_fee_per_gas)
+                            || fee_off(staged.max_priority_fee_per_gas, fresh.max_priority_fee_per_gas);
+                        report.slots_resigned += usize::from(stale);
+                        stale
+                    }
+                };
+                if needs && let Some(ticket) = batch.lease_slot(idx, acc, fresh) {
+                    tickets.push((acc.clone(), ticket));
+                }
+            }
+            self.sign_tickets(&batch, tickets).await;
+        }
+        if report.slots_released + report.slots_added + report.slots_resigned > 0 {
+            info!(
+                "[presign] reshaped {} batch(es) for new runtime parameters: -{} slot(s), +{} slot(s), {} re-signed",
+                report.batches, report.slots_released, report.slots_added, report.slots_resigned
+            );
+        }
+        report
     }
 
     /// Tear down the staged batch of `launch_tx`: its order was rejected, cancelled or failed. Every
@@ -867,6 +998,7 @@ impl Dispatcher {
     /// Returns `Err` unless at least one transaction was accepted by an endpoint, so callers
     /// never register a position for a buy that was never broadcast.
     pub async fn dispatch_signal(&self, signal: &TradeSignal) -> Result<DispatchReport> {
+        let _in_flight = self.entry_guard();
         let is_strategy = is_prysm_tag(signal.strategy_tag.as_deref());
         let result = self.dispatch_inner(signal, is_strategy).await;
         if is_strategy && result.is_err() {
@@ -888,6 +1020,10 @@ impl Dispatcher {
                 signal.strategy_tag, signal.pool_or_router
             );
         }
+
+        // Paused intake (operator /pause or panic): no new entry leaves, whatever was already queued
+        // (a copied signal in the channel, a Prysm order released by its receipt).
+        anyhow::ensure!(self.config.is_engine_running(), "engine intake paused: entry refused");
 
         let exec_mode = *self.config.execution_mode.read().await;
         let ctx = self.entry_ctx().await;
@@ -915,10 +1051,7 @@ impl Dispatcher {
         let priority_fee_gwei = ctx.priority_fee_wei as f64 / 1e9;
 
         let accounts = self.wallet_manager.get_all_accounts_shared().await?;
-        let account_count = match exec_mode {
-            ExecutionMode::Single => 1,
-            ExecutionMode::MultiAccount => accounts.len(),
-        };
+        let account_count = active_accounts(exec_mode, ctx.carriers_enabled, accounts.len());
 
         if ctx.l1_component_gas == 0 {
             warn!(
@@ -926,6 +1059,10 @@ impl Dispatcher {
                 crate::payload::L1_COMPONENT_FALLBACK_GAS
             );
         }
+
+        // Intake again, after the awaits above: a circuit breaker that fired meanwhile stops the
+        // entry here. From this point to the broadcast there is no await left.
+        anyhow::ensure!(self.config.is_engine_running(), "engine intake paused: entry refused");
 
         // Exactly one dispatch can own a launch's staged batch (compare-exchange); later or racing
         // cancels and expiries find it gone.

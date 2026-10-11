@@ -1066,6 +1066,16 @@ impl CurveMirror {
         read
     }
 
+    /// Every tracked curve with what a read would return right now (operator dashboard). Does not
+    /// count towards the read statistics.
+    pub fn curve_overview(&self) -> Vec<(Address, MirrorRead)> {
+        let curves: Vec<Address> = self.lock().slots.keys().copied().collect();
+        let now = Instant::now();
+        let mut out: Vec<(Address, MirrorRead)> = curves.into_iter().map(|c| (c, self.read_at(&c, now, true))).collect();
+        out.sort_by_key(|(c, _)| *c);
+        out
+    }
+
     /// The replica's best state regardless of freshness (anchored curves only).
     pub fn snapshot_any(&self, curve: &Address) -> Option<CurveSnapshot> {
         self.read_at(curve, Instant::now(), false).fresh()

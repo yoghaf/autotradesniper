@@ -636,8 +636,9 @@ pub struct DynamicFeeAdjuster {
     alpha: f64,
     /// Multiplier to ensure transaction outbids competing submissions
     priority_multiplier: f64,
-    /// Minimum priority fee in Gwei floor
-    min_priority_fee_gwei: f64,
+    /// Minimum priority fee floor in Gwei (`f64` bits; shared by clones, settable at runtime from
+    /// the operator's fee preset).
+    min_priority_fee_bits: Arc<AtomicU64>,
     /// Atomic representation of current EMA Base Fee (stored as micro-Gwei integer, 1e-6 Gwei)
     ema_base_fee_atomic: Arc<AtomicU64>,
     /// Atomic representation of current EMA Priority Fee (stored as micro-Gwei integer, 1e-6 Gwei)
@@ -649,16 +650,32 @@ pub struct DynamicFeeAdjuster {
 impl DynamicFeeAdjuster {
     pub fn new(min_priority_gwei: f64, priority_multiplier: f64) -> Self {
         let initial_base_nano = (1.0 * 1_000_000.0) as u64; // 1 Gwei base
-        let initial_prio_nano = (min_priority_gwei * 1_000_000.0) as u64;
+        // The EMA tracks the network only; the floor is applied on top (see `calculate_optimal_fees`).
+        let initial_prio_nano = 0;
 
         Self {
             alpha: 0.20,
             priority_multiplier,
-            min_priority_fee_gwei: min_priority_gwei,
+            min_priority_fee_bits: Arc::new(AtomicU64::new(min_priority_gwei.to_bits())),
             ema_base_fee_atomic: Arc::new(AtomicU64::new(initial_base_nano)),
             ema_priority_fee_atomic: Arc::new(AtomicU64::new(initial_prio_nano)),
             l1_component_gas: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Current priority fee floor in Gwei.
+    #[inline]
+    pub fn priority_floor_gwei(&self) -> f64 {
+        f64::from_bits(self.min_priority_fee_bits.load(Ordering::Relaxed))
+    }
+
+    /// Operator fee preset: new priority floor, effective for the very next fee computation (one
+    /// atomic store). The EMA only tracks what the network reports, so neither a higher nor a
+    /// *lower* preset is masked by history (Arbitrum is first-come-first-served: the tip buys no
+    /// ordering, so with a quiet network the tip is exactly the preset).
+    pub fn set_priority_floor_gwei(&self, floor_gwei: f64) {
+        let floor = if floor_gwei.is_finite() { floor_gwei.max(0.0) } else { 0.0 };
+        self.min_priority_fee_bits.store(floor.to_bits(), Ordering::Relaxed);
     }
 
     /// Record the latest L1 poster-gas estimate (from the background refresher).
@@ -691,10 +708,11 @@ impl DynamicFeeAdjuster {
         let new_base = (self.alpha * base_fee_gwei) + ((1.0 - self.alpha) * prev_base_nano);
         self.ema_base_fee_atomic.store((new_base * 1_000_000.0) as u64, Ordering::Relaxed);
 
-        // Read previous priority fee
+        // Read previous priority fee. The floor is not folded in: it is applied when fees are
+        // computed, so the multiplier scales the network's tip, never the operator's preset.
         let prev_prio_nano = self.ema_priority_fee_atomic.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-        let effective_prio = priority_fee_gwei.max(self.min_priority_fee_gwei);
-        let new_prio = (self.alpha * effective_prio) + ((1.0 - self.alpha) * prev_prio_nano);
+        let observed = if priority_fee_gwei.is_finite() { priority_fee_gwei.max(0.0) } else { 0.0 };
+        let new_prio = (self.alpha * observed) + ((1.0 - self.alpha) * prev_prio_nano);
         self.ema_priority_fee_atomic.store((new_prio * 1_000_000.0) as u64, Ordering::Relaxed);
     }
 
@@ -707,7 +725,7 @@ impl DynamicFeeAdjuster {
             * self.priority_multiplier;
         let base_gwei = self.ema_base_fee_atomic.load(Ordering::Relaxed) as f64 / 1_000_000.0;
 
-        let effective_prio_gwei = prio_gwei.max(self.min_priority_fee_gwei);
+        let effective_prio_gwei = prio_gwei.max(self.priority_floor_gwei());
         // Max fee = (2.0 * BaseFee) + PriorityFee to withstand block fee spikes
         let max_fee_gwei = (base_gwei * 2.0) + effective_prio_gwei;
 

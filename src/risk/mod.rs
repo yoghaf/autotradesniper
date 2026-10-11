@@ -243,6 +243,22 @@ async fn fetch_quote_mirrored(reader: Option<&BroadcasterPool>, owner: Option<Ad
     quote
 }
 
+/// What one circuit-breaker run (`/panic`) did, position by position.
+#[derive(Debug, Default, Clone)]
+pub struct PanicReport {
+    /// Open positions when the breaker fired.
+    pub positions: usize,
+    /// `(position id, symbol, exit tx)` sold and confirmed by a receipt (or by the balance).
+    pub sold: Vec<(String, String, String)>,
+    /// Closed without a sell: the wallet held none of the token.
+    pub nothing_held: Vec<(String, String)>,
+    /// Another exit of the position was already running (single flight): it continues.
+    pub already_exiting: Vec<(String, String)>,
+    /// `(id, symbol, reason)` still open after the run (failed sells; the watchdog retries).
+    pub still_open: Vec<(String, String, String)>,
+    pub elapsed: Duration,
+}
+
 /// Comprehensive Multi-Layered Risk Management & Liquidation Engine
 pub struct RiskManager {
     config: AppConfig,
@@ -402,7 +418,57 @@ impl RiskManager {
         {
             mirror.track(pool_address);
         }
-        self.trackers.write().await.insert(pos_id, tracker);
+        self.trackers.write().await.insert(pos_id.clone(), tracker);
+
+        // An entry that was already on its way when the circuit breaker fired (it passed the intake
+        // check before the latch, its tx was accepted after the breaker listed the open positions):
+        // liquidate it now instead of leaving it to the normal exit rules. The latch is read after
+        // the tracker is inserted and the breaker sets it before listing, so every position is seen
+        // by at least one of the two (single flight makes the second one a no-op).
+        if self.config.breaker_engaged() {
+            warn!("🚨 {} registered while the circuit breaker is engaged: liquidating it as soon as it fills", pos_id);
+            // The buy was accepted, not necessarily executed or visible to the read RPC yet: a
+            // zero balance now would close the position as "nothing held" and leave the tokens
+            // that land a moment later unsupervised. Wait for the fill (bounded) first.
+            let owner = self.wallet_manager.get_master_account().await.ok().map(|a| a.address);
+            let filled = match (self.reader(), owner, token_address != pool_address) {
+                (Some(reader), Some(owner), true) => {
+                    let deadline = Instant::now() + ENTRY_FILL_TIMEOUT;
+                    loop {
+                        if matches!(erc20_balance(&reader, token_address, owner, EXIT_READ_TIMEOUT).await, Ok(b) if !b.is_zero()) {
+                            break true;
+                        }
+                        if Instant::now() >= deadline {
+                            break false;
+                        }
+                        tokio::time::sleep(BALANCE_POLL_EVERY).await;
+                    }
+                }
+                _ => true, // nothing to wait on: the exit path reads the balance itself
+            };
+            if !filled {
+                warn!(
+                    "🚨 {}: no tokens visible within {:?} of registration; left to the normal fill check (it did not fill, or the read RPC lags)",
+                    pos_id, ENTRY_FILL_TIMEOUT
+                );
+                return pos;
+            }
+            let signal = ExitSignal {
+                position_id: pos_id.clone(),
+                token_address,
+                pool_address,
+                reason: ExitReason::ManualPanic,
+                reason_description: "Manual Operator Panic Sell Triggered (entry in flight)".to_string(),
+                is_emergency: true,
+                slippage_percent: 50.0,
+            };
+            if let Some(flight) = ExitFlight::claim(&self.exits_in_flight, &pos_id) {
+                self.run_liquidation(signal, flight).await;
+            }
+            if let Some(now) = self.positions.read().await.iter().find(|p| p.id == pos_id) {
+                return now.clone();
+            }
+        }
 
         pos
     }
@@ -1360,11 +1426,31 @@ impl RiskManager {
     /// Lapis 6: Manual Panic Sell (`/panic`)
     /// Liquidates all open positions simultaneously within milliseconds and pauses signal intake
     pub async fn panic_sell_all(&self) -> usize {
-        warn!("🚨 OPERATOR TRIGGERED MANUAL PANIC SELL (/panic)! Liquidating ALL open positions!");
+        self.panic_sell_all_report().await.positions
+    }
 
-        // Pause engine intake immediately (idempotent: toggling would *resume* an already
-        // paused engine in the middle of an emergency)
-        self.config.set_engine_running(false).await;
+    /// Circuit breaker with a per-position account of what happened.
+    ///
+    /// Intake is paused with one atomic store before anything else (persisting that to disk happens
+    /// in the background, it must not delay the sells). Every open position is then liquidated
+    /// concurrently through the normal receipt-confirmed exit (emergency: wide slippage, no
+    /// confirmation step), skipping the watchdog's retry cadence and any exit-round limit.
+    pub async fn panic_sell_all_report(&self) -> PanicReport {
+        warn!("🚨 OPERATOR TRIGGERED MANUAL PANIC SELL (/panic)! Liquidating ALL open positions!");
+        let started = Instant::now();
+
+        // Idempotent (toggling would *resume* an already paused engine in the middle of an emergency).
+        // The latch keeps intake from being resumed until the operator releases it, and makes an
+        // entry still in flight liquidate itself on registration (see `register_entry`).
+        // Keep the epoch of a breaker the control plane already engaged (its release button
+        // names that epoch); engage one when called directly.
+        if !self.config.breaker_engaged() {
+            self.config.engage_breaker();
+        }
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            let _ = config.save_persisted_state().await;
+        });
 
         let mut signals = Vec::new();
         {
@@ -1389,14 +1475,56 @@ impl RiskManager {
             }
         }
 
+        let mut report = PanicReport { positions: signals.len(), ..PanicReport::default() };
+        let symbol_of = |id: &str, trackers: &HashMap<String, PositionTracker>| {
+            trackers.get(id).map(|t| t.position.token_symbol.clone()).unwrap_or_default()
+        };
+        // Claimed here, so a position whose exit is already running is reported, not silently skipped.
+        let mut runs = Vec::new();
+        {
+            let trackers = self.trackers.read().await;
+            for signal in signals {
+                match ExitFlight::claim(&self.exits_in_flight, &signal.position_id) {
+                    Some(flight) => runs.push((signal, flight)),
+                    None => report.already_exiting.push((signal.position_id.clone(), symbol_of(&signal.position_id, &trackers))),
+                }
+            }
+        }
+        let ids: Vec<String> = runs.iter().map(|(s, _)| s.position_id.clone()).collect();
         // Concurrently: one stuck exit must not hold up the others.
-        let count = signals.len();
-        futures_util::future::join_all(signals.into_iter().map(|s| self.execute_liquidation(s))).await;
-        count
+        futures_util::future::join_all(runs.into_iter().map(|(s, f)| self.run_liquidation(s, f))).await;
+
+        // The public position list (closed trackers are pruned by the monitor, positions are kept).
+        let positions = self.positions.read().await;
+        for id in ids {
+            let Some(p) = positions.iter().find(|p| p.id == id) else { continue };
+            let symbol = p.token_symbol.clone();
+            match (p.is_open, p.exit_tx_hash.clone()) {
+                (false, Some(tx)) => report.sold.push((id, symbol, tx)),
+                (false, None) => report.nothing_held.push((id, symbol)),
+                (true, _) => {
+                    let why = p.exit_reason.clone().unwrap_or_else(|| "sell not confirmed; watchdog retries".to_string());
+                    report.still_open.push((id, symbol, why));
+                }
+            }
+        }
+        report.elapsed = started.elapsed();
+        report
+    }
+
+    /// Exits currently running (single-flight set).
+    pub fn exits_in_flight(&self) -> usize {
+        self.exits_in_flight.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Open positions as currently tracked (copies; the lock is released before returning).
+    pub async fn open_positions_snapshot(&self) -> Vec<Position> {
+        self.positions.read().await.iter().filter(|p| p.is_open).cloned().collect()
     }
 
     /// Lapis 6: Engine Pause (`/pause`)
-    /// Pauses new entry signals while leaving existing positions guarded
+    /// Pauses new entry signals while leaving existing positions guarded. Idempotent (never
+    /// resumes). Returns false if this call paused the engine, true if it was already paused.
     pub async fn pause_engine(&self) -> bool {
         let is_running = self.config.is_engine_running();
         if is_running {

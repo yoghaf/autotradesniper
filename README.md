@@ -43,9 +43,9 @@ flowchart TD
     end
 
     subgraph Layer6 [Lapis 6: Operator Emergency Controls]
-        L6A["/panic & Inline Button (Likuidasi instan seluruh posisi)"]
-        L6B["/pause (Bekukan signal intake, supervisi pasif aktif)"]
-        L6C["/sweep & Inline Button (Konversi residual token ke ETH)"]
+        L6A["/panic & Inline Button (Circuit breaker: intake terkunci, likuidasi receipt-confirmed)"]
+        L6B["/pause & /resume (Bekukan / aktifkan signal intake, supervisi tetap aktif)"]
+        L6C["/sweep & Inline Button (Daftar posisi; sweep on-chain belum diimplementasikan)"]
     end
 
     subgraph ExecutionEngine [Fast-Exit Dispatcher]
@@ -91,10 +91,15 @@ flowchart TD
      - **Watchdog Max Hold:** Likuidasi otomatis jika posisi tertahan lebih dari **600 detik (10 menit)** (`ExitReason::WatchdogTimeout`).
      - **Pool Quote Timeout:** Likuidasi jika quoter harga pool sekunder gagal merespons selama **30 detik berturut-turut** (`ExitReason::PoolQuoteTimeout`).
 
-6. **Lapis 6: Kontrol Operator & Penutupan Darurat Manual (`src/telegram/emergency_controls.rs` & `src/telegram.rs`)**
-   - **Command `/panic` & Tombol Inline `🚨 Panic Sell All`:** Menutup seluruh posisi terbuka seketika dalam beberapa milidetik dan membekukan intake sinyal baru.
-   - **Command `/pause`:** Membekukan intake sinyal tanpa menutup posisi yang sedang berjalan (mode supervisi pasif).
-   - **Command `/sweep` & Tombol Inline `🧹 Sweep Assets`:** Melikuidasi seluruh saldo residual token di dompet master dan akun satelit kembali menjadi Native ETH.
+6. **Lapis 6: Kontrol Operator & Penutupan Darurat Manual (`src/telegram/control.rs` & `src/telegram.rs`)**
+   - **Command `/panic` & Tombol Inline `🚨 PANIC SELL ALL` (circuit breaker):** intake berhenti dan terkunci saat itu juga (dua store atomik,
+     tanpa lock/await), antrean order Prysm dan batch pre-sign dipotong, lalu setiap posisi dijual lewat exit receipt-confirmed di runtime
+     engine. Operator langsung mendapat layar "breaker aktif"; laporan per posisi menyusul sebagai notifikasi kritis. Entri yang sedang
+     terkirim saat breaker dipicu otomatis dijual begitu terdaftar. Intake hanya bisa aktif lagi lewat tombol `🔓` setelah likuidasi selesai.
+   - **Command `/pause` / `/resume` & tombol Intake:** membekukan / mengaktifkan intake (tombol membawa status tujuan, jadi tombol lama tidak
+     pernah membalik engine). Pause juga membatalkan order Prysm yang antre dan melepas batch pre-sign; posisi terbuka tetap diawasi.
+   - **Command `/sweep` & Tombol `🧹 Sweep Assets`:** menampilkan posisi yang tercatat. Sweep token residual on-chain **belum**
+     diimplementasikan; untuk menjual semua posisi gunakan Panic Sell.
 
 ---
 
@@ -256,6 +261,36 @@ menghilangkan kontensi itu.
 
 ---
 
+## 📡 ANTARMUKA TELEGRAM (CONTROL PLANE TERISOLASI)
+
+**Isolasi:** polling, handler, render layar, pembacaan saldo, dan outbox notifikasi berjalan di thread OS `telegram-io` dengan
+runtime tokio single-thread sendiri (`telegram::start_control_plane`). Sisi Telegram **tidak pernah memegang lock engine**: setiap
+pembacaan/perubahan state dijalankan sebagai task di runtime engine (`ControlPlane`, `src/telegram/control.rs`) dan hanya ditunggu,
+dengan batas waktu. Engine mengirim alert lewat `Notifier::notify` (satu `try_send`, tanpa await).
+
+| Tombol | Efek ke engine (tanpa restart) |
+|---|---|
+| `👥 1/2/3/5 Anak` | layout akun baru diturunkan + nonce carrier yang bergabung dibaca dari chain **sebelum** commit (gagal baca = dibatalkan); batch pre-sign yang siap di-resize (slot dilepas / ditambah dan ditandatangani) |
+| `⚡ 1.0G / 🚀 2.5G / 🔥 5.0G` | pasangan (tip, max fee) ditukar atomik (seqlock), floor fee adjuster ikut; paket staged di luar toleransi ditandatangani ulang dengan nonce yang sama (naik maupun turun) |
+| `📦 95 KB / 0 KB` | saklar padding: 0 KB = satu tx master tanpa padding, tanpa carrier (lease carrier dikembalikan); 95 KB = carrier + padding ~94,5 KB kembali |
+| `Intake` / `Mode` | status tujuan ada di tombol (`intake:on/off`, `cfg_mode:single/multi`): tombol lama atau tekanan ganda tidak pernah membalik engine; pause melepas antrean & batch |
+| `🚨 PANIC SELL ALL` | circuit breaker (lihat Lapis 6); `/panic` dan tombol ini melewati antrean per-chat. Latch ber-epoch: tombol `🔓` hanya melepas breaker yang ia tampilkan, dan ditolak selama likuidasi / exit / entri masih berjalan |
+
+**Telemetri** (`/start`, `📡 Telemetri`): saldo ETH Ayah + semua Anak (dibaca paralel, batas 3 dtk, "?" bila tidak terbaca),
+feed racing (feed live, % menang `ClaimRing`, RTT, lag), status curve mirror (ZERO-RPC / campuran / fallback RPC per kurva),
+pre-sign AOT, posisi terbuka dengan PnL real-time dan sumber valuasinya, statistik outbox.
+
+**Keamanan output:** semua nilai dinamis di-escape (`html::escape`), setiap layar divalidasi parser HTML Telegram yang ketat
+(`html::validate`), dipotong di batas 4096 unit UTF-16 (`html::fit`), dan bila Telegram tetap menolak, dikirim ulang sebagai teks
+polos. **Outbox berbatas:** 64 notifikasi menunggu (lebih = dibuang & dihitung), notifikasi yang menumpuk digabung jadi satu pesan,
+TTL 90 dtk untuk notifikasi rutin (notifikasi kritis tidak kedaluwarsa dan didahulukan), retry dibatasi (`RetryAfter` ≤ 30 dtk,
+3 percobaan), jumlah notifikasi yang hilang diumumkan di pesan berikutnya.
+
+**Dompet:** ganti / impor mnemonic hanya bila intake di-pause dan tidak ada entri dalam pengiriman, posisi terbuka, exit berjalan,
+batch staged, atau order antre; frasa seed yang ditempel di chat dihapus otomatis.
+
+---
+
 ## ⚡ RINGKASAN OPTIMASI PERFORMA & LATENSI (< 100 µs TARGET)
 
 Pengujian micro-benchmark nyata dilakukan menggunakan harness **Criterion**:
@@ -325,8 +360,12 @@ autotradesniper/
     │   ├── watchdog.rs         # Layer 5: Fault-Tolerant Watchdog Supervisor (5s interval)
     │   └── evaluator.rs        # Non-blocking multi-layer block event orchestrator
     └── telegram/
-        ├── emergency_controls.rs # Layer 6: Operator Emergency Controls (/panic, /pause, /sweep)
-        └── (telegram.rs)       # Teloxide Bot Controller, inline keyboards & rate-limiting queue
+        ├── control.rs          # Control plane: tombol -> engine (reshape pre-sign, fee, padding, breaker), telemetri
+        ├── screens.rs          # Semua teks & keyboard (fungsi murni, HTML-safe)
+        ├── outbox.rs           # Notifikasi engine -> operator: try_send, coalescing, TTL, retry berbatas
+        ├── html.rs             # Escape, validator HTML Telegram, fallback teks polos, pemotongan UTF-16
+        ├── emergency_controls.rs # Layer 6 helper (/panic, /pause, /sweep)
+        └── (telegram.rs)       # Adapter teloxide di thread "telegram-io" (start_control_plane)
 ```
 
 ---
@@ -380,7 +419,7 @@ flowchart LR
 
 ## 🔨 PANDUAN PENGGUNAAN & PENGUJIAN
 
-### 1. Menjalankan Seluruh Unit & Integration Test (184 Pengujian)
+### 1. Menjalankan Seluruh Unit & Integration Test (223 Pengujian)
 ```powershell
 cargo test
 ```
