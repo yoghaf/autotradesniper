@@ -451,6 +451,14 @@ impl TelegramBot {
             },
             "/prysm" => self.show_prysm(chat_id, None, None).await,
             "/settings" => self.show_settings(chat_id, None, None).await,
+            "/wallets" | "/treasury" => match self.control.snapshot(true).await {
+                Ok(snap) => self.show(chat_id, None, &screens::treasury(&snap), Some(screens::treasury_keyboard())).await,
+                Err(e) => self.show_error(chat_id, None, "Treasury tidak tersedia", &e).await,
+            },
+            "/portfolio" => match self.control.snapshot(true).await {
+                Ok(snap) => self.show(chat_id, None, &screens::portfolio(&snap), Some(screens::back_keyboard("menu_main"))).await,
+                Err(e) => self.show_error(chat_id, None, "Portfolio tidak tersedia", &e).await,
+            },
             _ => self.show_dashboard(chat_id, None).await,
         }
         Ok(())
@@ -735,6 +743,29 @@ pub fn start_control_plane(token: String, handles: EngineHandles, policy: Outbox
         tokio::spawn(outbox::run_outbox(Arc::new(TeloxideApi { bot: bot.clone() }), outbox_rx));
         let control = ControlPlane::new(handles).with_notifier(bot_notifier);
         let tg = Arc::new(TelegramBot::new(bot.clone(), control));
+
+        let commands = vec![
+            teloxide::types::BotCommand::new("start", "Buka Dashboard & Menu Utama"),
+            teloxide::types::BotCommand::new("dashboard", "Tampilkan Dashboard & Menu"),
+            teloxide::types::BotCommand::new("settings", "Pengaturan Execution & Swarm"),
+            teloxide::types::BotCommand::new("wallets", "Status Saldo Ayah & Anak"),
+            teloxide::types::BotCommand::new("portfolio", "Posisi Token & PnL Terbuka"),
+            teloxide::types::BotCommand::new("telemetry", "Telemetri L2 Feed & Mirror"),
+            teloxide::types::BotCommand::new("prysm", "Menu Model Strategi Seri Prysm"),
+            teloxide::types::BotCommand::new("pause", "Hentikan Sementara Intake Transaksi"),
+            teloxide::types::BotCommand::new("resume", "Lanjutkan Intake Transaksi"),
+            teloxide::types::BotCommand::new("panic", "🚨 Jual Semua Token & Hentikan Bot"),
+        ];
+        let bot_cmd = bot.clone();
+        tokio::spawn(async move {
+            use teloxide::requests::Requester;
+            if let Err(e) = bot_cmd.set_my_commands(commands).await {
+                warn!("Could not register Telegram commands menu: {}", e);
+            } else {
+                info!("Registered Telegram slash commands menu with Bot API");
+            }
+        });
+
         info!("Telegram control plane running on its own thread (polling, handlers, outbox)");
 
         let tg_msg = tg.clone();
